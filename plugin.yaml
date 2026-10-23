@@ -1,5 +1,5 @@
 name: hermes-workspaces
-version: 0.1.0
+version: 0.2.0
 description: >
   One jj workspace per session, enforced. A session is either bound to a repo
   (its own workspace under /Git/hermes/workspaces/<repo>/<slug>) or explicitly
