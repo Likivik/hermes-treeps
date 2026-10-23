@@ -28,6 +28,14 @@ else's tree.
 - **1:1 session ↔ workspace** — `ws_new` on a bound session asks for explicit
   `rebind=true` instead of silently dual-binding. Rebinding detaches the old
   tree (the directory stays).
+- **Not on disk ≠ does not exist** — `ws_new` for a repo that is not under
+  `REPO_ROOTS` checks the GitHub/Forgejo catalogue. If the repo lives there,
+  the answer is `needs_confirmation: true` with the remote's name, owner, url
+  and source, and nothing is written to disk; the clone happens only on the
+  second call, `ws_new(repo, slug, create_repo=true)`, after the user approves.
+  If the repo is nowhere, the error names the remotes that do exist, so nobody
+  keeps guessing repo names. `ws_doctor` lists the same picture
+  (`repo_roots`, `local_candidates`, `remote_candidates`).
 - **Titles** — the greeting requires a session title; it becomes the workspace
   slug. Picker taps without a title get a temporary name and can be renamed
   with `ws_rename` (jj-safe: workspaces are keyed by working-copy commit, not

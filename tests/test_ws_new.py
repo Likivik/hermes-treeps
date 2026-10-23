@@ -146,3 +146,162 @@ def test_ws_new_default_slug_follows_the_session_id(fake_repo, state_home):
     out = _ws_new({"repo": "repo"}, "sid-abcdef123456")
     assert out["ok"] is True, out
     assert Path(out["path"]).name == "repo-123456", out
+
+
+# ── not on disk, but on a remote: the clone must be an approved step ──────────
+
+
+@pytest.fixture
+def empty_workspace_root(tmp_path, monkeypatch):
+    """A workspace root with nothing in it, and a repo that is not on disk."""
+    root = tmp_path / "workspaces"
+    root.mkdir()
+    monkeypatch.setattr(STORE, "root_dir", lambda: root)
+
+    def _missing(name):
+        raise STORE.WorkspaceError(f"no repo {name!r} under /Git - existing: ")
+
+    monkeypatch.setattr(STORE, "find_repo", _missing)
+    monkeypatch.setattr(STORE, "clone_repo", lambda name, url: pytest.fail(
+        "nothing may be cloned without the user's approval"
+    ))
+    return root
+
+
+def _fake_remote(monkeypatch, entries):
+    """Point the remote catalogue at a fixed list. No network, ever."""
+    monkeypatch.setattr(STORE, "remote_repos", lambda limit_per_source=5: list(entries))
+
+
+def test_ws_new_off_disk_remote_repo_asks_before_cloning(
+    empty_workspace_root, state_home, monkeypatch
+):
+    """A repo that lives on a remote is NOT "does not exist" - it needs a clone.
+
+    Prevents (P2-3): the tools only ever mentioned local /Git roots, so an
+    agent whose repo lived on Forgejo cloned it on its own initiative, twice,
+    after two failed attempts. The remote catalogue now names the repo and
+    asks; nothing is written to disk until the user says yes.
+    """
+    _fake_remote(monkeypatch, [{
+        "name": "achiyon", "owner": "likivik",
+        "url": "https://forgejo.example/owner/achiyon.git", "source": "forgejo",
+    }])
+    out = _ws_new({"repo": "achiyon", "slug": "work"}, "sid-remote-1")
+    assert out["ok"] is False, out
+    assert out.get("needs_confirmation") is True, out
+    assert out["remote"]["url"] == "https://forgejo.example/owner/achiyon.git", out
+    assert out["remote"]["source"] == "forgejo", out
+    assert "achiyon" in out["error"], out
+    assert "create_repo" in out["error"], out
+    # Nothing was created: the workspace root is untouched.
+    assert list(empty_workspace_root.iterdir()) == [], list(empty_workspace_root.iterdir())
+
+
+def test_ws_new_with_create_repo_clones_after_approval(
+    empty_workspace_root, state_home, monkeypatch
+):
+    """The SECOND call (create_repo=true) is the one that clones.
+
+    Prevents (P2-3): the approval must be actionable, not just a message.
+    The clone is the only thing that writes to the user's disk, and it happens
+    exactly once, on the call the user approved.
+    """
+    _fake_remote(monkeypatch, [{
+        "name": "achiyon", "owner": "likivik",
+        "url": "https://forgejo.example/owner/achiyon.git", "source": "forgejo",
+    }])
+    cloned = []
+    source = empty_workspace_root.parent / "cloned-achiyon"
+    state = {"cloned": False}
+
+    def _fake_clone(name, url):
+        cloned.append((name, url))
+        source.mkdir(exist_ok=True)
+        state["cloned"] = True
+        return source
+
+    def _find(name):
+        if not state["cloned"]:
+            raise STORE.WorkspaceError(f"no repo {name!r} under /Git - existing: ")
+        return source
+
+    monkeypatch.setattr(STORE, "clone_repo", _fake_clone)
+    monkeypatch.setattr(STORE, "find_repo", _find)
+    monkeypatch.setattr(STORE, "is_jj", lambda repo: False)
+    monkeypatch.setattr(STORE, "run", lambda cmd, **kw: None)
+
+    out = _ws_new({"repo": "achiyon", "slug": "work", "create_repo": True}, "sid-remote-2")
+    assert out["ok"] is True, out
+    assert cloned == [("achiyon", "https://forgejo.example/owner/achiyon.git")], cloned
+
+
+def test_ws_new_unknown_repo_names_the_remotes_it_did_see(
+    empty_workspace_root, state_home, monkeypatch
+):
+    """A repo that is nowhere gets told WHICH repos do exist.
+
+    Prevents (P2-3): the old error only listed local directories, so an agent
+    kept guessing repo names against a catalogue it had never been shown.
+    """
+    _fake_remote(monkeypatch, [
+        {"name": "hermes-treeps", "owner": "likivik", "url": "https://gh/o/hermes-treeps", "source": "github"},
+        {"name": "spectacle", "owner": "likivik", "url": "https://gh/o/spectacle", "source": "github"},
+    ])
+    out = _ws_new({"repo": "achiyon", "slug": "work"}, "sid-unknown-1")
+    assert out["ok"] is False, out
+    assert out.get("needs_confirmation") is not True, out
+    assert "hermes-treeps" in out["error"], out
+    assert "spectacle" in out["error"], out
+    assert list(empty_workspace_root.iterdir()) == [], list(empty_workspace_root.iterdir())
+
+
+def test_ws_new_survives_a_dead_remote_catalogue(
+    empty_workspace_root, state_home, monkeypatch
+):
+    """A failing catalogue must not turn into a traceback, and must not clone.
+
+    Prevents (P2-3): `remote_repos` shells out to gh and to Forgejo over
+    HTTP; a dead network used to be able to break the tool answer itself.
+    """
+
+    def _boom(limit_per_source=5):
+        raise RuntimeError("network is down")
+
+    monkeypatch.setattr(STORE, "remote_repos", _boom)
+    out = _ws_new({"repo": "achiyon", "slug": "work"}, "sid-dead-1")
+    assert out["ok"] is False, out
+    assert "Traceback" not in out["error"], out
+    assert "catalogue" in out["error"].lower(), out
+    assert list(empty_workspace_root.iterdir()) == [], list(empty_workspace_root.iterdir())
+
+
+def test_ws_doctor_says_where_a_repo_could_come_from(state_home, monkeypatch):
+    """ws_doctor must answer "where could this come from?", not just "no".
+
+    Prevents (P2-3): with only the local candidate list, a repo that lives on
+    GitHub/Forgejo was indistinguishable from one that does not exist.
+    """
+    _fake_remote(monkeypatch, [{
+        "name": "achiyon", "owner": "likivik", "url": "https://gh/o/achiyon", "source": "github",
+    }])
+    out = json.loads(PLUGIN._tool_doctor({}, session_id="sid-doctor-1"))
+    assert "local_candidates" in out, out
+    assert "remote_candidates" in out, out
+    assert out["repo_roots"], out
+    assert out["candidate_repos"] == out["local_candidates"], out
+    assert [c["name"] for c in out["remote_candidates"]] == ["achiyon"], out
+    assert out["remote_candidates"][0]["source"] == "github", out
+    assert out["remote_error"] == "", out
+
+
+def test_ws_doctor_reports_a_dead_catalogue(state_home, monkeypatch):
+    """A failed lookup is reported as an error, not as "no remote repos"."""
+
+    def _boom(limit_per_source=5):
+        raise RuntimeError("network is down")
+
+    monkeypatch.setattr(STORE, "remote_repos", _boom)
+    out = json.loads(PLUGIN._tool_doctor({}, session_id="sid-doctor-2"))
+    assert out["remote_candidates"] == [], out
+    assert out["remote_error"], out

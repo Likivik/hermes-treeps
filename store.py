@@ -994,21 +994,66 @@ def gc_apply() -> list[str]:
 
 _REMOTE_CACHE: dict[str, Any] | None = None
 
+# Why the last catalogue lookup failed, so a caller can say "the catalogue was
+# unavailable" instead of "there are no remote repos" - the two mean very
+# different things to the user.
+_REMOTE_ERROR: str = ""
+
 
 def remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> list[dict[str, Any]]:
     """The user's repos from GitHub and Forgejo, most recently pushed first.
 
     Remote-first picker source. Falls back to the stale cache, then to local
     candidate_repos(), so a dead network never produces an empty keyboard.
+
+    NEVER raises: this shells out to `gh` and to the Forgejo HTTP API, and a
+    catalogue lookup is a diagnostic, not a gate. A failure must degrade to
+    "no remote repos known" (recorded in _REMOTE_ERROR), never to a traceback
+    in the middle of a ws_new / ws_doctor answer.
     """
+    global _REMOTE_ERROR
+    try:
+        repos, err = _remote_repos(limit_per_source=limit_per_source, cache_s=cache_s)
+    except Exception as exc:  # a catalogue lookup must never break the caller
+        logger.debug("remote catalogue lookup failed", exc_info=True)
+        _REMOTE_ERROR = f"remote catalogue unavailable: {type(exc).__name__}: {exc}"
+        return []
+    _REMOTE_ERROR = err
+    return repos
+
+
+def remote_catalogue(limit_per_source: int = 5) -> tuple[list[dict[str, Any]], str]:
+    """(entries, error) from the remote catalogue. Never raises.
+
+    The single read-only entry point for "does this repo exist on GitHub or
+    Forgejo?". The error string is empty when the lookup worked - including
+    when it worked and found nothing, which is a different answer from "the
+    lookup itself failed".
+    """
+    global _REMOTE_ERROR
+    _REMOTE_ERROR = ""  # a fresh lookup must not inherit the last one's error
+    try:
+        entries = remote_repos(limit_per_source=limit_per_source)
+    except Exception as exc:  # defensive: a caller must never see a traceback
+        logger.debug("remote catalogue lookup failed", exc_info=True)
+        return [], f"remote catalogue unavailable: {type(exc).__name__}: {exc}"
+    if not isinstance(entries, list):
+        return [], "remote catalogue unavailable: unexpected result"
+    clean = [e for e in entries if isinstance(e, dict)]
+    return clean, _REMOTE_ERROR
+
+
+def _remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> tuple[list[dict[str, Any]], str]:
+    """The catalogue lookup itself; returns (repos, error)."""
     import urllib.request
 
     global _REMOTE_CACHE
     now = time.time()
     if _REMOTE_CACHE and now - _REMOTE_CACHE.get("at", 0) < cache_s:
-        return _REMOTE_CACHE["repos"]
+        return _REMOTE_CACHE["repos"], ""
 
     repos: list[dict[str, Any]] = []
+    errors: list[str] = []
     gh = shutil.which("gh")
     try:
         if not gh:
@@ -1028,8 +1073,9 @@ def remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> list[dict[str
                 "source": "github",
                 "pushed_at": r.get("pushedAt", ""),
             })
-    except Exception:
+    except Exception as exc:
         logger.debug("gh repo list failed", exc_info=True)
+        errors.append(f"github: {type(exc).__name__}: {exc}")
 
     try:
         import os
@@ -1049,8 +1095,9 @@ def remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> list[dict[str
                 "source": "forgejo",
                 "pushed_at": r.get("updated_at", ""),
             })
-    except Exception:
+    except Exception as exc:
         logger.debug("forgejo repo search failed", exc_info=True)
+        errors.append(f"forgejo: {type(exc).__name__}: {exc}")
 
     # dedupe by name (github wins on ties), newest first
     seen: dict[str, dict[str, Any]] = {}
@@ -1066,17 +1113,57 @@ def remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> list[dict[str
             tmp.write_text(json.dumps({"at": now, "repos": repos}, indent=2))
             os.replace(tmp, p)
         except Exception:
-            pass
-        return repos
+            # Not fatal: the catalogue is still usable in memory, only the
+            # on-disk fallback copy is lost.
+            logger.debug("could not persist remote catalogue", exc_info=True)
+        return repos, ""
 
     # stale cache, then local disk
     try:
         stale = json.loads((state_dir() / "remote_repos.json").read_text())
         if stale.get("repos"):
-            return stale["repos"]
+            return stale["repos"], ""
     except Exception:
-        pass
-    return [{"name": n, "url": "", "source": "local", "pushed_at": ""} for n in candidate_repos(limit=6)]
+        # No stale cache on disk (or it is unreadable): fall through to the
+        # local names. Not fatal - the caller still gets an answer.
+        logger.debug("no usable stale remote catalogue", exc_info=True)
+    err = ("remote catalogue unavailable: " + "; ".join(errors)) if errors else ""
+    return (
+        [{"name": n, "owner": "", "url": "", "source": "local", "pushed_at": ""} for n in candidate_repos(limit=6)],
+        err,
+    )
+
+
+def clone_target(name: str) -> Path:
+    """Where a clone of `name` would land, without cloning it.
+
+    Read-only: the gate and ws_new both want to TELL the user the
+    destination before anything is written to their disk.
+    """
+    # Prefer the agent's own root: /Git itself is likivik's, and clones landing
+    # there would violate the likivik/hermes ownership split.
+    for b in ("/Git/hermes", "/Git"):
+        base = Path(b)
+        if base.is_dir() and os.access(base, os.W_OK):
+            return base / name
+    return Path(REPO_ROOTS[0]) / name
+
+
+def clone_repo(name: str, url: str) -> Path:
+    """Clone `name` from `url` into the repo root. The explicit, approved step.
+
+    Separate from ensure_local() on purpose: ensure_local() clones as a
+    side effect of "give me a checkout", while this one is only ever reached
+    after the user approved a clone (ws_new with create_repo=true).
+    """
+    if not url:
+        raise WorkspaceError(f"repo {name!r} has no clone URL")
+    dest = clone_target(name)
+    if dest.exists():
+        raise WorkspaceError(f"{dest} already exists but is not a repo")
+    base = dest.parent
+    run(["jj", "git", "clone", "--colocate", url, str(dest)], cwd=base)
+    return dest
 
 
 def ensure_local(name: str, url: str) -> Path:
