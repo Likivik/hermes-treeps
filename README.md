@@ -74,7 +74,7 @@ to a stale cache, then to local repos under `REPO_ROOTS`.
 ## Install
 
 ```
-hermes plugins install Likivik/hermes-workspaces
+hermes plugins install Likivik/hermes-1s1ws-warden
 ```
 
 ## License
