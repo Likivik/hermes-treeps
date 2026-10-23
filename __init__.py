@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 from . import store
@@ -104,11 +107,26 @@ def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
         "description": "Show this session's workspace binding and every workspace under the root.",
         "parameters": {"type": "object", "properties": {}},
     }
+    doctor_schema = {
+        "name": "ws_doctor",
+        "description": (
+            "Diagnose why workspace resolution failed: binding state (unbound / stale / bound), "
+            "the recorded path and whether it still exists, candidate repos, and whether jj/gh "
+            "are resolvable. Set forget=true to drop a dead record."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "forget": {"type": "boolean", "description": "drop this session's record, making it unbound"},
+            },
+        },
+    }
     return (
         ("ws_new", new_schema, _tool_new),
         ("ws_chatting", chat_schema, _tool_chatting),
         ("ws_rename", rename_schema, _tool_rename),
         ("ws_status", status_schema, _tool_status),
+        ("ws_doctor", doctor_schema, _tool_doctor),
     )
 
 
@@ -214,6 +232,49 @@ def _tool_status(args: dict[str, Any], **kw: Any) -> str:
     )
 
 
+def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
+    """Answer "why won't this session resolve?" from one place, without shell.
+
+    Deliberately usable while unresolved: it is the repair tool for the gate, so
+    it must never be behind the gate.
+    """
+    sid = _session_id(kw)
+    try:
+        detail = store.resolve_detail(sid)
+        out: dict[str, Any] = {
+            "session_id": sid,
+            "state": detail["state"],
+            "reason": detail["reason"],
+            "path": detail["path"],
+            "path_exists": bool(detail["path"]) and Path(str(detail["path"])).exists(),
+            "record": detail["record"],
+            "candidate_repos": store.candidate_repos(limit=8),
+            "tools": {"jj": shutil.which("jj"), "gh": shutil.which("gh")},
+            "state_dir": str(store.state_dir()),
+        }
+        if args.get("forget"):
+            out["forgot"] = store.forget(sid)
+        return json.dumps(out, indent=2, default=str)
+    except Exception as e:
+        logger.exception("ws_doctor failed")
+        return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+def _readonly_allowed(tool_name: str, kw: dict[str, Any]) -> bool:
+    """Read-only diagnosis is never gated: the gate must not block its own repair.
+
+    The invariant is about *editing* and *running commands* in a tree nobody
+    chose. Blocking reads is what turned a stale binding into a dead session: the
+    agent could not read the plugin's own source to say why resolution failed,
+    and neither could it read the state file that held the answer. Logged so the
+    relaxation stays visible.
+    """
+    if tool_name not in {"read_file", "search_files"}:
+        return False
+    logger.info("gate: allowing read-only %s while unresolved (repair path)", tool_name)
+    return True
+
+
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
     """Block repo-touching tools until the session resolves a workspace."""
     # Read the recency tracker BEFORE noting this call's session id: the tracker
@@ -280,6 +341,25 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             listing = ", ".join(repos) if repos else "(none found under /Git)"
         except Exception:
             listing = "(could not scan /Git)"
+        detail = store.resolve_detail(sid)
+        if detail["state"] == "unbound" and _readonly_allowed(tool_name, kw):
+            return None
+        if detail["state"] == "stale":
+            # A dead path is NOT "no choice yet". Say which tree vanished: the
+            # user can usually point straight at where it moved.
+            return {
+                "action": "block",
+                "message": (
+                    "This session's workspace binding is STALE, not missing: "
+                    f"{detail['reason']}\n"
+                    "Tell the user the exact path that disappeared, then call ONE of:\n"
+                    "  ws_doctor()                    - full diagnosis (state, record, candidates, tool paths)\n"
+                    "  ws_doctor(forget=true)         - drop the dead record; the session starts unbound\n"
+                    "  ws_new(path=<new path>, rebind=true) - bind where the tree lives now\n"
+                    "  ws_chatting()                  - talk-only, if the work is no longer in a checkout\n"
+                    f"Candidate repos: {listing}"
+                ),
+            }
         return {
             "action": "block",
             "message": (
@@ -338,8 +418,14 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
     try:
         sid = session_id or _session_id(kw)
         picker.note_session_id(sid)
-        if store.read_state(sid) is not None:
+        detail = store.resolve_detail(sid)
+        if detail["state"] == "bound":
             return  # already resolved once: don't re-ask on every resume
+        if detail["state"] == "stale":
+            # Do NOT go quiet on a dead path: fall through to the picker/inject
+            # path so the user gets a fresh choice instead of a session that
+            # silently refuses every tool.
+            logger.warning("session %s has a stale binding: %s", sid, detail["reason"])
 
         # Telegram: an inline keyboard is the whole point - one tap, no typing.
         # `platform` arrives as whatever the agent carries (str, enum, or empty),

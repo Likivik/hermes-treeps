@@ -16,6 +16,7 @@ provides_tools:
   - ws_chatting
   - ws_rename
   - ws_status
+  - ws_doctor
 provides_hooks:
   - pre_tool_call
   - on_session_start

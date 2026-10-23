@@ -10,15 +10,38 @@ drift out of sync with the filesystem.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_ROOT = "/Git/hermes/workspaces"
 REPO_ROOTS = ("/Git", "/Git/hermes", "/Git/likivik", "/Git/repos")
+
+# The gateway service runs with a narrowed PATH — /run/current-system/sw/bin is
+# not in it — so `gh` and `jj` are invisible to every subprocess unless the dirs
+# are added here. Done once at import so all call sites stay unchanged. Without
+# this, `gh repo list` raises FileNotFoundError inside remote_repos() and the
+# Telegram workspace picker never sends its keyboard.
+_EXTRA_BIN_DIRS = ("/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin")
+
+
+def ensure_tool_path() -> list[str]:
+    """Prepend missing bin dirs to PATH; returns the dirs that were added."""
+    parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    missing = [d for d in _EXTRA_BIN_DIRS if d not in parts and Path(d).is_dir()]
+    if missing:
+        os.environ["PATH"] = os.pathsep.join(missing + parts)
+    return missing
+
+
+ensure_tool_path()
 
 # Tools that can touch a filesystem or run commands. Blocked until the session
 # resolves a workspace (see the gate in __init__).
@@ -101,14 +124,63 @@ def write_state(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def resolve(session_id: str) -> dict[str, Any] | None:
-    """The resolved mode for a session, or None when it has not chosen yet."""
+def resolve_detail(session_id: str) -> dict[str, Any]:
+    """Resolution *with* the reason, so a stale binding is never read as unbound.
+
+    Three states, and the middle one is the one that used to hide: a session
+    whose record points at a path that has since moved, been renamed, or been
+    trashed. ``resolve()`` returned the record anyway, the gate then refused with
+    "no workspace resolved", and the user saw a session that simply would not
+    work. Never collapse stale into unbound again.
+    """
     st = read_state(session_id)
     if not st:
-        return None
-    if st.get("mode") not in {"repo", "chatting", "external"}:
-        return None
-    return st
+        return {"state": "unbound", "record": None, "path": None, "reason": "no record for this session"}
+    mode = st.get("mode")
+    if mode not in {"repo", "chatting", "external"}:
+        return {
+            "state": "unbound",
+            "record": st,
+            "path": None,
+            "reason": f"record has unknown mode {mode!r}",
+        }
+    if mode == "chatting":
+        return {"state": "bound", "record": st, "path": None, "reason": "chatting"}
+    path = str(st.get("path") or "")
+    if not path:
+        return {"state": "stale", "record": st, "path": "", "reason": "record names no path"}
+    p = Path(path).expanduser()
+    if not p.exists():
+        return {
+            "state": "stale",
+            "record": st,
+            "path": path,
+            "reason": f"workspace path is gone: {path}",
+        }
+    if not p.is_dir():
+        return {
+            "state": "stale",
+            "record": st,
+            "path": path,
+            "reason": f"workspace path is not a directory: {path}",
+        }
+    return {"state": "bound", "record": st, "path": path, "reason": ""}
+
+
+def resolve(session_id: str) -> dict[str, Any] | None:
+    """The resolved mode for a session, or None when it has no *usable* binding."""
+    detail = resolve_detail(session_id)
+    return detail["record"] if detail["state"] == "bound" else None
+
+
+def forget(session_id: str) -> bool:
+    """Drop this session's record so it starts unbound again. True if one existed."""
+    p = _state_path(session_id)
+    try:
+        p.unlink()
+        return True
+    except FileNotFoundError:
+        return False
 
 
 def mark_chatting(session_id: str, title: str = "") -> dict[str, Any]:
@@ -239,18 +311,30 @@ def create_repo(name: str) -> Path:
 
 
 def bind_external(path: str, session_id: str, title: str = "") -> dict[str, Any]:
-    """Bind a session to an existing repo OUTSIDE the workspace root.
+    """Bind a session to an existing directory OUTSIDE the workspace root.
 
-    No checkout is created: the session works in that tree directly. The path
-    must be an existing jj/git repo - binding /etc or a random directory is
-    refused here, not at the tool layer.
+    No checkout is created: the session works in that tree directly. Any absolute
+    directory is accepted - refusing non-repos here pushed people into inventing
+    workarounds - but a non-repo binding is flagged in the record so the prompt
+    can say so. A missing path is reported as *missing*, never as "not a
+    directory": that message cost a whole session once (a tree had been moved to
+    /Storage/trash-workspaces-* and the tool refused the new path with the wrong
+    word).
     """
-    p = Path(path).expanduser().resolve()
+    if not path or not str(path).strip():
+        raise WorkspaceError("path must be a non-empty absolute path")
+    raw = Path(str(path)).expanduser()
+    if not raw.is_absolute():
+        raise WorkspaceError(f"path must be absolute, got {path!r}")
+    p = raw.resolve()
+    if not p.exists():
+        raise WorkspaceError(f"{p} does not exist (the path is gone, not merely invalid)")
     if not p.is_dir():
-        raise WorkspaceError(f"{p} is not a directory")
-    if not (is_jj(p) or (p / ".git").exists() or (p / ".git").is_file()):
-        raise WorkspaceError(f"{p} is not a jj or git repository")
-    state = {"mode": "external", "repo": p.name, "slug": p.name, "path": str(p)}
+        raise WorkspaceError(f"{p} exists but is not a directory")
+    is_repo = is_jj(p) or (p / ".git").exists() or (p / ".git").is_file()
+    state: dict[str, Any] = {"mode": "external", "repo": p.name, "slug": p.name, "path": str(p)}
+    if not is_repo:
+        state["not_a_repo"] = True
     if title:
         state["title"] = title.strip()
     write_state(session_id, state)
@@ -726,12 +810,17 @@ def remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> list[dict[str
         return _REMOTE_CACHE["repos"]
 
     repos: list[dict[str, Any]] = []
+    gh = shutil.which("gh")
     try:
+        if not gh:
+            raise FileNotFoundError("gh is not on PATH")
         raw = subprocess.run(
-            ["gh", "repo", "list", "--limit", str(limit_per_source),
+            [gh, "repo", "list", "--limit", str(limit_per_source),
              "--json", "nameWithOwner,url,pushedAt"],
             capture_output=True, text=True, timeout=30,
         )
+        if raw.returncode != 0:
+            raise RuntimeError((raw.stderr or "").strip()[:200] or f"gh exited {raw.returncode}")
         for r in json.loads(raw.stdout or "[]"):
             repos.append({
                 "name": r["nameWithOwner"].split("/")[-1],
