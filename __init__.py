@@ -861,7 +861,7 @@ def _cli(args) -> int:
             print("session marked as chatting")
             return 0
         if action == "migrate":
-            out = store.migrate_legacy()
+            out = store.migrate_legacy(dry_run=bool(getattr(args, "dry_run", False)))
             print(json.dumps(out, indent=2, default=str))
             if not getattr(args, "purge", False):
                 return 0

@@ -624,13 +624,18 @@ def _import_workspace_record(conn: sqlite3.Connection, path: Path, record: dict[
     return True
 
 
-def migrate_legacy(workspace_root: Path | None = None) -> dict[str, Any]:
+def migrate_legacy(workspace_root: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
     """Import the legacy JSON records into the database. Idempotent.
 
     Imports the per-session state files and every workspace's
     ``.hermes/session.json``. A corrupt file is skipped with a warning - one
     broken record must not abort the migration of the rest. Existing rows are
     never overwritten, so running this twice cannot lose a binding.
+
+    ``dry_run`` counts what would be imported and then rolls the whole thing
+    back: a preview that writes is not a preview, and the first version of
+    this function proved that the hard way by importing 38 rows under
+    ``--dry-run``.
     """
     conn = connect()
     root = Path(workspace_root) if workspace_root is not None else None
@@ -680,15 +685,20 @@ def migrate_legacy(workspace_root: Path | None = None) -> dict[str, Any]:
                 except Exception as exc:
                     logger.warning("could not import legacy record %s (%s); skipping", rec_path, exc)
                     skipped.append(str(rec_path))
-        conn.commit()
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
 
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    set_kv("migrated_at", stamp)
+    if not dry_run:
+        set_kv("migrated_at", stamp)
     return {
         "imported_bindings": imported_bindings,
         "imported_workspaces": imported_workspaces,
         "skipped": skipped,
-        "migrated_at": stamp,
+        "migrated_at": "" if dry_run else stamp,
+        "dry_run": dry_run,
     }
 
 
