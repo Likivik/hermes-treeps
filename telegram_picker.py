@@ -71,7 +71,7 @@ def _allowlist() -> list[int]:
         from hermes_cli.config import load_config_readonly  # type: ignore
 
         cfg = load_config_readonly() or {}
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-workspaces") or {}
+        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-treeps") or {}
         ids = entry.get("allowed_user_ids") or []
         return [int(i) for i in ids]
     except Exception:
@@ -84,7 +84,7 @@ def _tapper_allowed(user_id: Any) -> bool:
         if not TG.get("warned_no_allowlist"):
             TG["warned_no_allowlist"] = True
             logger.warning(
-                "hermes-workspaces.allowed_user_ids is unset: ANY group member can tap "
+                "hermes-treeps.allowed_user_ids is unset: ANY group member can tap "
                 "the workspace picker and create workspaces under this session"
             )
         return True

@@ -1,4 +1,4 @@
-name: hermes-1s1ws-warden
+name: hermes-treeps
 version: 0.2.0
 description: >
   One jj workspace per session, enforced. A session is either bound to a repo

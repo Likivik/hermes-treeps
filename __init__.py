@@ -1,4 +1,4 @@
-"""hermes-workspaces: one jj workspace per session, enforced.
+"""hermes-treeps: one jj workspace per session, enforced.
 
 The gate is the point. Until a session resolves either a repo (``ws_new``) or
 "just chatting" (``ws_chatting``), the tools that could touch a filesystem are
@@ -33,7 +33,7 @@ _LAST_DELEGATION = {"sid": "", "at": 0.0}
 # {repos} is filled at register() from the live candidate list: a hardcoded
 # example here went stale the first time a repo moved.
 _PROMPT_TEMPLATE = """\
-## Workspace discipline (hermes-workspaces)
+## Workspace discipline (hermes-treeps)
 
 This session starts unresolved. Repository work - anything that reads, writes or
 runs commands in a checkout - requires a workspace first:
@@ -311,7 +311,7 @@ def _inject_first_message_enabled() -> bool:
         from hermes_cli.config import load_config_readonly  # type: ignore
 
         cfg = load_config_readonly() or {}
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-workspaces") or {}
+        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-treeps") or {}
         return bool(entry.get("inject_first_message"))
     except Exception:
         return False
@@ -333,7 +333,7 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
     On Telegram the picker keyboard is that first thing (see telegram_picker).
     Elsewhere, inject_message() queues user-role input so the session opens with
     the question itself - gateway sessions additionally need a session_key/origin
-    plus `plugins.entries.hermes-workspaces.inject_first_message: true`.
+    plus `plugins.entries.hermes-treeps.inject_first_message: true`.
     """
     try:
         sid = session_id or _session_id(kw)

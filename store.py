@@ -1,4 +1,4 @@
-"""Session <-> jj workspace bookkeeping for the hermes-workspaces plugin.
+"""Session <-> jj workspace bookkeeping for the hermes-treeps plugin.
 
 One invariant holds the whole thing together: a session is bound to exactly one
 workspace, or to no workspace at all ("just chatting"). Records live in the
@@ -50,7 +50,7 @@ def hermes_home() -> Path:
 
 
 def state_dir() -> Path:
-    d = hermes_home() / "plugins" / "hermes-workspaces" / "state"
+    d = hermes_home() / "plugins" / "hermes-treeps" / "state"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -64,7 +64,7 @@ def root_dir() -> Path:
         from hermes_cli.config import load_config_readonly  # type: ignore
 
         cfg = load_config_readonly() or {}
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-workspaces") or {}
+        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-treeps") or {}
         if entry.get("root"):
             return Path(str(entry["root"]))
     except Exception:

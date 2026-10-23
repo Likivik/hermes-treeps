@@ -1,4 +1,4 @@
-# hermes-workspaces
+# hermes-treeps
 
 One jj workspace per Hermes session, enforced.
 
@@ -53,7 +53,7 @@ else's tree.
 ```yaml
 plugins:
   entries:
-    hermes-workspaces:
+    hermes-treeps:
       allowed_user_ids: [<telegram ids that may tap the picker>]
       inject_first_message: false   # open gateway sessions with the question itself (runs an extra turn)
 ```
@@ -74,7 +74,7 @@ to a stale cache, then to local repos under `REPO_ROOTS`.
 ## Install
 
 ```
-hermes plugins install Likivik/hermes-1s1ws-warden
+hermes plugins install Likivik/hermes-treeps
 ```
 
 ## License
