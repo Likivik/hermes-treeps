@@ -148,11 +148,32 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         slug = str(args.get("slug") or "").strip()
 
         existing = store.read_state(sid)
+        path = str(args.get("path") or "").strip()
+        repo = str(args.get("repo") or "").strip()
+
+        if not path and not repo:
+            return json.dumps({"ok": False, "error": "ws_new needs repo (or path for an external repo)"})
+
+        if not slug and not path:
+            # Stable naming: the path follows the session id, never the title.
+            # Titles get renamed constantly and there is no rename hook to keep a
+            # path in sync; an id-derived slug needs no syncing at all.
+            slug = f"{repo}-{sid[-6:]}" if sid and sid != "unknown" else repo
+        # The comparison is on (repo, slug), not the slug alone: two repos can
+        # share a slug, and comparing slugs alone let a session bound to repo A
+        # silently bind repo B's workspace of the same name. The requested slug
+        # is sanitised the same way create() will sanitise it, so "same
+        # workspace, different spelling" is not read as a re-bind.
+        #
+        # The confirmation covers BOTH directions: a session bound to a repo
+        # workspace and then asked for an external path (or the other way
+        # round) is the same silent re-binding, so `mode in {repo, external}`
+        # is compared against the request in one place.
         if (
             existing
-            and existing.get("mode") == "repo"
+            and existing.get("mode") in {"repo", "external"}
             and not args.get("rebind")
-            and str(existing.get("slug")) != slug
+            and _binding_key(existing) != _requested_key(args, repo, slug)
         ):
             # 1:1 by default; re-binding is explicit, never a silent append.
             return json.dumps({
@@ -165,32 +186,109 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
                 ),
             })
 
-        if args.get("path"):
-            state = store.bind_external(str(args.get("path")), sid, title=title)
+        if path:
+            state = store.bind_external(path, sid, title=title)
+            _detach_previous(existing, state["path"], sid, args.get("rebind"))
             return json.dumps({"ok": True, "mode": "external", "path": state["path"]})
 
-        repo = str(args.get("repo") or "").strip()
-        if not repo:
-            return json.dumps({"ok": False, "error": "ws_new needs repo (or path for an external repo)"})
-        if not slug:
-            # Stable naming: the path follows the session id, never the title.
-            # Titles get renamed constantly and there is no rename hook to keep a
-            # path in sync; an id-derived slug needs no syncing at all.
-            slug = f"{repo}-{sid[-6:]}" if sid and sid != "unknown" else repo
+        # Idempotence: re-requesting the workspace this session is ALREADY
+        # bound to must not try to create it a second time. create() refuses
+        # an existing directory, so without this a harmless repeat of the
+        # same request came back as an error ("... already exists") even
+        # though the session's binding was already correct.
+        requested = _requested_key(args, repo, slug)
+        if existing and _binding_key(existing) == requested:
+            existing_path = Path(str(existing.get("path") or ""))
+            if existing_path.is_dir():
+                out = {"ok": True, "path": str(existing_path)}
+                if existing.get("mode") == "repo":
+                    out["vcs"] = (store.read_record(existing_path) or {}).get("vcs", "jj")
+                else:
+                    out["mode"] = "external"
+                return json.dumps(out)
+
         if args.get("create_repo"):
             store.create_repo(repo)
         record = store.create(repo, slug, purpose=str(args.get("purpose") or ""))
-        store.bind_session(store.workspace_path(repo, slug), sid)
-        state = {"mode": "repo", "repo": repo, "slug": slug, "path": record["path"]}
+        # WHY the record's slug/path and not our own copy: create() SANITISES
+        # the slug ("Fix The Widget" -> "fix-the-widget"). Binding the raw slug
+        # pointed at a path that does not exist, so the session stayed unbound
+        # and the created workspace leaked, unbound, forever.
+        bound_slug = str(record.get("slug") or slug)
+        bound_path = str(record.get("path") or store.workspace_path(repo, bound_slug))
+        store.bind_session(Path(bound_path), sid)
+        # Rebinding detaches the PREVIOUS workspace: otherwise the old tree
+        # still lists this session as live, and retire() refuses it forever
+        # while it also stays on disk, unowned.
+        _detach_previous(existing, bound_path, sid, args.get("rebind"))
+        state = {"mode": "repo", "repo": repo, "slug": bound_slug, "path": bound_path}
         if title:
             state["title"] = title
         store.write_state(sid, state)
-        return json.dumps({"ok": True, "path": record["path"], "vcs": record["vcs"]})
+        return json.dumps({"ok": True, "path": bound_path, "vcs": record["vcs"]})
     except store.WorkspaceError as e:
         return json.dumps({"ok": False, "error": str(e)})
     except Exception as e:  # never raise into the tool dispatcher
         logger.exception("ws_new failed")
         return json.dumps({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+def _detach_previous(
+    existing: dict[str, Any] | None, new_path: str, sid: str, rebind: Any
+) -> None:
+    """Drop this session from the workspace it was bound to before.
+
+    Prevents (P1-6): rebinding used to leave the OLD workspace still listing
+    the session as live, so retire() refused it forever ("bound session still
+    live") while it sat on disk, owned by nobody and impossible to clean up.
+    The old tree is NOT deleted - only the session's claim on it is dropped.
+    """
+    if not rebind or not existing:
+        return
+    old_path = str(existing.get("path") or "")
+    if not old_path or Path(old_path) == Path(new_path):
+        return
+    try:
+        store.detach(Path(old_path), sid)
+    except Exception:
+        logger.warning("could not detach %s from %s", sid, old_path, exc_info=True)
+
+
+def _binding_key(state: dict[str, Any]) -> tuple[str, str]:
+    """The (repo, slug) a session is currently bound to.
+
+    An external binding is keyed by its path, so asking for the same external
+    path again is not read as a re-bind.
+    """
+    if state.get("mode") == "external":
+        return ("external", str(state.get("path") or ""))
+    return (str(state.get("repo") or ""), str(state.get("slug") or ""))
+
+
+def _requested_key(args: dict[str, Any], repo: str, slug: str) -> tuple[str, str]:
+    """The (repo, slug) a ws_new call is asking for, in the same shape.
+
+    Compared against _binding_key() so "same repo, same workspace" is the only
+    case that needs no confirmation. The slug is sanitised first, because
+    create() sanitises it: without that, re-requesting the same workspace with
+    a different spelling looked like a re-bind.
+    """
+    path = str(args.get("path") or "").strip()
+    if path:
+        # The same key shape as _binding_key(), which keys an external binding
+        # by its RESOLVED path (that is what bind_external stores). Resolving
+        # here too means "the same tree, spelled differently" (a trailing
+        # slash, a symlink, a relative segment) is recognised as the same
+        # binding instead of being read as a re-bind.
+        try:
+            path = str(Path(path).expanduser().resolve())
+        except OSError:
+            # Not fatal: compare the path verbatim. This is only the key used to
+            # decide "same binding or re-bind?", and bind_external raises the
+            # real error (with a far better message) when the path is used.
+            pass
+        return ("external", path)
+    return (repo, store.sanitize_slug(slug))
 
 
 def _tool_rename(args: dict[str, Any], **kw: Any) -> str:
@@ -342,14 +440,16 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             is_child = is_delegated_child_context()
         except Exception:
             is_child = False
-        if not is_child and _LAST_DELEGATION["sid"] and time.time() - _LAST_DELEGATION["at"] < 600:
-            # FALLBACK for batch children: upstream #96483 - `_run_single_child`
-            # never enters delegated_child_context(), so batch-spawned children
-            # look like ordinary sessions. Treat "unresolved + recent
-            # delegation dispatch" as a batch child. REMOVE when upstream fixes
-            # #96483; until then a fresh session created within the 10-minute
-            # pointer window inherits too (the known residue).
-            is_child = True
+        # NOTE: there is deliberately NO "recent delegation dispatch" fallback
+        # here any more. The old fallback set is_child=True for ANY unresolved
+        # session while `_LAST_DELEGATION` was younger than 600 s, so an
+        # unrelated pre-existing session inherited another session's workspace
+        # (verified live). The upstream bug it worked around (#96483,
+        # `_run_single_child` not entering delegated_child_context) is FIXED in
+        # the installed Hermes: children run inside delegated_child_context(),
+        # so is_delegated_child_context() is authoritative. `_LAST_DELEGATION`
+        # is now used ONLY to pick WHICH parent id to inherit from, never to
+        # decide whether this session is a child at all.
         if is_child:
             # Parent = the dispatching session (delegation pointer first -
             # ordinary tool calls cannot move it - then the general recency
@@ -364,9 +464,18 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                         "Report this to the user: the parent must run ws_new/ws_chatting first."
                     ),
                 }
-            parent_state["inherited_from"] = parent
-            parent_state["inherited_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-            store.write_state(sid, parent_state)
+            # Non-destructive inheritance: the child's own record wins. If the
+            # child already has a record (it resolved its own workspace, or it
+            # was written by an earlier hook), it is NOT overwritten - the old
+            # code copied the parent's dict wholesale and clobbered it.
+            if store.read_state(sid) is None:
+                inherited = {
+                    k: v for k, v in parent_state.items()
+                    if k not in {"session_id", "inherited_from", "inherited_at"}
+                }
+                inherited["inherited_from"] = parent
+                inherited["inherited_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+                store.write_state(sid, inherited)
             logger.info("gate: delegated child %s inherits binding of %s", sid, parent)
             return None
         try:
