@@ -42,7 +42,9 @@ This session starts unresolved. Repository work - anything that reads, writes or
 runs commands in a checkout - requires a workspace first:
 
 - `ws_new(repo, slug)` creates `/Git/hermes/workspaces/<repo>/<slug>` and binds
-  this session to it. Use for any real work: code, docs, config, git.
+  this session to it. Use for any real work: code, docs, config, git. Omit slug
+  and it defaults to `<repo>-<last 6 of the session id>` - the path is derived
+  from the id, never from the session title, because titles get renamed.
 - `ws_chatting()` declares a talk-only session: cwd stays HERMES_HOME and all
   tools stay available, but nothing repo-shaped should be edited.
 
@@ -170,6 +172,11 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         repo = str(args.get("repo") or "").strip()
         if not repo:
             return json.dumps({"ok": False, "error": "ws_new needs repo (or path for an external repo)"})
+        if not slug:
+            # Stable naming: the path follows the session id, never the title.
+            # Titles get renamed constantly and there is no rename hook to keep a
+            # path in sync; an id-derived slug needs no syncing at all.
+            slug = f"{repo}-{sid[-6:]}" if sid and sid != "unknown" else repo
         if args.get("create_repo"):
             store.create_repo(repo)
         record = store.create(repo, slug, purpose=str(args.get("purpose") or ""))
@@ -273,6 +280,32 @@ def _readonly_allowed(tool_name: str, kw: dict[str, Any]) -> bool:
         return False
     logger.info("gate: allowing read-only %s while unresolved (repair path)", tool_name)
     return True
+
+
+_TITLE_SYNC = {"at": 0.0, "interval": 60.0}
+
+
+def _on_pre_gateway_dispatch(**kw: Any) -> None:
+    """Mirror a renamed session's title into its records, at most once a minute.
+
+    Lazy by necessity: this build has no session-rename hook, and polling the
+    state DB on every message would be wasteful. Metadata only - the workspace
+    path is id-derived and never follows the title.
+    """
+    now = time.time()
+    if now - _TITLE_SYNC["at"] < _TITLE_SYNC["interval"]:
+        return None
+    sid = _session_id(kw) or picker.last_session(max_age_s=600)
+    if not sid or sid == "unknown":
+        return None
+    _TITLE_SYNC["at"] = now
+    try:
+        result = store.sync_title(sid)
+        if result.get("changed"):
+            logger.info("title synced for %s -> %r", sid, result.get("title"))
+    except Exception:
+        logger.debug("title sync failed for %s", sid, exc_info=True)
+    return None
 
 
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
@@ -608,4 +641,8 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
+    try:
+        ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
+    except Exception:
+        logger.debug("pre_gateway_dispatch hook not available in this host", exc_info=True)
     picker.register(ctx)

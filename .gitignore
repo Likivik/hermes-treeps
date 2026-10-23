@@ -1,3 +1,6 @@
 __pycache__/
 state/
 *.pyc
+
+# hermes-treeps writes per-workspace bookkeeping here; never commit it.
+.hermes/

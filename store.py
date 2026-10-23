@@ -190,6 +190,71 @@ def mark_chatting(session_id: str, title: str = "") -> dict[str, Any]:
     return write_state(session_id, state)
 
 
+# ── title mirroring ───────────────────────────────────────────────────────────
+#
+# A session title is a UI label the user renames whenever they like, and this
+# build exposes no rename hook (VALID_HOOKS has no on_session_rename), so the
+# records are reconciled lazily from the state DB instead. Metadata only: the
+# workspace PATH is derived from the session id and never follows a rename
+# (moving a jj workspace leaves jj's internal workspace name stale).
+
+
+def _hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home  # type: ignore
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+
+
+def session_title(session_id: str) -> str:
+    """The session's current title from ``state.db``, or "" when unavailable."""
+    if not session_id:
+        return ""
+    db = _hermes_home() / "state.db"
+    if not db.exists():
+        return ""
+    try:
+        import sqlite3
+
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("SELECT title FROM sessions WHERE id=?", (session_id,)).fetchone()
+        finally:
+            con.close()
+        return str(row[0] or "") if row else ""
+    except Exception:
+        logger.debug("session title lookup failed for %s", session_id, exc_info=True)
+        return ""
+
+
+def sync_title(session_id: str) -> dict[str, Any]:
+    """Mirror a renamed session's title into the session state and workspace record."""
+    title = session_title(session_id)
+    if not title:
+        return {"changed": False, "title": ""}
+    st = read_state(session_id)
+    if not st:
+        return {"changed": False, "title": title}
+    changed = st.get("title") != title
+    if changed:
+        st["title"] = title
+        write_state(session_id, st)
+    path = str(st.get("path") or "")
+    if path:
+        ws = Path(path)
+        if ws.is_dir():
+            rec = read_record(ws) or {}
+            titles = dict(rec.get("titles") or {})
+            if titles.get(session_id) != title:
+                titles[session_id] = title
+                rec["titles"] = titles
+                write_record(ws, rec)
+                changed = True
+    return {"changed": changed, "title": title}
+
+
 # ── repo + workspace discovery ────────────────────────────────────────────────
 
 
