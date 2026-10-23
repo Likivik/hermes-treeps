@@ -289,7 +289,10 @@ def test_ws_doctor_says_where_a_repo_could_come_from(state_home, monkeypatch):
     assert "local_candidates" in out, out
     assert "remote_candidates" in out, out
     assert out["repo_roots"], out
-    assert out["candidate_repos"] == out["local_candidates"], out
+    # One canonical name for the local list: "candidate_repos" was an exact
+    # duplicate of "local_candidates", so a consumer could read either and
+    # never know which one was canonical.
+    assert "candidate_repos" not in out, out
     assert [c["name"] for c in out["remote_candidates"]] == ["achiyon"], out
     assert out["remote_candidates"][0]["source"] == "github", out
     assert out["remote_error"] == "", out

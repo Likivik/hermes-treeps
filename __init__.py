@@ -469,7 +469,9 @@ def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
             "path_exists": bool(detail["path"]) and Path(str(detail["path"])).exists(),
             "record": detail["record"],
             "repo_roots": store.repo_roots(),
-            "candidate_repos": local_candidates,
+            # one name, one value: "candidate_repos" and "local_candidates"
+            # were both emitted with identical contents, so a consumer could
+            # read either and never know which one was canonical.
             "local_candidates": local_candidates,
             "remote_candidates": [
                 {
@@ -682,7 +684,9 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
     On Telegram the picker keyboard is that first thing (see telegram_picker).
     Elsewhere, inject_message() queues user-role input so the session opens with
     the question itself - gateway sessions additionally need a session_key/origin
-    plus `plugins.entries.hermes-treeps.inject_first_message: true`.
+    plus `plugins.entries.hermes-treeps.settings.inject_first_message: true`
+    (the settings namespace; the old top-level
+    `plugins.entries.hermes-treeps.inject_first_message` is never read).
     """
     try:
         sid = session_id or _session_id(kw)
@@ -715,10 +719,17 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
         else:
             if not _inject_first_message_enabled():
                 return
-            key = store.session_key_for(sid)
+            # store has no session_key_for(); the durable key lives in the
+            # host's sessions.json row for this session id, which
+            # store.session_entry() returns as {**entry, "session_key": key}.
+            # Calling a non-existent function raised AttributeError, which the
+            # bare except below swallowed - gateway first-message injection
+            # was dead code.
+            entry = store.session_entry(sid)
+            key = (entry or {}).get("session_key")
             if not key:
                 return
-            kwargs["session_key"] = key
+            kwargs["session_key"] = str(key)
         _CTX.inject_message(_opening_prompt(), role="user", **kwargs)
     except Exception:
         logger.debug("workspace opening prompt skipped", exc_info=True)

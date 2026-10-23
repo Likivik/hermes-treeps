@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 PLUGIN_ID = "hermes-treeps"
 
+# The .env name of the Forgejo token. The manifest declares it as
+# `forgejo_token: {type: secret, env: FORGEJO_TOKEN}`, so the Desktop secret
+# field writes HERE and forgejo_token() reads HERE. The host otherwise derives
+# HERMES_TREEPS_<KEY> from the plugin id, which nothing read - the token was
+# always empty.
+FORGEJO_TOKEN_ENV = "FORGEJO_TOKEN"
+
+# The name the Desktop secret field used before the manifest declared `env:`.
+# Kept as a fallback so an already-written .env entry keeps working.
+FORGEJO_TOKEN_ENV_LEGACY = "HERMES_TREEPS_FORGEJO_TOKEN"
+
 # The keys settings() reads. The test suite compares this set with the
 # ``config_schema`` in plugin.yaml - they must be identical.
 SETTINGS_KEYS: tuple[str, ...] = (
@@ -57,7 +68,15 @@ DEFAULTS: dict[str, Any] = {
     "vcs": "auto",
     "extra_bin_dirs": ["/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin"],
     "picker_enabled": True,
+    # Prevents the "declared but never returned" drift: inject_first_message
+    # was in SETTINGS_KEYS and in plugin.yaml but NOT here, so settings()
+    # never returned it and __init__.py's getter raised KeyError (swallowed
+    # by a bare except) - the feature was permanently dead.
+    "inject_first_message": False,
     "allowed_user_ids": [],
+    # forgejo_token is deliberately NOT here: it is a SECRET, read through
+    # get_secret() below, and a secret must never travel through the config
+    # dict (the manifest declares it separately with `env: FORGEJO_TOKEN`).
     "forgejo_url": "",
 }
 
@@ -213,16 +232,26 @@ def forgejo_token() -> str:
 
     Secrets live in .env and are resolved by ``agent.secret_scope``; the plain
     environment is only a fallback for hosts that do not ship the scope.
+
+    The name ``FORGEJO_TOKEN`` is the one the manifest declares
+    (``forgejo_token: {type: secret, env: FORGEJO_TOKEN}``), so the Desktop
+    secret field and this reader agree. Without that ``env:`` the host derived
+    ``HERMES_TREEPS_FORGEJO_TOKEN`` for the Desktop field while this function
+    read ``FORGEJO_TOKEN`` - the two never met and the token was always empty.
+
+    ``HERMES_TREEPS_FORGEJO_TOKEN`` (the name the Desktop form used to derive
+    on its own) is still read as a fallback, so a token already written to
+    ``.env`` under the old name keeps working.
     """
     try:
         from agent.secret_scope import get_secret  # type: ignore
 
-        val = get_secret("FORGEJO_TOKEN")
+        val = get_secret(FORGEJO_TOKEN_ENV)
         if val:
             return str(val)
     except Exception:
         logger.debug("agent.secret_scope is unavailable; falling back to the environment", exc_info=True)
-    return os.environ.get("FORGEJO_TOKEN", "")
+    return os.environ.get(FORGEJO_TOKEN_ENV) or os.environ.get(FORGEJO_TOKEN_ENV_LEGACY, "")
 
 
 def allowed_user_ids(config: Mapping[str, Any] | None = None) -> list[int]:

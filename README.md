@@ -13,9 +13,14 @@ else's tree.
 
 | File | Purpose |
 |---|---|
-| `__init__.py` | tools (`ws_new`, `ws_chatting`, `ws_rename`, `ws_status`), the tool gate, `hermes ws` CLI, system-prompt section |
+| `__init__.py` | tools (`ws_new`, `ws_chatting`, `ws_rename`, `ws_status`, `ws_doctor`), the tool gate, `hermes ws` CLI, system-prompt section |
 | `telegram_picker.py` | Telegram inline keyboard: repo picker on `/new`, tap handling, `/wsbtn` |
 | `store.py` | workspaces, session records, tokens, remote repo listing (GitHub + Forgejo), retire ladder, gc tiers |
+| `db.py` | the SQLite schema and every query: sessions, bindings, workspaces, remote cache, legacy import |
+| `settings.py` | one accessor for the config: defaults, env overrides, validation, the manifest schema contract |
+| `discovery.py` | repo discovery: local roots plus the GitHub/Forgejo catalogue |
+| `vcs.py` | the jj/git adapter: one API, two backends |
+| `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
 
 ## Behavior
 
@@ -29,7 +34,8 @@ else's tree.
   `rebind=true` instead of silently dual-binding. Rebinding detaches the old
   tree (the directory stays).
 - **Not on disk ≠ does not exist** — `ws_new` for a repo that is not under
-  `REPO_ROOTS` checks the GitHub/Forgejo catalogue. If the repo lives there,
+  the configured `repo_roots` checks the GitHub/Forgejo catalogue. If the repo
+  lives there,
   the answer is `needs_confirmation: true` with the remote's name, owner, url
   and source, and nothing is written to disk; the clone happens only on the
   second call, `ws_new(repo, slug, create_repo=true)`, after the user approves.
@@ -80,9 +86,17 @@ plugins:
 ```
 
 `forgejo_token` is a secret: it is declared in the manifest with
-`type: secret` and is stored in `.env`, never in `config.yaml`. Set it with
-`hermes plugins set-secret hermes-treeps forgejo_token` (or
-`FORGEJO_TOKEN` in the environment).
+`type: secret` and `env: FORGEJO_TOKEN`, and is stored in `.env`, never in
+`config.yaml`. Set it either way:
+
+```
+hermes config set FORGEJO_TOKEN <token>     # writes .env
+```
+
+or through **Desktop → Settings → Plugins → hermes-treeps → forgejo_token**,
+which writes the same `.env` name. The plugin reads that name via the host's
+secret scope (`agent.secret_scope.get_secret`), falling back to the process
+environment.
 
 There is no fallback to the old top-level `plugins.entries.hermes-treeps.<key>`
 form — one namespace, one source of truth. A relative path, an unknown
@@ -90,7 +104,9 @@ form — one namespace, one source of truth. A relative path, an unknown
 the key.
 
 Environment overrides exist for the same keys (`HERMES_TREEPS_WORKSPACE_ROOT`,
-`FORGEJO_URL`, …) and win over `config.yaml`.
+`HERMES_TREEPS_FORGEJO_URL`, `FORGEJO_URL`, …) and win over `config.yaml`.
+`forgejo_token` is not one of them: it is a secret, and it is read from `.env`,
+not from the settings namespace.
 
 ## State
 
@@ -103,8 +119,9 @@ lost half of eight concurrent bindings.
 The plugin install directory holds no state, so `hermes plugins update` can
 replace it without touching anything. Legacy JSON records (the old
 `state/*.json` files and the in-tree `<workspace>/.hermes/session.json` files)
-are imported into the database on first open; `hermes ws migrate --purge`
-deletes the in-tree copies after writing a tarball backup of them.
+are imported into the database by an explicit `hermes ws migrate` — nothing
+imports them on open. `hermes ws migrate --purge` deletes the in-tree copies
+after writing a tarball backup of them.
 
 ## Requirements
 

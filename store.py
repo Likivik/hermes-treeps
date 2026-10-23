@@ -42,9 +42,6 @@ from .errors import WorkspaceError
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ROOT = "/Git/hermes/workspaces"
-REPO_ROOTS = ("/Git", "/Git/hermes", "/Git/likivik", "/Git/repos")
-
 
 def settings() -> dict[str, Any]:
     """The plugin's effective configuration (see :mod:`settings`)."""

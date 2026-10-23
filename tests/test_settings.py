@@ -8,6 +8,7 @@ two sources of truth.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -38,8 +39,8 @@ def test_defaults_reproduce_the_original_constants():
     assert cfg["allowed_user_ids"] == []
     assert cfg["forgejo_url"] == ""
     # The store's own constants must agree with the settings defaults.
-    assert STORE.DEFAULT_ROOT == cfg["workspace_root"]
-    assert list(STORE.REPO_ROOTS) == cfg["repo_roots"]
+    assert settings_module.DEFAULTS["workspace_root"] == cfg["workspace_root"]
+    assert list(settings_module.DEFAULTS["repo_roots"]) == cfg["repo_roots"]
 
 
 def test_a_custom_config_is_honoured():
@@ -109,8 +110,8 @@ def test_a_relative_clone_root_is_refused_and_names_the_key():
 # ── schema drift: the manifest and the code must agree ───────────────────────
 
 
-def _manifest_config_schema() -> dict[str, str]:
-    """The ``config_schema`` block of plugin.yaml, as {key: type}.
+def _manifest_config_schema() -> dict[str, dict[str, str]]:
+    """The ``config_schema`` block of plugin.yaml, as {key: {field: value}}.
 
     Parsed by hand rather than with PyYAML: the CI image installs pytest and
     nothing else, and the plugin itself depends on the stdlib alone.
@@ -124,7 +125,7 @@ def _manifest_config_schema() -> dict[str, str]:
             start = i + 1
             break
     assert start is not None, "plugin.yaml has no config_schema block"
-    schema: dict[str, str] = {}
+    schema: dict[str, dict[str, str]] = {}
     key = None
     for line in lines[start:]:
         if not line.strip() or line.lstrip().startswith("#"):
@@ -135,10 +136,115 @@ def _manifest_config_schema() -> dict[str, str]:
         stripped = line.strip()
         if indent == 2 and stripped.endswith(":"):
             key = stripped[:-1]
-            schema[key] = ""
-        elif indent == 4 and key and stripped.startswith("type:"):
-            schema[key] = stripped.split(":", 1)[1].strip()
+            schema[key] = {}
+        elif indent == 4 and key and ":" in stripped:
+            name, _, value = stripped.partition(":")
+            schema[key][name.strip()] = value.strip()
     return schema
+
+
+def _settings_source_keys() -> set[str]:
+    """Every settings key the SOURCE of settings.py mentions.
+
+    WHY: the old drift test compared two hand-maintained lists (the module's
+    ``SETTINGS_KEYS`` and the manifest's ``config_schema``). A key missing
+    from BOTH sides kept the suite green - that is exactly how
+    ``inject_first_message`` ended up declared in the manifest and in
+    ``SETTINGS_KEYS`` but absent from ``DEFAULTS``, so ``settings()`` never
+    returned it and the feature was dead.
+
+    So the key set is read out of the module's own source: the ``DEFAULTS``
+    dict, the ``ENV_OVERRIDES`` values (each names the setting it overrides),
+    the ``SETTINGS_KEYS``/``SECRET_KEYS`` tuples, and every key the module's
+    accessors read out of the settings dict (a ``d["key"]`` subscript or a
+    ``d.get("key")`` call).
+
+    The accessor scan skips ``_settings_entry``/``_load_config``: those read
+    the CONFIG PATH (``plugins``/``entries``/``settings``), not setting keys.
+
+    The whole package is scanned as well: every ``settings()["key"]`` read in
+    ``store.py``, ``discovery.py``, ``telegram_picker.py``, ``db.py`` and
+    ``__init__.py`` names a key that must exist. That is what catches a key
+    deleted from ``DEFAULTS``, ``SETTINGS_KEYS`` and the manifest at once -
+    the consumer still asks for it and would get a ``KeyError``.
+    """
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "settings.py").read_text())
+
+    def _const_tuple(node: ast.AST | None) -> list[str]:
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return [e.value for e in node.elts
+                    if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        return []
+
+    def _dict_keys(node: ast.AST | None) -> list[str]:
+        """The keys of a dict literal (any value type)."""
+        if not isinstance(node, ast.Dict):
+            return []
+        return [k.value for k in node.keys
+                if isinstance(k, ast.Constant) and isinstance(k.value, str)]
+
+    def _dict_items(node: ast.AST | None) -> list[tuple[str, str]]:
+        """(key, value) of a dict literal, both plain strings."""
+        if not isinstance(node, ast.Dict):
+            return []
+        out = []
+        for k, v in zip(node.keys, node.values):
+            if (isinstance(k, ast.Constant) and isinstance(k.value, str)
+                    and isinstance(v, ast.Constant) and isinstance(v.value, str)):
+                out.append((k.value, v.value))
+        return out
+
+    keys: set[str] = set()
+
+    # module-level constants (plain assignments and annotated ones)
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            name, value = node.targets[0].id, node.value
+        else:
+            continue
+        if name == "DEFAULTS":
+            keys.update(_dict_keys(value))
+        elif name == "ENV_OVERRIDES":
+            # ENV VAR -> setting key: the VALUE is the settings key.
+            keys.update(v for _, v in _dict_items(value))
+        elif name in ("SETTINGS_KEYS", "SECRET_KEYS"):
+            keys.update(_const_tuple(value))
+
+    # accessor reads: d["key"] and d.get("key"), outside the config-path helpers
+    for fn in [n for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+        if fn.name in ("_settings_entry", "_load_config"):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+                if isinstance(node.slice.value, str):
+                    keys.add(node.slice.value)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == "get" and node.args
+                  and isinstance(node.args[0], ast.Constant)
+                  and isinstance(node.args[0].value, str)):
+                keys.add(node.args[0].value)
+
+    # The consumers: every settings()["key"] read anywhere in the package.
+    for path in sorted(root.glob("*.py")):
+        if path.name == "settings.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Constant):
+                continue
+            if not isinstance(node.slice.value, str):
+                continue
+            call = node.value
+            if not isinstance(call, ast.Call):
+                continue
+            func = call.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name == "settings":
+                keys.add(node.slice.value)
+    return keys
 
 
 def test_plugin_yaml_declares_exactly_the_keys_settings_reads():
@@ -147,18 +253,112 @@ def test_plugin_yaml_declares_exactly_the_keys_settings_reads():
     WHY: the Desktop settings form is generated from the manifest. A key the
     code reads but the manifest does not declare is invisible to the user, and
     a key the manifest declares but the code ignores is a lie.
+
+    The key set comes from the SOURCE (see :func:`_settings_source_keys`), not
+    from a second hand-maintained list: a key that is missing from both the
+    module's list and the manifest must FAIL this test, not pass it.
     """
     schema = _manifest_config_schema()
     declared = set(schema)
-    read = set(settings_module.SETTINGS_KEYS)
-    secrets = set(settings_module.SECRET_KEYS)
-    assert declared == read | secrets, (
+    source_keys = _settings_source_keys()
+    assert declared == source_keys, (
         f"plugin.yaml config_schema {sorted(declared)} != "
-        f"settings keys {sorted(read)} + secrets {sorted(secrets)}"
+        f"the keys settings.py actually uses {sorted(source_keys)}"
     )
-    for key, stype in schema.items():
+    for key, spec in schema.items():
+        stype = spec.get("type", "")
         assert stype, f"{key} declares no type"
         assert stype in ("str", "list", "bool", "int", "secret"), f"{key}: {stype}"
+
+
+def test_defaults_and_settings_keys_agree():
+    """``DEFAULTS`` and ``SETTINGS_KEYS`` must name the same keys.
+
+    WHY: this is the drift that killed ``inject_first_message``. It was in
+    ``SETTINGS_KEYS`` and in the manifest but NOT in ``DEFAULTS``, so
+    ``settings()`` never returned it and the caller raised ``KeyError`` - which
+    a bare ``except`` swallowed, leaving the feature silently dead.
+    """
+    defaults = set(settings_module.DEFAULTS)
+    listed = set(settings_module.SETTINGS_KEYS)
+    assert defaults == listed, (
+        f"DEFAULTS {sorted(defaults)} != SETTINGS_KEYS {sorted(listed)}; "
+        "a key in one but not the other is dead or undeclared"
+    )
+
+
+def test_every_declared_key_has_a_default():
+    """Each settings key the manifest declares must be returned by settings().
+
+    The cheapest guard against the KeyError class of bug: whatever the
+    manifest promises, ``settings()`` must actually hand back.
+    """
+    cfg = settings_module.settings()
+    for key in settings_module.SETTINGS_KEYS:
+        assert key in cfg, f"settings() does not return the declared key {key!r}"
+
+
+def test_the_gateway_injection_calls_a_function_that_exists():
+    """``__init__.py`` must not call a store function that does not exist.
+
+    WHY: the gateway first-message injection called
+    ``store.session_key_for(sid)``, which store.py never defined (it has
+    ``session_entry``/``session_for_chat``). The ``AttributeError`` was
+    swallowed by a bare ``except``, so the branch was dead code that looked
+    alive. This test walks the AST of ``__init__.py`` and checks every
+    ``store.<name>(...)`` call against the real store module.
+    """
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "__init__.py").read_text())
+    called: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "store"):
+            called.add(node.func.attr)
+    assert called, "no store.* calls found - the scan is broken"
+    for name in sorted(called):
+        assert hasattr(STORE, name), (
+            f"__init__.py calls store.{name}(...), which store.py does not define"
+        )
+
+
+def test_the_secret_env_name_agrees_with_the_code():
+    """The manifest's secret env name must be the name the code reads.
+
+    WHY: the manifest declared ``forgejo_token`` as ``type: secret`` with no
+    ``env:``, so the host derived ``HERMES_TREEPS_FORGEJO_TOKEN`` for the
+    Desktop secret field while the plugin read ``FORGEJO_TOKEN``. The two
+    names never met, so the token was always empty and the Forgejo catalogue
+    silently never authenticated.
+    """
+    schema = _manifest_config_schema()
+    spec = schema.get("forgejo_token")
+    assert spec is not None, "plugin.yaml does not declare forgejo_token"
+    assert spec.get("type") == "secret", spec
+    declared_env = spec.get("env", "")
+    assert declared_env, (
+        "forgejo_token declares no env: - the host would derive "
+        "HERMES_TREEPS_FORGEJO_TOKEN, which the plugin never reads"
+    )
+    assert declared_env == settings_module.FORGEJO_TOKEN_ENV, (
+        f"plugin.yaml env {declared_env!r} != the name settings.py reads "
+        f"{settings_module.FORGEJO_TOKEN_ENV!r}"
+    )
+    # And the name really is the one handed to get_secret().
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / "settings.py").read_text())
+    passed = {
+        node.args[0].id
+        for node in ast.walk(tree)
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "get_secret" and node.args
+            and isinstance(node.args[0], ast.Name))
+    }
+    assert "FORGEJO_TOKEN_ENV" in passed, (
+        "forgejo_token() must pass the shared FORGEJO_TOKEN_ENV constant to "
+        "get_secret(), not a hard-coded string"
+    )
 
 
 def test_the_manifest_declares_the_manifest_v2_fields():
