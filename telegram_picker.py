@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from . import store
@@ -363,22 +364,27 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
             slug = f"{repo}-{session_id[-6:]}" if session_id else repo
             import asyncio
 
-            def _bind_local() -> str:
+            def _bind_local() -> dict:
                 if isinstance(entry, dict) and entry.get("url"):
                     store.ensure_local(repo, entry["url"])
-                store.create(repo, slug, purpose="")
-                return ""
+                # WHY the record is returned and used: create() SANITISES the
+                # slug, so the slug we passed in is not necessarily the slug on
+                # disk. Binding our own copy pointed at a non-existent path:
+                # the session stayed unbound and the workspace leaked.
+                return store.create(repo, slug, purpose="")
 
             await q.answer(f"setting up {repo} (cloning if needed)…")
             # A clone can take a minute; run it in a thread or every Telegram
             # update in the process stalls behind it.
-            await asyncio.to_thread(_bind_local)
-            path = store.workspace_path(repo, slug)
-            store.bind_session(path, session_id)
+            record = await asyncio.to_thread(_bind_local)
+            bound_slug = str(record.get("slug") or slug)
+            bound_path = str(record.get("path") or store.workspace_path(repo, bound_slug))
+            store.bind_session(Path(bound_path), session_id)
             store.write_state(
-                session_id, {"mode": "repo", "repo": repo, "slug": slug, "path": str(path)}
+                session_id,
+                {"mode": "repo", "repo": repo, "slug": bound_slug, "path": bound_path},
             )
-            label = f"{repo}/{slug}"
+            label = f"{repo}/{bound_slug}"
     except store.WorkspaceError as e:
         await q.answer(str(e)[:180], show_alert=True)
         return

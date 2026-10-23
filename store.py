@@ -43,18 +43,33 @@ def ensure_tool_path() -> list[str]:
 
 ensure_tool_path()
 
-# Tools that can touch a filesystem or run commands. Blocked until the session
-# resolves a workspace (see the gate in __init__).
-GATED_TOOLS = frozenset(
-    {
-        "terminal",
-        "read_file",
-        "write_file",
-        "patch",
-        "search_files",
-        "execute_code",
-    }
-)
+# Tools that can touch a filesystem, run commands, or execute code on the host.
+# Blocked until the session resolves a workspace (see the gate in __init__).
+#
+# WHY each one is here, because the failure this prevents is a gate BYPASS:
+# an ungated tool reaches the host with the session's (possibly someone else's)
+# cwd, which is exactly what the gate exists to stop. The list is a MAPPING, not
+# a set, so the reason travels with the name and the next addition is obvious:
+# if the tool can run code, read or write a tree, or control the machine, it
+# belongs here.
+GATED_TOOLS: dict[str, str] = {
+    "terminal": "runs shell commands in the host cwd",
+    "read_file": "reads files anywhere on the host",
+    "write_file": "writes files anywhere on the host",
+    "patch": "edits files anywhere on the host",
+    "search_files": "walks the host filesystem",
+    "execute_code": "executes Python on the host",
+    # These four were missing and each one is a full gate bypass on this host:
+    "browser_exec": "runs arbitrary host Python (default browser backend here)",
+    "computer_use": "drives the host desktop: clicks, keys, arbitrary actions",
+    "cronjob_manage": "installs no_agent script jobs that run commands on a schedule",
+    "process_manage": "signals and kills host processes",
+}
+
+
+def is_gated(tool_name: str) -> bool:
+    """True when the tool must be blocked until the session resolves a workspace."""
+    return tool_name in GATED_TOOLS
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -287,11 +302,22 @@ def workspace_path(repo_name: str, slug: str) -> Path:
     return root_dir() / repo_name / slug
 
 
-def create(repo_name: str, slug: str, purpose: str = "") -> dict[str, Any]:
-    """Create the workspace and its record together: neither exists without the other."""
+def sanitize_slug(slug: str) -> str:
+    """The canonical form of a slug: lowercase, safe characters only.
+
+    Callers must use THIS, not their raw input: create() sanitises the slug
+    internally, so a caller that binds `workspace_path(repo, raw_slug)` binds
+    a path that does not exist.
+    """
     import re as _re
 
-    slug = _re.sub(r"[^a-z0-9._-]+", "-", slug.strip().lower()).strip("-._")
+    out = _re.sub(r"[^a-z0-9._-]+", "-", str(slug or "").strip().lower()).strip("-._")
+    return out
+
+
+def create(repo_name: str, slug: str, purpose: str = "") -> dict[str, Any]:
+    """Create the workspace and its record together: neither exists without the other."""
+    slug = sanitize_slug(slug)
     if not _SLUG_RE.match(slug):
         raise WorkspaceError(f"invalid slug {slug!r}: lowercase letters, digits, '.', '_', '-'; <=64 chars")
 
@@ -414,6 +440,12 @@ def rename(old_slug: str, new_slug: str) -> str:
     our records are authoritative.
     """
     ws = find_workspace(old_slug)
+    # The OLD slug is validated too: rename() is the one call that MOVES a
+    # directory, so a traversal in old_slug would move (not just read) a tree
+    # outside the root. find_workspace() already refuses such a slug; this is
+    # the explicit, local refusal so the failure names the bad argument.
+    if not _SLUG_RE.match(str(old_slug or "")):
+        raise WorkspaceError(f"invalid old slug {old_slug!r}")
     if not _SLUG_RE.match(new_slug):
         raise WorkspaceError(f"invalid new slug {new_slug!r}")
     dest = ws.parent / new_slug
@@ -435,8 +467,40 @@ def rename(old_slug: str, new_slug: str) -> str:
 
 
 def find_workspace(slug: str) -> Path:
+    """Locate a workspace by slug, refusing anything that could escape the root.
+
+    The glob `*/{slug}` is a path-traversal primitive: a slug like
+    `../../outside/victim` globs to a path OUTSIDE the root, and rename()/retire()
+    then move or `rm -rf` that path. This is the single choke point every
+    caller goes through (rename, retire, gc), so the check lives here.
+
+    Two defences, because either alone is bypassable:
+      1. the slug must match _SLUG_RE - no separators, no dots-only names;
+      2. every hit is resolved and must be inside the resolved root, which also
+         catches symlinks pointing out of the tree.
+    """
+    slug = str(slug or "")
+    if not _SLUG_RE.match(slug):
+        raise WorkspaceError(f"invalid slug {slug!r}: lowercase letters, digits, '.', '_', '-'; <=64 chars")
     root = root_dir()
-    hits = [p for p in root.glob(f"*/{slug}") if (p / ".hermes" / "session.json").exists()]
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        root_resolved = root
+    hits = []
+    for p in root.glob(f"*/{slug}"):
+        if not (p / ".hermes" / "session.json").exists():
+            continue
+        try:
+            resolved = p.resolve()
+        except OSError:
+            continue
+        # A hit outside the root is never a workspace of ours: refuse it rather
+        # than hand back a path that rename()/retire() would then destroy.
+        if not resolved.is_relative_to(root_resolved):
+            logger.warning("find_workspace: refusing out-of-root hit %s", p)
+            continue
+        hits.append(p)
     if not hits:
         raise WorkspaceError(f"no workspace {slug!r} under {root}")
     if len(hits) > 1:
@@ -557,14 +621,38 @@ def unpushed_commits(workspace: Path) -> bool | None:
     """
     try:
         if (workspace / ".jj").exists():
+            # WHY `remote_bookmarks()..@` and not `..bookmarks()`: the old
+            # revset only saw BOOKMARKED commits, so an agent's own `jj commit`
+            # (no bookmark) looked "pushed" and retire() deleted a tree whose
+            # work existed only in the op log. `@` is the working-copy commit,
+            # so the range now covers every commit not on a remote bookmark,
+            # bookmarked or not.
+            #
+            # Empty commits are filtered out by the template: the working-copy
+            # commit is always "not on a remote bookmark", so counting it would
+            # make every workspace look unpushed forever. A commit with real
+            # content (the agent's own work) is never empty.
+            #
+            # `--ignore-working-copy` is deliberately NOT used: it would hide
+            # the working copy commit, which is exactly where an agent's
+            # uncommitted work sits. dirty() covers the working tree separately.
             out = subprocess.run(
-                ["jj", "log", "--no-graph", "--ignore-working-copy",
-                 "-r", "remote_bookmarks()..bookmarks()"],
+                ["jj", "log", "--no-graph",
+                 "-r", "remote_bookmarks()..@",
+                 "-T", 'if(empty, "", commit_id ++ "\\n")'],
                 cwd=str(workspace), capture_output=True, text=True, timeout=30,
             )
-            if out.returncode != 0:
+            if out.returncode == 0:
+                return bool(out.stdout.strip())
+            # Fallback for a jj too old for the `empty` template keyword:
+            # compare trees instead of commits.
+            diff = subprocess.run(
+                ["jj", "diff", "--summary", "-r", "remote_bookmarks()..@"],
+                cwd=str(workspace), capture_output=True, text=True, timeout=30,
+            )
+            if diff.returncode != 0:
                 return None
-            return bool(out.stdout.strip())
+            return bool(diff.stdout.strip())
         up = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "@{u}"],
             cwd=str(workspace), capture_output=True, text=True, timeout=10,
@@ -674,14 +762,60 @@ def _retire_checked(
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     target = archive / f"{record.get('repo', ws.parent.name)}-{slug}-{stamp}.json"
     target.write_text(json.dumps({"record": record, "retired_at": stamp}, indent=2, sort_keys=True))
-    parent = ws.parent
     vcs = record.get("vcs", "jj")
+    # WHY the repo is resolved from the record and not from `parent`:
+    # `parent` is <root>/<repo>, which is NOT a jj/git root, so `jj workspace
+    # forget` run there always failed - and its returncode was ignored, so the
+    # workspace was left registered in the repo while the directory was deleted.
+    # Resolve the SOURCE repo (where the workspace is registered) and run the
+    # cleanup there, and CHECK the returncode: a failed forget leaves a stale
+    # workspace entry behind, which must not be silent.
+    repo = _source_repo(record, ws)
     if vcs == "jj":
-        subprocess.run(["jj", "workspace", "forget", slug], cwd=str(parent), capture_output=True, text=True, timeout=60)
+        if repo is not None:
+            proc = subprocess.run(
+                ["jj", "-R", str(repo), "workspace", "forget", slug],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                raise WorkspaceError(
+                    f"refusing to retire {slug}: jj workspace forget failed in {repo}: "
+                    + ((proc.stderr or proc.stdout or "").strip()[:300])
+                )
     else:
-        subprocess.run(["git", "worktree", "remove", str(ws)], cwd=str(parent), capture_output=True, text=True, timeout=60)
-    subprocess.run(["rm", "-rf", str(ws)], timeout=120)
+        if repo is not None:
+            proc = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "remove", str(ws)],
+                capture_output=True, text=True, timeout=60,
+            )
+            if proc.returncode != 0:
+                raise WorkspaceError(
+                    f"refusing to retire {slug}: git worktree remove failed in {repo}: "
+                    + ((proc.stderr or proc.stdout or "").strip()[:300])
+                )
+    # No `rm -rf`: the path was validated by find_workspace() (slug shape +
+    # resolved-inside-root), and shutil.rmtree on that exact path deletes the
+    # tree without a shell in between. `rm -rf` on an unvalidated path is how
+    # a traversal bug becomes data loss.
+    if ws.exists():
+        shutil.rmtree(str(ws), ignore_errors=False)
     return f"retired {slug} -> {target}"
+
+
+def _source_repo(record: dict[str, Any], ws: Path) -> Path | None:
+    """The repo a workspace belongs to, resolved from its record.
+
+    The record carries the repo NAME; find_repo() maps it back to a path on
+    disk. Returns None when the repo is gone (nothing to clean up then).
+    """
+    name = str(record.get("repo") or "")
+    if not name:
+        name = ws.parent.name
+    try:
+        return find_repo(name)
+    except WorkspaceError:
+        logger.warning("source repo %r not found for workspace %s", name, ws)
+        return None
 
 def candidate_repos(limit: int = 8) -> list[str]:
     """Repo names available under the repo roots, for the opening prompt."""
