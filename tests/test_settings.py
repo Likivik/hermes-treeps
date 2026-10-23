@@ -361,6 +361,52 @@ def test_the_secret_env_name_agrees_with_the_code():
     )
 
 
+# ── the prepare settings ─────────────────────────────────────────────────────
+
+
+def test_a_zero_prepare_timeout_is_refused_and_names_the_key():
+    with pytest.raises(SettingsError) as exc:
+        settings_module.settings(_config(prepare_timeout_seconds=0))
+    assert "prepare_timeout_seconds" in str(exc.value), exc.value
+
+
+def test_a_prepare_timeout_above_the_ceiling_is_refused_and_names_the_key():
+    with pytest.raises(SettingsError) as exc:
+        settings_module.settings(_config(prepare_timeout_seconds=4000))
+    assert "prepare_timeout_seconds" in str(exc.value), exc.value
+
+
+def test_a_prepare_timeout_inside_the_range_is_accepted():
+    cfg = settings_module.settings(_config(prepare_timeout_seconds=1))
+    assert cfg["prepare_timeout_seconds"] == 1
+
+
+def test_a_non_bool_prepare_enabled_is_refused_and_names_the_key():
+    with pytest.raises(SettingsError) as exc:
+        settings_module.settings(_config(prepare_enabled="yes"))
+    assert "prepare_enabled" in str(exc.value), exc.value
+
+
+def test_a_non_list_prepare_files_is_refused_and_names_the_key():
+    with pytest.raises(SettingsError) as exc:
+        settings_module.settings(_config(prepare_files=".env"))
+    assert "prepare_files" in str(exc.value), exc.value
+
+
+def test_a_non_string_prepare_command_is_refused_and_names_the_key():
+    with pytest.raises(SettingsError) as exc:
+        settings_module.settings(_config(prepare_command=42))
+    assert "prepare_command" in str(exc.value), exc.value
+
+
+def test_the_prepare_defaults_are_what_the_feature_documents():
+    cfg = settings_module.settings()
+    assert cfg["prepare_enabled"] is True
+    assert cfg["prepare_command"] == ""
+    assert cfg["prepare_files"] == [".env"]
+    assert cfg["prepare_timeout_seconds"] == 300
+
+
 def test_the_manifest_declares_the_manifest_v2_fields():
     """The manifest is a v2 manifest with the fields the host knows."""
     root = Path(__file__).resolve().parent.parent

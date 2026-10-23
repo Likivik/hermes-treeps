@@ -52,6 +52,10 @@ SETTINGS_KEYS: tuple[str, ...] = (
     "inject_first_message",
     "allowed_user_ids",
     "forgejo_url",
+    "prepare_enabled",
+    "prepare_command",
+    "prepare_files",
+    "prepare_timeout_seconds",
 )
 
 # Keys whose schema entry is a SECRET: they live in .env, never in config.yaml.
@@ -78,6 +82,21 @@ DEFAULTS: dict[str, Any] = {
     # get_secret() below, and a secret must never travel through the config
     # dict (the manifest declares it separately with `env: FORGEJO_TOKEN`).
     "forgejo_url": "",
+    # The prepare step: a workspace is not usable the moment `jj workspace
+    # add` returns. workmux and Conductor both run a prepare step (copy
+    # .env, symlink dependencies, run installs) - we did not, which is why
+    # every real session started with hand-written GRADLE_USER_HOME /
+    # GIT_DIR / GIT_WORK_TREE exports.
+    "prepare_enabled": True,
+    # Operator-configured shell command, run with `bash -lc` INSIDE the new
+    # workspace. Empty means no command runs at all. It runs arbitrary code
+    # by design - see README, "Prepare".
+    "prepare_command": "",
+    # Repo-relative files copied into the workspace when it exists. A missing
+    # file is skipped with a note, never an error.
+    "prepare_files": [".env"],
+    # Hard ceiling on the prepare command.
+    "prepare_timeout_seconds": 300,
 }
 
 ALLOWED_SOURCES = ("local", "github", "forgejo")
@@ -208,6 +227,33 @@ def _validate(values: dict[str, Any]) -> dict[str, Any]:
 
     if not isinstance(out.get("forgejo_url"), str):
         raise SettingsError("hermes-treeps settings.forgejo_url: must be a string")
+
+    # ── the prepare step ───────────────────────────────────────────────────
+    if not isinstance(out.get("prepare_enabled"), bool):
+        raise SettingsError("hermes-treeps settings.prepare_enabled: must be true or false")
+
+    if not isinstance(out.get("prepare_command"), str):
+        raise SettingsError("hermes-treeps settings.prepare_command: must be a string")
+
+    files = out.get("prepare_files")
+    if not isinstance(files, list):
+        raise SettingsError("hermes-treeps settings.prepare_files: must be a list of paths")
+    for f in files:
+        if not isinstance(f, str) or not f.strip():
+            raise SettingsError(
+                "hermes-treeps settings.prepare_files: every entry must be a non-empty path"
+            )
+
+    timeout = out.get("prepare_timeout_seconds")
+    if isinstance(timeout, bool) or not isinstance(timeout, int):
+        raise SettingsError(
+            "hermes-treeps settings.prepare_timeout_seconds: must be an integer number of seconds"
+        )
+    if not 1 <= timeout <= 3600:
+        raise SettingsError(
+            "hermes-treeps settings.prepare_timeout_seconds: must be between 1 and 3600, "
+            f"got {timeout}"
+        )
     return out
 
 

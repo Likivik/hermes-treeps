@@ -83,6 +83,10 @@ plugins:
         inject_first_message: false             # open gateway sessions with the question itself
         allowed_user_ids: []                    # telegram ids allowed to tap the picker
         forgejo_url: ""                         # e.g. https://forgejo.example
+        prepare_enabled: true                  # run the workspace prepare step
+        prepare_command: ""                    # shell command run inside the new workspace
+        prepare_files: [".env"]                # repo-relative files copied into the workspace
+        prepare_timeout_seconds: 300           # ceiling on the prepare command (1-3600)
 ```
 
 `forgejo_token` is a secret: it is declared in the manifest with
@@ -107,6 +111,87 @@ Environment overrides exist for the same keys (`HERMES_TREEPS_WORKSPACE_ROOT`,
 `HERMES_TREEPS_FORGEJO_URL`, `FORGEJO_URL`, …) and win over `config.yaml`.
 `forgejo_token` is not one of them: it is a secret, and it is read from `.env`,
 not from the settings namespace.
+
+## Prepare
+
+A workspace is not usable the moment `jj workspace add` returns. Every other
+harness for this job runs a **prepare step** right after creating the
+workspace: copy the `.env`, symlink the dependency directories, run the
+install. This plugin does the same, in `prepare.py`, with four settings:
+
+| key | default | meaning |
+| --- | --- | --- |
+| `prepare_enabled` | `true` | master switch — when false, nothing is copied and no command runs |
+| `prepare_files` | `[".env"]` | repo-relative files copied into the new workspace |
+| `prepare_command` | `""` | shell command run with `bash -lc` **inside** the new workspace (empty means none) |
+| `prepare_timeout_seconds` | `300` | hard ceiling on the command (1–3600) |
+
+**What runs when.** After a workspace is created, the prepare step copies
+each file in `prepare_files` from the repo root into the workspace, then runs
+`prepare_command` with the workspace as the working directory.
+
+**Files.** Only regular files that exist are copied. A missing file is
+skipped with a note, not an error — a repo without a `.env` is normal. An
+existing file in the workspace is **never overwritten** (your hand-edit
+survives). A path that points outside the repo root is skipped.
+
+**The command runs arbitrary code by design.** It is operator-configured:
+anyone who can edit `config.yaml` can already run code as you, so the
+command is not sandboxed. What the plugin does guarantee is that the command
+runs with its working directory set to the workspace — never anywhere else —
+and that it is killed when it exceeds `prepare_timeout_seconds`.
+
+**On failure.** A non-zero exit code or a timeout is *reported*, not raised:
+the workspace stays on disk and stays bound, and the result comes back with
+`ok: false` and the tail of the command's output. Fix it by hand and re-run
+the step — nothing is deleted, and no session is taken down.
+
+The result is returned under a `prepare` key in the `ws_new` response:
+
+```json
+{
+  "ok": true,
+  "path": "/Git/hermes/workspaces/hermes-pylon/fix-the-widget",
+  "vcs": "jj",
+  "prepare": {
+    "ok": true,
+    "copied": [".env"],
+    "skipped": [],
+    "command": {"ran": true, "exit_code": 0, "output_tail": ""},
+    "duration_s": 0.412
+  }
+}
+```
+
+To run the step again — after fixing a failed prepare, or on a workspace
+created before this feature existed — use the `ws_prepare` tool with the
+workspace path (it defaults to this session's workspace).
+
+### Example: a nix devshell project
+
+A project that needs `GRADLE_USER_HOME` and a jj/git environment set up
+before anything builds:
+
+```yaml
+plugins:
+  entries:
+    hermes-treeps:
+      settings:
+        prepare_enabled: true
+        prepare_files: [".env", "gradle.properties"]
+        prepare_command: >-
+          nix develop --command bash -c '
+            export GRADLE_USER_HOME="$PWD/.gradle-home";
+            export GIT_DIR="$PWD/.jj/repo/store/git";
+            export GIT_WORK_TREE="$PWD";
+            gradle --version >/dev/null
+          '
+        prepare_timeout_seconds: 600
+```
+
+The command inherits the workspace as its working directory, so `$PWD` is
+the new workspace and the exports point at the workspace's own Gradle cache
+and jj store — not at the source repo.
 
 ## State
 
