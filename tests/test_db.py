@@ -93,6 +93,27 @@ def test_migration_imports_the_legacy_json_and_is_idempotent(tmp_path, monkeypat
     assert len(DB.list_workspace_rows()) == 0, "the second run created rows"
 
 
+def test_migration_dry_run_imports_nothing(tmp_path, monkeypatch):
+    """`migrate --dry-run` must preview, not import.
+
+    Prevents: the first version of `migrate_legacy` ignored dry_run and wrote
+    38 bindings into the live database during a `--dry-run --purge` preview.
+    A preview that writes is what makes an operator stop trusting dry runs.
+    """
+    _legacy_state(tmp_path, monkeypatch)
+
+    preview = DB.migrate_legacy(workspace_root=tmp_path / "wsroot", dry_run=True)
+    assert preview["imported_bindings"] == 1, preview  # it counted what it saw
+    assert preview["dry_run"] is True, preview
+    assert preview["migrated_at"] == "", preview
+    assert DB.read_binding("sid-good") is None, "a dry run imported a binding"
+    assert DB.get_kv("migrated_at") is None, "a dry run recorded migrated_at"
+
+    real = DB.migrate_legacy(workspace_root=tmp_path / "wsroot")
+    assert real["imported_bindings"] == 1, real
+    assert DB.read_binding("sid-good") is not None, "the real run imported nothing"
+
+
 def test_migration_imports_the_in_tree_workspace_records(tmp_path, monkeypatch):
     """Every ``<workspace>/.hermes/session.json`` under the root is imported."""
     root = tmp_path / "wsroot"
