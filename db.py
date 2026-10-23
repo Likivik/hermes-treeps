@@ -546,18 +546,30 @@ def legacy_workspace_records(workspace_root: Path) -> list[Path]:
     return out
 
 
-def _derive_repo_slug(record: dict[str, Any], path: Path) -> tuple[str, str]:
+def _derive_repo_slug(record: dict[str, Any], path: Path, root: Path | None = None) -> tuple[str, str]:
+    """repo/slug for a legacy record, from its fields or from where it sits.
+
+    ``path`` is the record FILE, so it has to be reduced to the workspace
+    directory first: taking ``path.parent.name`` gave every workspace whose
+    record carried no repo/slug the slug "``.hermes``" and its own name as the
+    repo. That shipped once (the hermes-treeps row came out as
+    ``repo="hermes-treeps-ee445923", slug=".hermes"``), which is why the
+    in-tree record - not the record's fields - is the source of truth here.
+    """
+    ws = path.parent.parent if path.parent.name == ".hermes" else path
     repo = str(record.get("repo") or "")
     slug = str(record.get("slug") or "")
     if not slug:
-        slug = path.parent.name
+        slug = ws.name
     if not repo:
         # Nested layout: <root>/<repo>/<slug>. Flat layout: <root>/<repo>-<slug>.
-        parent = path.parent.parent.name
-        if parent and parent != path.parent.name and not path.parent.name.startswith(parent + "-"):
-            repo = parent
+        # The root decides, not the names: a nested slug usually repeats the
+        # repo name ("hermes-treeps/hermes-treeps-ee445923"), so any
+        # name-prefix heuristic misfires on exactly the common case.
+        if root is not None and ws.parent.resolve() == Path(root).resolve():
+            repo = ws.name.split("-")[0]
         else:
-            repo = path.parent.name.split("-")[0]
+            repo = ws.parent.name
     return repo, slug
 
 
@@ -587,8 +599,10 @@ def _import_binding(conn: sqlite3.Connection, session_id: str, payload: dict[str
     return True
 
 
-def _import_workspace_record(conn: sqlite3.Connection, path: Path, record: dict[str, Any]) -> bool:
-    repo, slug = _derive_repo_slug(record, path)
+def _import_workspace_record(
+    conn: sqlite3.Connection, path: Path, record: dict[str, Any], root: Path | None = None
+) -> bool:
+    repo, slug = _derive_repo_slug(record, path, root)
     if not repo or not slug:
         return False
     row = conn.execute(
@@ -680,7 +694,7 @@ def migrate_legacy(workspace_root: Path | None = None, dry_run: bool = False) ->
                     skipped.append(str(rec_path))
                     continue
                 try:
-                    if _import_workspace_record(conn, rec_path, record):
+                    if _import_workspace_record(conn, rec_path, record, root):
                         imported_workspaces += 1
                 except Exception as exc:
                     logger.warning("could not import legacy record %s (%s); skipping", rec_path, exc)
