@@ -97,6 +97,23 @@ def test_forgetting_the_record_leaves_the_session_gated(state_home, tmp_path):
     assert res is not None and res["action"] == "block", "forgetting must not unblock the session"
 
 
+def test_unbound_message_offers_the_third_route(state_home):
+    """The unbound gate must name all three routes, including the clone.
+
+    Prevents (P2-3): the message listed only ws_new and ws_chatting, both of
+    which assume the repo is already on disk. An agent whose repo lived on
+    GitHub/Forgejo saw no sanctioned way forward and cloned it on its own
+    initiative - so the gate now offers create_repo=true explicitly.
+    """
+    res = _gate("terminal", "sid-unbound-routes")
+    assert res is not None and res["action"] == "block", res
+    msg = res["message"]
+    assert "ws_new(repo, slug)" in msg, msg
+    assert "ws_chatting()" in msg, msg
+    assert "create_repo" in msg, msg
+    assert "GitHub/Forgejo" in msg, msg
+
+
 def test_gate_tools_are_a_mapping_with_reasons():
     """Every gated tool carries WHY it is gated.
 

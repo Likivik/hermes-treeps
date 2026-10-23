@@ -46,6 +46,9 @@ runs commands in a checkout - requires a workspace first:
   from the id, never from the session title, because titles get renamed.
 - `ws_chatting()` declares a talk-only session: cwd stays HERMES_HOME and all
   tools stay available, but nothing repo-shaped should be edited.
+- A repo that is not on disk but lives on GitHub/Forgejo goes through
+  `ws_new(repo, slug, create_repo=true)`, and the user must approve the clone
+  first - never clone on your own initiative.
 
 On the first turn, ask BOTH questions in a single line (never two messages, never
 a menu): the session TITLE (required - it becomes the workspace name), and which
@@ -78,7 +81,14 @@ def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
                 "purpose": {"type": "string", "description": "one line: what this session is for"},
                 "rebind": {"type": "boolean", "description": "true to move this session from its current workspace to the new one"},
                 "path": {"type": "string", "description": "absolute path to an EXISTING repo outside /Git - binds it directly, no checkout"},
-                "create_repo": {"type": "boolean", "description": "create /Git/<repo> first (brand-new project)"},
+                "create_repo": {
+                    "type": "boolean",
+                    "description": (
+                        "true to make /Git/<repo> exist first: clones it when the repo "
+                        "lives on GitHub/Forgejo, otherwise creates a brand-new project. "
+                        "Only pass this after the user approved the clone."
+                    ),
+                },
             },
             "required": ["slug"],
         },
@@ -139,6 +149,49 @@ def _session_id(kw: dict[str, Any]) -> str:
     import os
 
     return os.environ.get("HERMES_SESSION_ID", "") or "unknown"
+
+
+def _match_remote(entries: list[dict[str, Any]], repo: str) -> dict[str, Any] | None:
+    """The catalogue entry for `repo`, if it lives on GitHub or Forgejo.
+
+    Only remote sources count: the catalogue's fallback lists LOCAL repos
+    ("source": "local"), and matching one of those would claim a repo "exists
+    remotely" for a tree that is already on disk.
+    """
+    want = str(repo or "").strip().lower()
+    if not want:
+        return None
+    for entry in entries:
+        if str(entry.get("source") or "").lower() not in {"github", "forgejo"}:
+            continue
+        if str(entry.get("name") or "").strip().lower() == want:
+            return entry
+    return None
+
+
+def _remote_names(entries: list[dict[str, Any]]) -> list[str]:
+    """The names of the remote repos the catalogue knows about."""
+    names = {
+        str(e.get("name") or "").strip()
+        for e in entries
+        if str(e.get("source") or "").lower() in {"github", "forgejo"}
+    }
+    names.discard("")
+    return sorted(names)
+
+
+def _remote_lookup(repo: str) -> tuple[dict[str, Any] | None, str, list[str]]:
+    """(entry, error, remote_names) for `repo` from the remote catalogue.
+
+    Never raises: the catalogue is a diagnostic, and a dead network must not
+    turn into a traceback inside a tool answer.
+    """
+    try:
+        entries, err = store.remote_catalogue(limit_per_source=5)
+    except Exception as exc:  # defensive: the catalogue must never break ws_new
+        logger.debug("remote catalogue lookup failed", exc_info=True)
+        return None, f"remote catalogue unavailable: {type(exc).__name__}: {exc}", []
+    return _match_remote(entries, repo), err, _remote_names(entries)
 
 
 def _tool_new(args: dict[str, Any], **kw: Any) -> str:
@@ -207,8 +260,63 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
                     out["mode"] = "external"
                 return json.dumps(out)
 
-        if args.get("create_repo"):
-            store.create_repo(repo)
+        # Is the repo on disk at all? "not on disk" and "does not exist" are
+        # different answers, and only the first one has a next step: the repo
+        # may live on GitHub/Forgejo and need an approved clone.
+        on_disk = True
+        disk_error = ""
+        try:
+            store.find_repo(repo)
+        except store.WorkspaceError as e:
+            if "invalid repo name" in str(e):
+                raise
+            on_disk = False
+            disk_error = str(e)
+
+        if not on_disk:
+            entry, remote_error, remote_names = _remote_lookup(repo)
+            if entry is not None:
+                remote = {
+                    "name": str(entry.get("name") or repo),
+                    "owner": str(entry.get("owner") or ""),
+                    "url": str(entry.get("url") or ""),
+                    "source": str(entry.get("source") or ""),
+                }
+                if not args.get("create_repo"):
+                    # Stop here: cloning writes to the user's disk, so it needs
+                    # the user's approval first. Prevents (P2-3): the tools
+                    # only ever mentioned local /Git roots, so an agent whose
+                    # repo lived on a remote cloned it on its own initiative.
+                    dest = store.clone_target(repo)
+                    return json.dumps({
+                        "ok": False,
+                        "needs_confirmation": True,
+                        "remote": remote,
+                        "error": (
+                            f"repo {repo!r} is not on disk but exists on "
+                            f"{remote['source']} as {remote['owner']}/{remote['name']}. "
+                            f"Ask the user, then call ws_new again with create_repo=true "
+                            f"(it clones {remote['url']} into {dest})."
+                        ),
+                    })
+                # create_repo=true: the user approved the clone.
+                store.clone_repo(repo, str(entry.get("url") or ""))
+            elif args.get("create_repo"):
+                # create_repo=true for a name nobody knows: keep the legacy
+                # behaviour of making a brand-new, empty repo of that name.
+                store.create_repo(repo)
+            else:
+                # Neither on disk nor on a remote: the repo does not exist.
+                # Name the remotes that DO exist so the agent stops guessing
+                # names, and say plainly when the catalogue could not be read.
+                if remote_error:
+                    tail = f" ({remote_error})."
+                elif remote_names:
+                    tail = " Remote repos available: " + ", ".join(remote_names) + "."
+                else:
+                    tail = " No remote repos found in the catalogue."
+                return json.dumps({"ok": False, "error": disk_error + tail})
+
         record = store.create(repo, slug, purpose=str(args.get("purpose") or ""))
         # WHY the record's slug/path and not our own copy: create() SANITISES
         # the slug ("Fix The Widget" -> "fix-the-widget"). Binding the raw slug
@@ -346,6 +454,12 @@ def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
     sid = _session_id(kw)
     try:
         detail = store.resolve_detail(sid)
+        # "Where could this come from?": the local roots we actually scan, and
+        # the remote repos the catalogue knows about. Without this a repo that
+        # lives on GitHub/Forgejo looks exactly like a repo that does not
+        # exist, and the only visible route is to invent a clone.
+        local_candidates = store.candidate_repos(limit=8)
+        remote_entries, remote_error = store.remote_catalogue(limit_per_source=5)
         out: dict[str, Any] = {
             "session_id": sid,
             "state": detail["state"],
@@ -353,7 +467,18 @@ def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
             "path": detail["path"],
             "path_exists": bool(detail["path"]) and Path(str(detail["path"])).exists(),
             "record": detail["record"],
-            "candidate_repos": store.candidate_repos(limit=8),
+            "repo_roots": list(store.REPO_ROOTS),
+            "candidate_repos": local_candidates,
+            "local_candidates": local_candidates,
+            "remote_candidates": [
+                {
+                    "name": str(e.get("name") or ""),
+                    "source": str(e.get("source") or ""),
+                    "owner": str(e.get("owner") or ""),
+                }
+                for e in remote_entries
+            ],
+            "remote_error": remote_error,
             "tools": {"jj": shutil.which("jj"), "gh": shutil.which("gh")},
             "state_dir": str(store.state_dir()),
         }
@@ -509,6 +634,7 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 "No workspace resolved for this session. Ask the user, then call ONE of:\n"
                 "  ws_new(repo, slug)  - repo work; creates /Git/hermes/workspaces/<repo>/<slug>\n"
                 "  ws_chatting()       - talk-only session, no repo, full tools\n"
+                "  repo on GitHub/Forgejo but not on disk: ws_new(repo, slug, create_repo=true) - clone it, after the user approves\n"
                 f"Candidate repos: {listing}\n"
                 "Ask in one short line offering these repos or 'just chatting'."
             ),
