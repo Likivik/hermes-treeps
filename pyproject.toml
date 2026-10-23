@@ -1,0 +1,11 @@
+# Lint config only — the plugin ships as a directory, not a wheel.
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+# E501 is off on purpose: this code base has long single-line subprocess calls
+# that read worse wrapped, and there is no formatter in the toolchain to rewrap
+# them consistently. Re-enable together with `ruff format` if that changes.
+ignore = ["E501"]
