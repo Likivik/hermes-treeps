@@ -144,6 +144,25 @@ def test_migration_imports_the_in_tree_workspace_records(tmp_path, monkeypatch):
     assert rec["sessions"] == ["sid-a"], rec
 
 
+def test_migration_derives_repo_and_slug_when_the_record_has_neither(tmp_path):
+    """A record carrying only `titles` still lands in the right workspace row.
+
+    Prevents: the in-tree record of a real workspace contained nothing but
+    `{"titles": {...}}`, and the derivation used the record file's parent
+    (`.hermes`) as the slug - so the live migration created
+    `repo="<slug>", slug=".hermes"`, a row that owned no real tree.
+    """
+    ws = tmp_path / "hermes-treeps" / "hermes-treeps-ee445923"
+    (ws / ".hermes").mkdir(parents=True)
+    (ws / ".hermes" / "session.json").write_text(json.dumps({"titles": {"s": "t"}}))
+
+    out = DB.migrate_legacy(workspace_root=tmp_path, dry_run=False)
+    assert out["imported_workspaces"] == 1, out
+    rows = DB.list_workspace_rows()
+    assert [(r["repo"], r["slug"]) for r in rows] == [("hermes-treeps", "hermes-treeps-ee445923")], rows
+    assert rows[0]["path"] == str(ws), rows
+
+
 def test_migration_skips_a_corrupt_workspace_record(tmp_path, monkeypatch):
     """One broken in-tree record must not abort the migration of the rest."""
     root = tmp_path / "wsroot"
