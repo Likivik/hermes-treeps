@@ -20,6 +20,7 @@ how the tests stay out of the live database.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -36,17 +37,62 @@ DB_FILENAME = "data.db"
 
 SCHEMA_VERSION = 2
 
-# One lock for every multi-statement write. The connection is shared across
-# threads (check_same_thread=False), so the lock is what keeps a transaction
-# from interleaving with another one. It is NEVER held across a subprocess
-# call: those can take seconds, and a lock held that long would serialise
-# every other session in the process.
+# One lock for every multi-statement write. It is NEVER held across a
+# subprocess call: those can take seconds, and a lock held that long would
+# serialise every other session in the process.
+#
+# WHY the lock is still needed with per-thread connections: WAL allows many
+# readers and ONE writer at a time. The lock is what keeps two writers in
+# this process from colliding on that single writer slot (and from seeing
+# "database is locked" instead of waiting).
 _WRITE_LOCK = threading.RLock()
 
-# Why a mutable holder instead of two module globals: rebinding a module-level
-# name from inside a function is what tripped CodeQL's unused-global query, and
-# a holder keeps the connection and its path updated together.
-_CONN: dict[str, object] = {"conn": None, "path": None}
+# ── one connection per THREAD ───────────────────────────────────────────────
+#
+# WHY: python's sqlite3 caches ONE prepared statement per (connection, sql)
+# pair. Two threads executing on the SAME connection therefore clobber each
+# other's statement state. The audit reproduced this on the live code:
+# "sqlite3.InterfaceError: bad parameter or other API misuse" out of
+# db.read_binding, reads that returned 0/2/14 rows for a five-row SELECT, and
+# a read that returned ANOTHER workspace's row.
+#
+# WHY that was a security bug and not a flake: bind_session keys its INSERT
+# on the record it just read, so a corrupted read became a corrupted WRITE -
+# a session landed under a workspace it was never given, and one session was
+# seen claimed by two workspaces at once. The gate catches that exception and
+# fails OPEN, so an unbound session kept running gated tools (616 of 2667
+# tool calls in the audit's control run; 0 with per-thread connections).
+#
+# The per-thread connection is held in thread-local storage. The module-level
+# registry below records each connection's IDENTITY and the GENERATION it was
+# opened in, so reset() can invalidate every connection in the process
+# without ever closing one another thread is using.
+_THREAD_LOCAL = threading.local()
+
+# Identity + generation of every live connection, keyed by the owning
+# THREAD OBJECT (not its ident: idents are reused, and a dead thread's
+# entry would be inherited by an unrelated new thread). The registry holds
+# IDs, not connections: a strong reference to the connection would keep a
+# dead thread's file descriptor open forever.
+_REGISTRY: dict[object, dict[str, Any]] = {}
+_REGISTRY_LOCK = threading.RLock()
+
+# Bumped by reset(). A connection opened in an older generation is stale:
+# its owner closes it (and opens a fresh one) the next time it asks for a
+# connection. Nobody closes another thread's connection - that is exactly
+# what segfaulted the process.
+_GENERATION = 0
+
+# Serialises "open a connection + make sure the schema exists" so two
+# threads opening the database at the same time cannot race the DDL.
+_INIT_LOCK = threading.RLock()
+
+# How long to wait for a lock that another process holds. SQLite's busy
+# handler covers ordinary locking; the JOURNAL MODE change does NOT go
+# through it, so that one gets an explicit retry loop (see _set_wal).
+_BUSY_TIMEOUT_S = 30.0
+_WAL_RETRIES = 60
+_WAL_RETRY_DELAY_S = 0.1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workspaces (
@@ -144,55 +190,282 @@ def db_path() -> Path:
     return plugin_data_dir() / DB_FILENAME
 
 
-def connect() -> sqlite3.Connection:
-    """The shared connection, opened once per process."""
-    path = db_path()
-    key = str(path)
-    cached = _CONN["conn"]
-    if cached is not None and _CONN["path"] == key:
-        return cached
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = None
-    # An explicit path wins over the host API: the host's plugin_db() always
-    # returns the live database, so an override that still went through it
-    # would write to the install the caller meant to stay out of.
-    if not os.environ.get("HERMES_TREEPS_DB_PATH"):
+def _env_override_active() -> bool:
+    """True when the caller pinned the database location with an env var.
+
+    WHY: ``db_path()`` honours BOTH ``HERMES_TREEPS_DB_PATH`` and
+    ``HERMES_TREEPS_PLUGIN_DATA_DIR``, but the old ``connect()`` only
+    checked the first one before calling the host's ``plugin_db()``. The
+    host's ``plugin_db()`` ALWAYS resolves the LIVE data dir, so with only
+    the data-dir override set, ``db_path()`` reported a tmp path while
+    ``PRAGMA database_list`` showed
+    ``/var/lib/hermes/.hermes/plugin-data/hermes-treeps/data.db``: the
+    override did not isolate anything. Any override means "open this file
+    directly".
+    """
+    return bool(
+        os.environ.get("HERMES_TREEPS_DB_PATH")
+        or os.environ.get("HERMES_TREEPS_PLUGIN_DATA_DIR")
+    )
+
+
+def _set_wal(conn: sqlite3.Connection) -> None:
+    """Put the database in WAL mode, retrying while another process holds it.
+
+    WHY the retry: changing the journal mode needs a brief exclusive lock
+    and does NOT go through SQLite's busy handler, so two processes opening
+    a FRESH database at the same time crashed with "database is locked" -
+    a crash that ``timeout=30`` does not save. Retrying with a short sleep
+    turns that race into a wait.
+    """
+    last: Exception | None = None
+    for attempt in range(_WAL_RETRIES):
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last = exc
+            time.sleep(_WAL_RETRY_DELAY_S)
+    raise last if last is not None else sqlite3.OperationalError("could not set WAL mode")
+
+
+def _host_connection(path: str) -> sqlite3.Connection | None:
+    """Open the host's sanctioned database, or None to open it ourselves.
+
+    WHY the host API is only used when NOTHING is overridden: the host's
+    ``plugin_db()`` always resolves the LIVE plugin-data dir, so an
+    override that still went through it would read and write the install
+    the caller meant to stay out of. With any override set we open the
+    requested file directly.
+
+    WHY the retry: ``plugin_db()`` sets the journal mode itself, and that
+    change does not go through SQLite's busy handler - two processes
+    opening a FRESH database at the same time crash with "database is
+    locked" there. Retrying turns the race into a wait.
+    """
+    last: Exception | None = None
+    for _ in range(_WAL_RETRIES):
         try:
             from plugins.plugin_storage import plugin_db  # type: ignore
 
             conn = plugin_db(PLUGIN_NAME)
+        except ImportError:
+            return None
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            last = exc
+            time.sleep(_WAL_RETRY_DELAY_S)
+            continue
+        # The host may resolve a different file than we asked for (a profile
+        # switch, say). If it does, use OUR path instead: a connection to
+        # the wrong file is worse than no connection at all.
+        try:
+            row = conn.execute("PRAGMA database_list").fetchone()
+            opened = str(row[2]) if row is not None and len(row) > 2 else ""
+        except Exception:
+            opened = ""
+        if opened and Path(opened) != Path(path):
+            _close_quietly(conn)
+            return None
+        return conn
+    if last is not None:
+        raise last
+    return None
+
+
+def _open_connection(path: str) -> sqlite3.Connection:
+    """Open a fresh connection to ``path`` with the schema in place.
+
+    The schema is created BEFORE the connection is handed out, and the
+    creation happens under ``_INIT_LOCK``: the old code published the
+    connection and only then ran ``init_schema()``, so a concurrent reader
+    could hit "no such table: bindings" on a database that existed for
+    microseconds.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    conn: sqlite3.Connection | None = None
+    if not _env_override_active():
+        try:
+            conn = _host_connection(path)
         except Exception:
             logger.debug("host plugin_db unavailable; using a local sqlite file", exc_info=True)
             conn = None
     if conn is None:
-        conn = sqlite3.connect(key, check_same_thread=False, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = sqlite3.connect(path, check_same_thread=False, timeout=_BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
-    _CONN["conn"] = conn
-    _CONN["path"] = key
-    init_schema(conn)
-    return conn
-
-
-def reset() -> None:
-    """Drop the cached connection (tests, and after a profile switch)."""
-    conn = _CONN["conn"]
-    if conn is not None:
+    try:
+        with _INIT_LOCK:
+            # A long busy timeout: the host's connection defaults to five
+            # seconds, which turns a busy database into "database is
+            # locked" instead of a wait.
+            conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_S * 1000)}")
+            _set_wal(conn)
+            conn.execute("PRAGMA foreign_keys=ON")
+            # WHY the existence check instead of a "have I done this already"
+            # flag: the database file can be replaced under us (a test
+            # pointing at a fresh path, a profile switch), and then the
+            # schema has to be created again.
+            have = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='bindings'"
+            ).fetchone()
+            if have is None:
+                conn.executescript(SCHEMA)
+                conn.commit()
+    except Exception:
+        # Never hand out a half-initialised connection.
         try:
             conn.close()
         except Exception:
-            logger.debug("could not close the plugin db", exc_info=True)
-    _CONN["conn"] = None
-    _CONN["path"] = None
+            logger.debug("could not close a failed connection", exc_info=True)
+        raise
+    return conn
+
+
+def connect() -> sqlite3.Connection:
+    """This thread's connection to the plugin database.
+
+    WHY one connection per thread: python's sqlite3 caches one prepared
+    statement per (connection, sql) pair, so two threads sharing a
+    connection clobber each other's statement state. That produced
+    "bad parameter or other API misuse", reads that returned the wrong
+    number of rows, and - because ``bind_session`` keys its INSERT on the
+    record it just read - a session bound to the WRONG workspace. The gate
+    swallows that exception and fails open, so it was a security hole.
+
+    The connection is cached in thread-local storage and is therefore used
+    by exactly one thread. WAL already allows many readers beside one
+    writer, and ``_WRITE_LOCK`` keeps the writers serialised.
+    """
+    path = str(db_path())
+    owner = threading.current_thread()
+    with _REGISTRY_LOCK:
+        generation = _GENERATION
+        entry = _REGISTRY.get(owner)
+        _prune_dead_threads()
+
+    cached = getattr(_THREAD_LOCAL, "conn", None)
+    if cached is not None:
+        fresh = (
+            entry is not None
+            and entry["generation"] == generation
+            and entry["path"] == path
+            and entry["id"] == id(cached)
+        )
+        if fresh:
+            return cached
+        # Stale: reset() ran (or the path changed) since this connection was
+        # opened. Close it HERE - this thread owns it, so nobody else can be
+        # inside a statement on it - and open a fresh one.
+        _close_quietly(cached)
+        _THREAD_LOCAL.conn = None
+
+    conn = _open_connection(path)
+    with _REGISTRY_LOCK:
+        _REGISTRY[owner] = {
+            "id": id(conn),
+            "generation": generation,
+            "path": path,
+            "thread": owner,
+        }
+    _THREAD_LOCAL.conn = conn
+    return conn
+
+
+def _prune_dead_threads() -> None:
+    """Forget the registry entries of threads that have exited.
+
+    WHY: the registry lives for the lifetime of the process, and a dead
+    thread's entry would otherwise be inherited by an unrelated thread
+    that reuses the same identifier.
+    """
+    for key in [
+        k
+        for k, v in _REGISTRY.items()
+        if not v.get("thread") or not v["thread"].is_alive()
+    ]:
+        _REGISTRY.pop(key, None)
+
+
+def _close_quietly(conn: sqlite3.Connection | None) -> None:
+    if conn is None:
+        return
+    try:
+        conn.close()
+    except Exception:
+        logger.debug("could not close the plugin db", exc_info=True)
+
+
+def reset() -> None:
+    """Invalidate every connection in the process.
+
+    WHY this cannot close other threads' connections: the old
+    implementation called ``conn.close()`` on the ONE shared connection
+    while another thread was mid-statement on it, and CPython segfaulted
+    the process (5/5 runs). Now every thread owns its connection, so
+    ``reset()`` bumps the generation counter; each thread notices the
+    change the next time it asks for a connection and reopens its own.
+    Only the CALLING thread's connection is closed here - and it is closed
+    by the thread that owns it, which is the only safe way to close it.
+    """
+    global _GENERATION
+    with _REGISTRY_LOCK:
+        _GENERATION += 1
+    owner = threading.current_thread()
+    cached = getattr(_THREAD_LOCAL, "conn", None)
+    _THREAD_LOCAL.conn = None
+    _close_quietly(cached)
+    with _REGISTRY_LOCK:
+        _REGISTRY.pop(owner, None)
+
+
+@contextlib.contextmanager
+def transaction(commit: bool = True) -> Iterator[sqlite3.Connection]:
+    """One write transaction: commits on success, rolls back on any error.
+
+    WHY a context manager: every mutating function used to do its writes
+    and then ``conn.commit()`` with no rollback on the failure path. A
+    function that raised half-way through left a DIRTY transaction on the
+    connection, and the NEXT unrelated commit published the half-write (a
+    changed ``purpose`` and the session rows gone). A transaction that
+    always ends in commit-or-rollback removes that class of bug, and
+    guarantees no function leaves the connection in a transaction.
+
+    ``commit=False`` rolls back on success too - that is what a dry run
+    needs: it must SEE what it would do without publishing any of it.
+    """
+    conn = connect()
+    with _WRITE_LOCK:
+        try:
+            yield conn
+        except BaseException:
+            # Roll back on ANY failure, including a KeyboardInterrupt: a
+            # half-written transaction must never survive this block.
+            try:
+                conn.rollback()
+            except Exception:
+                logger.debug("rollback failed", exc_info=True)
+            raise
+        else:
+            if commit:
+                conn.commit()
+            else:
+                conn.rollback()
 
 
 def init_schema(conn: sqlite3.Connection | None = None) -> None:
-    conn = conn or connect()
-    with _WRITE_LOCK:
+    """Create the schema if it is missing. Idempotent."""
+    if conn is None:
+        conn = connect()
+    with _INIT_LOCK:
         conn.executescript(SCHEMA)
         conn.commit()
-    set_kv("schema_version", str(SCHEMA_VERSION))
+        # On THIS connection, and without going through set_kv(): see
+        # _write_kv for why the lock order matters.
+        _write_kv(conn, "schema_version", str(SCHEMA_VERSION))
+        conn.commit()
 
 
 # ── kv helpers (tokens, caches, markers) ─────────────────────────────────────
@@ -207,14 +480,24 @@ def get_kv(key: str, default: str | None = None) -> str | None:
 
 
 def set_kv(key: str, value: str) -> None:
-    conn = connect()
-    with _WRITE_LOCK:
-        conn.execute(
-            "INSERT INTO kv(key, value, updated_at) VALUES(?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-            (key, value, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
-        )
-        conn.commit()
+    with transaction() as conn:
+        _write_kv(conn, key, value)
+
+
+def _write_kv(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """The kv upsert, on a given connection.
+
+    WHY it is separate: ``init_schema()`` has to record the schema version
+    on the SAME connection it created the schema on, and it must not call
+    ``set_kv()`` while holding ``_INIT_LOCK`` - that would take the locks
+    in the opposite order to ``transaction()`` (``_WRITE_LOCK`` then
+    ``_INIT_LOCK``) and deadlock two threads against each other.
+    """
+    conn.execute(
+        "INSERT INTO kv(key, value, updated_at) VALUES(?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+        (key, value, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
+    )
 
 
 def get_kv_json(key: str, default: Any = None) -> Any:
@@ -266,8 +549,7 @@ def write_binding(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     payload.setdefault("session_id", session_id)
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     extra = {k: v for k, v in payload.items() if k not in BINDING_COLUMNS and k not in ("session_id", "updated_at")}
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         conn.execute(
             "INSERT INTO bindings(session_id, mode, repo, slug, path, title, inherited_from,"
             " inherited_at, session_ended_at, updated_at, extra, payload)"
@@ -292,16 +574,13 @@ def write_binding(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 json.dumps(payload, sort_keys=True),
             ),
         )
-        conn.commit()
     return payload
 
 
 def delete_binding(session_id: str) -> bool:
     """Drop a session record. True when one existed."""
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         cur = conn.execute("DELETE FROM bindings WHERE session_id=?", (session_id,))
-        conn.commit()
         return cur.rowcount > 0
 
 
@@ -380,8 +659,7 @@ def write_workspace(record: dict[str, Any], path: str | Path | None = None) -> N
         if k not in WORKSPACE_COLUMNS and k != "sessions"
     }
     sessions = [str(s) for s in (record.get("sessions") or [])]
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         conn.execute(
             "INSERT INTO workspaces(repo, slug, path, vcs, purpose, created_at, last_synced, extra)"
             " VALUES(?,?,?,?,?,?,?,?)"
@@ -405,7 +683,6 @@ def write_workspace(record: dict[str, Any], path: str | Path | None = None) -> N
                 "INSERT OR IGNORE INTO workspace_sessions(repo, slug, session_id) VALUES(?,?,?)",
                 (repo, slug, sid),
             )
-        conn.commit()
 
 
 def rename_workspace(repo: str, old_slug: str, new_slug: str, new_path: str) -> None:
@@ -417,8 +694,7 @@ def rename_workspace(repo: str, old_slug: str, new_slug: str, new_path: str) -> 
     exists, and leaving the session rows behind would keep the OLD workspace
     claiming the session - which is exactly what retire() refuses forever.
     """
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         row = conn.execute(
             "SELECT path FROM workspaces WHERE repo=? AND slug=?", (repo, old_slug)
         ).fetchone()
@@ -432,7 +708,6 @@ def rename_workspace(repo: str, old_slug: str, new_slug: str, new_path: str) -> 
             "UPDATE workspace_sessions SET slug=? WHERE repo=? AND slug=?",
             (new_slug, repo, old_slug),
         )
-        conn.commit()
 
 
 def add_workspace_session(repo: str, slug: str, session_id: str) -> None:
@@ -442,23 +717,19 @@ def add_workspace_session(repo: str, slug: str, session_id: str) -> None:
     concurrent calls each appended to a list they had read, and the last
     writer wrote back a list missing the other seven.
     """
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO workspace_sessions(repo, slug, session_id) VALUES(?,?,?)",
             (repo, slug, str(session_id)),
         )
-        conn.commit()
 
 
 def remove_workspace_session(repo: str, slug: str, session_id: str) -> None:
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         conn.execute(
             "DELETE FROM workspace_sessions WHERE repo=? AND slug=? AND session_id=?",
             (repo, slug, str(session_id)),
         )
-        conn.commit()
 
 
 def workspace_sessions(repo: str, slug: str) -> list[str]:
@@ -482,11 +753,9 @@ def workspace_paths_for_slug(slug: str) -> list[str]:
 
 
 def delete_workspace(repo: str, slug: str) -> None:
-    conn = connect()
-    with _WRITE_LOCK:
+    with transaction() as conn:
         conn.execute("DELETE FROM workspace_sessions WHERE repo=? AND slug=?", (repo, slug))
         conn.execute("DELETE FROM workspaces WHERE repo=? AND slug=?", (repo, slug))
-        conn.commit()
 
 
 def list_workspace_rows() -> list[dict[str, Any]]:
@@ -651,13 +920,14 @@ def migrate_legacy(workspace_root: Path | None = None, dry_run: bool = False) ->
     this function proved that the hard way by importing 38 rows under
     ``--dry-run``.
     """
-    conn = connect()
     root = Path(workspace_root) if workspace_root is not None else None
     imported_bindings = 0
     imported_workspaces = 0
     skipped: list[str] = []
 
-    with _WRITE_LOCK:
+    # A dry run rolls the whole import back: it must SEE what it would do
+    # without publishing any of it.
+    with transaction(commit=not dry_run) as conn:
         state_dir = legacy_state_dir()
         files = sorted(state_dir.glob("*.json")) if state_dir.is_dir() else []
         for f in files:
@@ -699,10 +969,6 @@ def migrate_legacy(workspace_root: Path | None = None, dry_run: bool = False) ->
                 except Exception as exc:
                     logger.warning("could not import legacy record %s (%s); skipping", rec_path, exc)
                     skipped.append(str(rec_path))
-        if dry_run:
-            conn.rollback()
-        else:
-            conn.commit()
 
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     if not dry_run:
@@ -724,6 +990,12 @@ def purge_legacy_records(dry_run: bool = False, workspace_root: Path | None = No
     alone, and a file whose record did NOT make it into the database is kept
     (deleting it would lose data). The tarball backup is written BEFORE
     anything is deleted, so a mistake here is recoverable.
+
+    A file that could NOT be backed up (unreadable, vanished) is NOT
+    deleted: it is reported in ``not_backed_up`` and left on disk. The old
+    code swallowed the per-file backup error and then deleted the file
+    anyway, so an unreadable record ended up purged with an EMPTY tarball -
+    the record was simply gone.
     """
     conn = connect()
     root = Path(workspace_root) if workspace_root is not None else None
@@ -737,12 +1009,19 @@ def purge_legacy_records(dry_run: bool = False, workspace_root: Path | None = No
                 continue
             candidates.append(rec_path)
     purged: list[str] = []
+    not_backed_up: list[str] = []
     backed_up = ""
+    backed: set[str] = set()
     if candidates and not dry_run:
-        backed_up = _write_backup(candidates)
+        backed_up, backed = _write_backup(candidates)
     for rec_path in candidates:
         if dry_run:
             # A dry run lists and deletes NOTHING.
+            continue
+        if str(rec_path) not in backed:
+            # NOT in the tarball: keeping it is the only safe option.
+            logger.warning("not purging %s: it is not in the backup", rec_path)
+            not_backed_up.append(str(rec_path))
             continue
         try:
             rec_path.unlink()
@@ -755,11 +1034,22 @@ def purge_legacy_records(dry_run: bool = False, workspace_root: Path | None = No
         "purged": purged,
         "would_purge": [str(p) for p in candidates] if dry_run else [],
         "backed_up": backed_up,
+        "not_backed_up": not_backed_up,
     }
 
 
-def _write_backup(files: Iterable[Path]) -> str:
-    """A tarball of the legacy records, written before they are deleted."""
+def _write_backup(files: Iterable[Path]) -> tuple[str, set[str]]:
+    """A tarball of the legacy records, written before they are deleted.
+
+    Returns the tarball path and the set of file paths that ACTUALLY made
+    it into it. The set is read back from the finished tarball rather than
+    assumed: ``tar.add`` can fail half-way through a file, and a file that
+    is not in the tarball must not be deleted.
+
+    A failure of the backup as a whole (an unwritable directory, a broken
+    tarball) still raises: that is not a per-file problem, and continuing
+    would delete records with no backup at all.
+    """
     import tarfile
 
     d = plugin_data_dir()
@@ -771,4 +1061,14 @@ def _write_backup(files: Iterable[Path]) -> str:
                 tar.add(str(f), arcname=str(f).lstrip("/"))
             except Exception as exc:
                 logger.warning("could not add %s to the backup (%s)", f, exc)
-    return str(target)
+    # Read the tarball back: what is in it is what is backed up.
+    backed: set[str] = set()
+    try:
+        with tarfile.open(target, "r:gz") as tar:
+            for member in tar.getmembers():
+                if not member.isfile():
+                    continue
+                backed.add("/" + member.name.lstrip("/"))
+    except Exception:
+        logger.warning("could not read back the backup %s", target, exc_info=True)
+    return str(target), backed
