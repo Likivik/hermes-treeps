@@ -77,4 +77,8 @@ config_schema:
     description: Base URL of the Forgejo instance to search for repos.
   forgejo_token:
     type: secret
+    # The .env name this secret lives under. Without it the host derives
+    # HERMES_TREEPS_FORGEJO_TOKEN for the Desktop field while the plugin reads
+    # FORGEJO_TOKEN - the two never met and the token was always empty.
+    env: FORGEJO_TOKEN
     description: Forgejo API token (stored in .env, never in config.yaml).
