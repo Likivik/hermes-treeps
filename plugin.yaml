@@ -25,6 +25,10 @@ provides_tools:
   - ws_rename
   - ws_status
   - ws_doctor
+  # ws_prepare lives in prepare.py and is registered through
+  # prepare.register(ctx). The wiring line in __init__.py is part of this
+  # PR's description - without it the tool does not exist.
+  - ws_prepare
 provides_hooks:
   - pre_tool_call
   - pre_gateway_dispatch
@@ -82,3 +86,21 @@ config_schema:
     # FORGEJO_TOKEN - the two never met and the token was always empty.
     env: FORGEJO_TOKEN
     description: Forgejo API token (stored in .env, never in config.yaml).
+  prepare_enabled:
+    type: bool
+    default: true
+    description: Run the workspace prepare step (copy files, run the prepare command).
+  prepare_command:
+    type: str
+    default: ""
+    description: >-
+      Shell command run with `bash -lc` inside the new workspace (empty means none).
+      Operator-configured; it runs arbitrary code by design.
+  prepare_files:
+    type: list
+    default: [".env"]
+    description: Repo-relative files copied into the new workspace when they exist.
+  prepare_timeout_seconds:
+    type: int
+    default: 300
+    description: Hard ceiling (1-3600 seconds) on the prepare command.
