@@ -1,0 +1,23 @@
+name: hermes-workspaces
+version: 0.1.0
+description: >
+  One jj workspace per session, enforced. A session is either bound to a repo
+  (its own workspace under /Git/hermes/workspaces/<repo>/<slug>) or explicitly
+  "just chatting" (HERMES_HOME as cwd, full capabilities). Repo-touching tools
+  are blocked until the session resolves one of the two, so a workspace can
+  never be created without a session record, and a session can never quietly
+  work in someone else's tree.
+author: "Likivik"
+kind: standalone
+platforms:
+  - linux
+provides_tools:
+  - ws_new
+  - ws_chatting
+  - ws_rename
+  - ws_status
+provides_hooks:
+  - pre_tool_call
+  - on_session_start
+  - on_session_reset
+  - on_session_finalize
