@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import store
+from . import prepare, store
 from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
@@ -334,7 +334,11 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         if title:
             state["title"] = title
         store.write_state(sid, state)
-        return json.dumps({"ok": True, "path": bound_path, "vcs": record["vcs"]})
+        # prepare runs inside the response so a broken setup script is visible
+        # in the same call that created the workspace, not on the next one.
+        return json.dumps(
+            prepare.with_prepare({"ok": True, "path": bound_path, "vcs": record["vcs"]}, repo, bound_path)
+        )
     except store.WorkspaceError as e:
         return json.dumps({"ok": False, "error": str(e)})
     except Exception as e:  # never raise into the tool dispatcher
@@ -920,3 +924,4 @@ def register(ctx) -> None:
     except Exception:
         logger.debug("pre_gateway_dispatch hook not available in this host", exc_info=True)
     picker.register(ctx)
+    prepare.register(ctx)
