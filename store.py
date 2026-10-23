@@ -1,10 +1,24 @@
-"""Session <-> jj workspace bookkeeping for the hermes-treeps plugin.
+"""Session <-> workspace bookkeeping for the hermes-treeps plugin.
 
 One invariant holds the whole thing together: a session is bound to exactly one
-workspace, or to no workspace at all ("just chatting"). Records live in the
-workspace itself (``.hermes/session.json``) so a workspace directory can always
-answer "which session am I, what did I ship" without a central database that can
-drift out of sync with the filesystem.
+workspace, or to no workspace at all ("just chatting").
+
+The records live in a SQLite database under the host's plugin-data directory
+(``<hermes home>/plugin-data/hermes-treeps/data.db``), opened through
+``plugins.plugin_storage.plugin_db``. They used to live in two kinds of JSON
+file - one per session in the plugin install directory, one per workspace
+inside the checkout - and every mutation was a read-modify-write. Eight
+concurrent ``bind_session`` calls on one workspace lost four of them, because
+the last writer wrote back a list it had read before the others wrote. A row
+per binding with one transaction per mutation removes that class of bug.
+
+The install directory is git-pulled and deleted on update, so nothing is
+written there: the old JSON files are imported once (see ``db.migrate_legacy``)
+and then purged explicitly.
+
+The paths, the VCS and the discovery sources come from the configuration (see
+:mod:`settings`), and the jj/git differences sit behind a small adapter (see
+:mod:`vcs`).
 """
 
 from __future__ import annotations
@@ -13,29 +27,55 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from . import db, discovery
+from . import settings as _settings
+from . import vcs as _vcs
+from .errors import WorkspaceError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROOT = "/Git/hermes/workspaces"
 REPO_ROOTS = ("/Git", "/Git/hermes", "/Git/likivik", "/Git/repos")
 
-# The gateway service runs with a narrowed PATH — /run/current-system/sw/bin is
-# not in it — so `gh` and `jj` are invisible to every subprocess unless the dirs
-# are added here. Done once at import so all call sites stay unchanged. Without
-# this, `gh repo list` raises FileNotFoundError inside remote_repos() and the
-# Telegram workspace picker never sends its keyboard.
-_EXTRA_BIN_DIRS = ("/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin")
+
+def settings() -> dict[str, Any]:
+    """The plugin's effective configuration (see :mod:`settings`)."""
+    return _settings.settings()
+
+
+def repo_roots() -> list[str]:
+    """The roots that hold repos, from the configuration."""
+    return list(settings()["repo_roots"])
+
+
+def extra_bin_dirs() -> list[str]:
+    """Extra PATH entries for `gh`, `jj` and friends."""
+    return list(settings()["extra_bin_dirs"])
+
+
+def clone_root() -> Path:
+    """Where a new repo is created/cloned: ``clone_root``, else a repo root."""
+    configured = Path(settings()["clone_root"])
+    if configured.is_dir():
+        return configured
+    for r in repo_roots():
+        if Path(r).is_dir():
+            return Path(r)
+    return configured
 
 
 def ensure_tool_path() -> list[str]:
     """Prepend missing bin dirs to PATH; returns the dirs that were added."""
     parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
-    missing = [d for d in _EXTRA_BIN_DIRS if d not in parts and Path(d).is_dir()]
+    missing = [d for d in extra_bin_dirs() if d not in parts and Path(d).is_dir()]
     if missing:
         os.environ["PATH"] = os.pathsep.join(missing + parts)
     return missing
@@ -71,11 +111,8 @@ def is_gated(tool_name: str) -> bool:
     """True when the tool must be blocked until the session resolves a workspace."""
     return tool_name in GATED_TOOLS
 
+
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
-
-
-class WorkspaceError(RuntimeError):
-    """A refusal with a message meant for the user, not a traceback."""
 
 
 def hermes_home() -> Path:
@@ -88,55 +125,37 @@ def hermes_home() -> Path:
 
 
 def state_dir() -> Path:
-    d = hermes_home() / "plugins" / "hermes-treeps" / "state"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    """The LEGACY per-session state directory.
+
+    Nothing is written here any more: the plugin install directory is
+    git-pulled and deleted on update, so it is not a place for state. The
+    records live in the plugin-data database; this path is the migration
+    SOURCE only.
+    """
+    return db.legacy_state_dir()
+
+
+def db_path() -> Path:
+    """The plugin's database file."""
+    return db.db_path()
 
 
 def root_dir() -> Path:
-    """Workspace root: config override, else the fleet convention."""
-    override = os.environ.get("HERMES_WS_ROOT")
-    if override:
-        return Path(override)
-    try:
-        from hermes_cli.config import load_config_readonly  # type: ignore
-
-        cfg = load_config_readonly() or {}
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-treeps") or {}
-        if entry.get("root"):
-            return Path(str(entry["root"]))
-    except Exception:
-        pass
-    return Path(DEFAULT_ROOT)
+    """Workspace root: the configured one (``settings.workspace_root``)."""
+    return Path(settings()["workspace_root"])
 
 
 # ── per-session state ─────────────────────────────────────────────────────────
 
 
-def _state_path(session_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id or "unknown")
-    return state_dir() / f"{safe}.json"
-
-
 def read_state(session_id: str) -> dict[str, Any] | None:
-    p = _state_path(session_id)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+    """The session record, or None when the session has none."""
+    return db.read_binding(session_id)
 
 
 def write_state(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    payload = dict(payload)
-    payload.setdefault("session_id", session_id)
-    payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    p = _state_path(session_id)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
-    tmp.replace(p)
-    return payload
+    """Replace a session record. One row, one transaction."""
+    return db.write_binding(session_id, payload)
 
 
 def resolve_detail(session_id: str) -> dict[str, Any]:
@@ -190,12 +209,7 @@ def resolve(session_id: str) -> dict[str, Any] | None:
 
 def forget(session_id: str) -> bool:
     """Drop this session's record so it starts unbound again. True if one existed."""
-    p = _state_path(session_id)
-    try:
-        p.unlink()
-        return True
-    except FileNotFoundError:
-        return False
+    return db.delete_binding(session_id)
 
 
 def mark_chatting(session_id: str, title: str = "") -> dict[str, Any]:
@@ -205,9 +219,9 @@ def mark_chatting(session_id: str, title: str = "") -> dict[str, Any]:
     return write_state(session_id, state)
 
 
-# ── title mirroring ───────────────────────────────────────────────────────────
+# ── title mirroring ──────────────────────────────────────────────────────────
 #
-# A session title is a UI label the user renames whenever they like, and this
+# A session title is a UI label the user renames whenever he likes, and this
 # build exposes no rename hook (VALID_HOOKS has no on_session_rename), so the
 # records are reconciled lazily from the state DB instead. Metadata only: the
 # workspace PATH is derived from the session id and never follows a rename
@@ -227,13 +241,13 @@ def session_title(session_id: str) -> str:
     """The session's current title from ``state.db``, or "" when unavailable."""
     if not session_id:
         return ""
-    db = _hermes_home() / "state.db"
-    if not db.exists():
+    dbfile = _hermes_home() / "state.db"
+    if not dbfile.exists():
         return ""
     try:
         import sqlite3
 
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        con = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True, timeout=2)
         try:
             row = con.execute("SELECT title FROM sessions WHERE id=?", (session_id,)).fetchone()
         finally:
@@ -274,25 +288,28 @@ def sync_title(session_id: str) -> dict[str, Any]:
 
 
 def find_repo(name: str) -> Path:
-    """Locate a repo by name under /Git or /Git/repos."""
+    """Locate a repo by name under the configured repo roots."""
     if not _SLUG_RE.match(name.lower()):
         raise WorkspaceError(f"invalid repo name {name!r}")
-    for base in REPO_ROOTS:
+    roots = repo_roots()
+    for base in roots:
         cand = Path(base) / name
         if (cand / ".jj").exists() or (cand / ".git").exists() or (cand / ".git").is_file():
             return cand
     raise WorkspaceError(
-        f"no repo {name!r} under {' or '.join(REPO_ROOTS)} - existing: "
-        + ", ".join(sorted(p.name for b in REPO_ROOTS if Path(b).is_dir() for p in Path(b).iterdir()))[:300]
+        f"no repo {name!r} under {' or '.join(roots)} - existing: "
+        + ", ".join(sorted(p.name for b in roots if Path(b).is_dir() for p in Path(b).iterdir()))[:300]
     )
 
 
 def is_jj(repo: Path) -> bool:
-    return (repo / ".jj").exists()
+    return _vcs.detect(repo) == _vcs.JJS
 
 
-def run(cmd: list[str], cwd: Path) -> str:
-    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=180)
+def run(cmd: list[str], cwd: Path | None = None) -> str:
+    proc = subprocess.run(
+        cmd, cwd=str(cwd) if cwd else None, capture_output=True, text=True, timeout=180
+    )
     if proc.returncode != 0:
         raise WorkspaceError(f"{' '.join(cmd)} failed: {(proc.stderr or proc.stdout).strip()[:400]}")
     return proc.stdout.strip()
@@ -327,10 +344,12 @@ def create(repo_name: str, slug: str, purpose: str = "") -> dict[str, Any]:
         raise WorkspaceError(f"{dest} already exists")
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    if is_jj(repo):
-        run(["jj", "workspace", "add", str(dest), "--name", slug], cwd=repo)
-    else:
-        run(["git", "worktree", "add", str(dest), "-b", slug], cwd=repo)
+    kind = _vcs.create_workspace(repo, dest, slug, vcs=settings()["vcs"], runner=run)
+    # The workspace directory and its record are created TOGETHER: neither
+    # exists without the other. jj/git create the directory themselves, but
+    # a runner that does not (or a checkout that was removed underneath us)
+    # must not leave a record pointing at a path that is not there.
+    dest.mkdir(parents=True, exist_ok=True)
 
     record = {
         "repo": repo_name,
@@ -338,7 +357,7 @@ def create(repo_name: str, slug: str, purpose: str = "") -> dict[str, Any]:
         "path": str(dest),
         "purpose": purpose,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "vcs": "jj" if is_jj(repo) else "git",
+        "vcs": kind,
         "sessions": [],
         "prs": [],
         "last_synced": None,
@@ -347,35 +366,29 @@ def create(repo_name: str, slug: str, purpose: str = "") -> dict[str, Any]:
     return record
 
 
-def record_path(ws: Path) -> Path:
-    return ws / ".hermes" / "session.json"
-
-
 def read_record(ws: Path) -> dict[str, Any] | None:
-    p = record_path(ws)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except Exception:
-        return None
+    """The workspace record for a path, or None when there is none."""
+    return db.read_workspace(str(ws))
 
 
 def write_record(ws: Path, record: dict[str, Any]) -> None:
-    p = record_path(ws)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(record, indent=2, sort_keys=True))
+    """Replace the workspace record for a path. One transaction."""
+    db.write_workspace(record, path=str(ws))
 
 
 def bind_session(ws: Path, session_id: str) -> dict[str, Any]:
+    """Bind a session to a workspace.
+
+    The old implementation read the workspace record, appended the session id
+    to a list and wrote the whole file back: eight concurrent calls on one
+    workspace lost four of them. This is one INSERT in one transaction, so
+    every call lands.
+    """
     record = read_record(ws)
     if record is None:
-        raise WorkspaceError(f"{ws} has no .hermes/session.json - not a workspace this plugin made")
-    sessions = record.setdefault("sessions", [])
-    if session_id not in sessions:
-        sessions.append(session_id)
-    write_record(ws, record)
-    return record
+        raise WorkspaceError(f"{ws} has no workspace record - not a workspace this plugin made")
+    db.add_workspace_session(str(record.get("repo") or ""), str(record.get("slug") or ""), session_id)
+    return read_record(ws) or record
 
 
 def detach(ws: Path, session_id: str) -> None:
@@ -384,20 +397,21 @@ def detach(ws: Path, session_id: str) -> None:
     record = read_record(ws)
     if record is None:
         return
-    sessions = [x for x in (record.get("sessions") or []) if str(x) != str(session_id)]
-    record["sessions"] = sessions
-    write_record(ws, record)
+    db.remove_workspace_session(
+        str(record.get("repo") or ""), str(record.get("slug") or ""), session_id
+    )
 
 
 def create_repo(name: str) -> Path:
-    """Create a brand-new repo under the first repo root, ready for ws_new."""
+    """Create a brand-new repo under the clone root, ready for ws_new."""
     if not _SLUG_RE.match(name.lower()):
         raise WorkspaceError(f"invalid repo name {name!r}")
-    base = Path("/Git/hermes") if Path("/Git/hermes").is_dir() else Path(REPO_ROOTS[0])
+    base = clone_root()
     dest = base / name
     if dest.exists():
         raise WorkspaceError(f"{dest} already exists")
-    run(["jj", "git", "init", "--colocate", str(dest)], cwd=base)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _vcs.init_colocated(dest)
     return dest
 
 
@@ -439,24 +453,31 @@ def rename(old_slug: str, new_slug: str) -> str:
     - `jj st` works after a plain mv). The internal jj name stays the old slug;
     our records are authoritative.
     """
-    ws = find_workspace(old_slug)
     # The OLD slug is validated too: rename() is the one call that MOVES a
     # directory, so a traversal in old_slug would move (not just read) a tree
     # outside the root. find_workspace() already refuses such a slug; this is
     # the explicit, local refusal so the failure names the bad argument.
+    # It is checked BEFORE the lookup, so the error names the bad argument
+    # instead of "no workspace <traversal>".
     if not _SLUG_RE.match(str(old_slug or "")):
-        raise WorkspaceError(f"invalid old slug {old_slug!r}")
-    if not _SLUG_RE.match(new_slug):
+        raise WorkspaceError(f"invalid slug {old_slug!r} (old slug): lowercase letters, digits, '.', '_', '-'; <=64 chars")
+    if not _SLUG_RE.match(str(new_slug or "")):
         raise WorkspaceError(f"invalid new slug {new_slug!r}")
+    ws = find_workspace(old_slug)
     dest = ws.parent / new_slug
     if dest.exists():
         raise WorkspaceError(f"{dest} already exists")
     old_path = str(ws)
+    record = read_record(ws) or {}
+    repo = str(record.get("repo") or ws.parent.name)
     ws.rename(dest)
-    record = read_record(dest) or {}
+    # The workspace row is keyed by (repo, slug), so a rename is a key change:
+    # the row moves with the directory, and the session rows move with it (a
+    # stale row would keep the old workspace claiming the session, and
+    # retire() would refuse it forever).
+    db.rename_workspace(repo, str(old_slug), str(new_slug), str(dest))
     record["slug"] = new_slug
     record["path"] = str(dest)
-    write_record(dest, record)
     for sid in record.get("sessions") or []:
         st = read_state(str(sid))
         if st and st.get("path") == old_path:
@@ -469,12 +490,9 @@ def rename(old_slug: str, new_slug: str) -> str:
 def find_workspace(slug: str) -> Path:
     """Locate a workspace by slug, refusing anything that could escape the root.
 
-    The glob `*/{slug}` is a path-traversal primitive: a slug like
-    `../../outside/victim` globs to a path OUTSIDE the root, and rename()/retire()
-    then move or `rm -rf` that path. This is the single choke point every
-    caller goes through (rename, retire, gc), so the check lives here.
-
-    Two defences, because either alone is bypassable:
+    The workspaces live in the database, so the lookup is a query - but the
+    slug is still a NAME, never a path, and the result is still checked
+    against the root. Two defences, because either alone is bypassable:
       1. the slug must match _SLUG_RE - no separators, no dots-only names;
       2. every hit is resolved and must be inside the resolved root, which also
          catches symlinks pointing out of the tree.
@@ -487,9 +505,10 @@ def find_workspace(slug: str) -> Path:
         root_resolved = root.resolve()
     except OSError:
         root_resolved = root
-    hits = []
-    for p in root.glob(f"*/{slug}"):
-        if not (p / ".hermes" / "session.json").exists():
+    hits: list[Path] = []
+    for cand in db.workspace_paths_for_slug(slug):
+        p = Path(cand)
+        if not p.exists():
             continue
         try:
             resolved = p.resolve()
@@ -500,7 +519,8 @@ def find_workspace(slug: str) -> Path:
         if not resolved.is_relative_to(root_resolved):
             logger.warning("find_workspace: refusing out-of-root hit %s", p)
             continue
-        hits.append(p)
+        if p not in hits:
+            hits.append(p)
     if not hits:
         raise WorkspaceError(f"no workspace {slug!r} under {root}")
     if len(hits) > 1:
@@ -512,17 +532,18 @@ def find_workspace(slug: str) -> Path:
 
 
 def _is_workspace_dir(p: Path) -> bool:
-    """A workspace is a checkout: it has its own VCS metadata or a session record."""
-    return (p / ".hermes" / "session.json").exists() or (p / ".jj").exists() or (p / ".git").exists()
+    """A workspace is a checkout: it has its own VCS metadata or a record."""
+    return (p / ".jj").exists() or (p / ".git").exists() or db.read_workspace(str(p)) is not None
 
 
 def list_workspaces() -> list[dict[str, Any]]:
     """Every workspace under the root, plus orphans in both directions.
 
-    Two layouts are supported because the root predates this plugin: the flat one
-    (``<root>/<repo>-<slug>``, e.g. ``spectacle-serenity-oom``) and the nested one
-    (``<root>/<repo>/<slug>``). A checkout is recognised by its own VCS metadata
-    or session record, so a repo directory is not mistaken for a workspace.
+    Two layouts are supported because the root predates this plugin: the flat
+    one (``<root>/<repo>-<slug>``, e.g. ``spectacle-serenity-oom``) and the
+    nested one (``<root>/<repo>/<slug>``). A checkout is recognised by its own
+    VCS metadata or its database record, so a repo directory is not mistaken
+    for a workspace.
     """
     root = root_dir()
     out: list[dict[str, Any]] = []
@@ -551,43 +572,20 @@ def list_workspaces() -> list[dict[str, Any]]:
     return out
 
 
+# ── VCS inspection (through the adapter) ─────────────────────────────────────
+
 
 def _remote_url(workspace: Path) -> str:
     """The origin URL without relying on git (jj workspaces have no .git dir,
     which makes plain `gh pr list` fail with 'not a git repository')."""
-    vcs = "jj" if (workspace / ".jj").exists() else "git"
-    try:
-        if vcs == "jj":
-            out = subprocess.run(["jj", "git", "remote", "list"], cwd=str(workspace), capture_output=True, text=True, timeout=30)
-            for line in (out.stdout or "").splitlines():
-                if line.startswith("origin "):
-                    return line.split()[1]
-        else:
-            out = subprocess.run(["git", "remote", "get-url", "origin"], cwd=str(workspace), capture_output=True, text=True, timeout=10)
-            return (out.stdout or "").strip()
-    except Exception:
-        return ""
-    return ""
+    return _vcs.remote_url(workspace)
 
 
 def _workspace_branches(workspace: Path) -> set[str]:
     """Branch/bookmark names owned by THIS workspace - the unit that open PRs
     must be matched against. A repo-wide PR list would block retiring a fresh
     workspace over PRs it never made (real case: spectacle #102/#93/#70/#67)."""
-    names: set[str] = set()
-    try:
-        if (workspace / ".jj").exists():
-            out = subprocess.run(["jj", "bookmark", "list"], cwd=str(workspace), capture_output=True, text=True, timeout=30)
-            for line in (out.stdout or "").splitlines():
-                name = line.strip().split(":")[0].strip()
-                if name and not name.startswith("git"):
-                    names.add(name.split()[-1] if "@" in name else name)
-        else:
-            out = subprocess.run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=str(workspace), capture_output=True, text=True, timeout=10)
-            names |= {ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()}
-    except Exception:
-        return set()
-    return names
+    return _vcs.branches(workspace)
 
 
 def open_prs(workspace: Path) -> tuple[list[dict[str, Any]], bool]:
@@ -598,17 +596,7 @@ def open_prs(workspace: Path) -> tuple[list[dict[str, Any]], bool]:
     silently pass the guard (Hermes worktree_gc fails safe the same way:
     offline degrades to keep).
     """
-    try:
-        repo_ref = _remote_url(workspace)
-        cmd = ["gh", "pr", "list", "--json", "number,title,url,state,headRefName", "--limit", "50"]
-        if repo_ref:
-            cmd += ["-R", repo_ref]  # gh cannot self-locate a jj workspace
-        raw = subprocess.run(cmd, cwd=str(workspace), capture_output=True, text=True, timeout=60)
-        if raw.returncode != 0:
-            return [], False
-        return json.loads(raw.stdout or "[]"), True
-    except Exception:
-        return [], False
+    return _vcs.open_prs(workspace)
 
 
 def unpushed_commits(workspace: Path) -> bool | None:
@@ -619,75 +607,33 @@ def unpushed_commits(workspace: Path) -> bool | None:
     and then rebased re-appears unpushed, because the comparison is by commit
     id, not content.
     """
-    try:
-        if (workspace / ".jj").exists():
-            # WHY `remote_bookmarks()..@` and not `..bookmarks()`: the old
-            # revset only saw BOOKMARKED commits, so an agent's own `jj commit`
-            # (no bookmark) looked "pushed" and retire() deleted a tree whose
-            # work existed only in the op log. `@` is the working-copy commit,
-            # so the range now covers every commit not on a remote bookmark,
-            # bookmarked or not.
-            #
-            # Empty commits are filtered out by the template: the working-copy
-            # commit is always "not on a remote bookmark", so counting it would
-            # make every workspace look unpushed forever. A commit with real
-            # content (the agent's own work) is never empty.
-            #
-            # `--ignore-working-copy` is deliberately NOT used: it would hide
-            # the working copy commit, which is exactly where an agent's
-            # uncommitted work sits. dirty() covers the working tree separately.
-            out = subprocess.run(
-                ["jj", "log", "--no-graph",
-                 "-r", "remote_bookmarks()..@",
-                 "-T", 'if(empty, "", commit_id ++ "\\n")'],
-                cwd=str(workspace), capture_output=True, text=True, timeout=30,
-            )
-            if out.returncode == 0:
-                return bool(out.stdout.strip())
-            # Fallback for a jj too old for the `empty` template keyword:
-            # compare trees instead of commits.
-            diff = subprocess.run(
-                ["jj", "diff", "--summary", "-r", "remote_bookmarks()..@"],
-                cwd=str(workspace), capture_output=True, text=True, timeout=30,
-            )
-            if diff.returncode != 0:
-                return None
-            return bool(diff.stdout.strip())
-        up = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "@{u}"],
-            cwd=str(workspace), capture_output=True, text=True, timeout=10,
-        )
-        if up.returncode != 0:
-            return None  # no upstream configured
-        out = subprocess.run(
-            ["git", "log", "--oneline", "@{u}.."],
-            cwd=str(workspace), capture_output=True, text=True, timeout=30,
-        )
-        return bool(out.stdout.strip())
-    except Exception:
-        return None
+    return _vcs.unpushed(workspace)
 
 
 def dirty(workspace: Path) -> bool:
     """True when the workspace has changes that retiring would lose.
 
-    The plugin's own ``.hermes/`` record is ignored: it is bookkeeping, not work,
-    and counting it would make every workspace permanently unretireable.
+    The plugin's own bookkeeping is ignored: it is not work, and counting it
+    would make every workspace permanently unretireable.
     """
-    try:
-        if (workspace / ".jj").exists():
-            # --summary + the same .hermes/ filter the git branch has: the
-            # plugin's own session.json bookkeeping must not make every jj
-            # workspace permanently unretireable.
-            out = subprocess.run(["jj", "diff", "--summary"], cwd=str(workspace), capture_output=True, text=True, timeout=60)
-            lines = [ln for ln in (out.stdout or "").splitlines() if ".hermes/" not in ln]
-            return bool(lines)
-        out = subprocess.run(["git", "status", "--porcelain"], cwd=str(workspace), capture_output=True, text=True, timeout=60)
-        lines = [ln for ln in (out.stdout or "").splitlines() if ".hermes/" not in ln]
-        return bool(lines)
-    except Exception:
-        return True  # assume dirty: refuse rather than lose work
+    return _vcs.dirty(workspace)
 
+
+# ── retire ────────────────────────────────────────────────────────────────────
+
+
+def _source_repo(record: dict[str, Any], ws: Path) -> Path | None:
+    """The repo a workspace is registered in (NOT ``ws.parent``)."""
+    name = str(record.get("repo") or "")
+    if name:
+        try:
+            return find_repo(name)
+        except WorkspaceError:
+            return None
+    try:
+        return find_repo(ws.parent.name)
+    except WorkspaceError:
+        return None
 
 
 def retire(slug: str, force: bool = False, ultraforce: bool = False) -> str:
@@ -762,7 +708,7 @@ def _retire_checked(
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     target = archive / f"{record.get('repo', ws.parent.name)}-{slug}-{stamp}.json"
     target.write_text(json.dumps({"record": record, "retired_at": stamp}, indent=2, sort_keys=True))
-    vcs = record.get("vcs", "jj")
+    vcs_kind = record.get("vcs", "jj")
     # WHY the repo is resolved from the record and not from `parent`:
     # `parent` is <root>/<repo>, which is NOT a jj/git root, so `jj workspace
     # forget` run there always failed - and its returncode was ignored, so the
@@ -771,133 +717,21 @@ def _retire_checked(
     # cleanup there, and CHECK the returncode: a failed forget leaves a stale
     # workspace entry behind, which must not be silent.
     repo = _source_repo(record, ws)
-    if vcs == "jj":
-        if repo is not None:
-            proc = subprocess.run(
-                ["jj", "-R", str(repo), "workspace", "forget", slug],
-                capture_output=True, text=True, timeout=60,
-            )
-            if proc.returncode != 0:
-                raise WorkspaceError(
-                    f"refusing to retire {slug}: jj workspace forget failed in {repo}: "
-                    + ((proc.stderr or proc.stdout or "").strip()[:300])
-                )
-    else:
-        if repo is not None:
-            proc = subprocess.run(
-                ["git", "-C", str(repo), "worktree", "remove", str(ws)],
-                capture_output=True, text=True, timeout=60,
-            )
-            if proc.returncode != 0:
-                raise WorkspaceError(
-                    f"refusing to retire {slug}: git worktree remove failed in {repo}: "
-                    + ((proc.stderr or proc.stdout or "").strip()[:300])
-                )
+    if repo is not None:
+        try:
+            _vcs.forget_workspace(repo, slug, ws, vcs=vcs_kind)
+        except WorkspaceError as exc:
+            raise WorkspaceError(f"refusing to retire {slug}: {exc}") from exc
     # No `rm -rf`: the path was validated by find_workspace() (slug shape +
     # resolved-inside-root), and shutil.rmtree on that exact path deletes the
     # tree without a shell in between. `rm -rf` on an unvalidated path is how
-    # a traversal bug becomes data loss.
-    if ws.exists():
-        shutil.rmtree(str(ws), ignore_errors=False)
+    # a traversal bug becomes a data-loss bug.
+    shutil.rmtree(ws, ignore_errors=True)
+    db.delete_workspace(str(record.get("repo") or ""), str(record.get("slug") or slug))
     return f"retired {slug} -> {target}"
 
 
-def _source_repo(record: dict[str, Any], ws: Path) -> Path | None:
-    """The repo a workspace belongs to, resolved from its record.
-
-    The record carries the repo NAME; find_repo() maps it back to a path on
-    disk. Returns None when the repo is gone (nothing to clean up then).
-    """
-    name = str(record.get("repo") or "")
-    if not name:
-        name = ws.parent.name
-    try:
-        return find_repo(name)
-    except WorkspaceError:
-        logger.warning("source repo %r not found for workspace %s", name, ws)
-        return None
-
-def candidate_repos(limit: int = 8) -> list[str]:
-    """Repo names available under the repo roots, for the opening prompt."""
-    names: list[str] = []
-    for base in REPO_ROOTS:
-        b = Path(base)
-        if not b.is_dir():
-            continue
-        for p in sorted(b.iterdir()):
-            if p.is_dir() and ((p / ".jj").exists() or (p / ".git").exists() or (p / ".git").is_file()):
-                if p.name not in names and not p.name.startswith("."):
-                    names.append(p.name)
-    return names[:limit]
-
-def session_key_for(session_id: str) -> str | None:
-    """Map an ephemeral session id to its durable gateway session key.
-
-    Gateway injection needs the durable key (``agent:main:telegram:dm:<id>``),
-    and on_session_start only hands us the ephemeral id, so this is the bridge.
-    """
-    p = hermes_home() / "sessions" / "sessions.json"
-    try:
-        data = json.loads(p.read_text())
-    except Exception:
-        return None
-    for key, entry in data.items():
-        if isinstance(entry, dict) and entry.get("session_id") == session_id:
-            return str(entry.get("session_key") or key)
-    return None
-
-# ── one-shot tokens for inline-button choices ────────────────────────────────
-
-
-def _tokens_path() -> Path:
-    return state_dir() / "tokens.json"
-
-
-_TOKEN_LOCK = __import__("threading").Lock()
-
-
-def _load_tokens() -> dict[str, Any]:
-    try:
-        return json.loads(_tokens_path().read_text())
-    except Exception:
-        return {}
-
-
-def _save_tokens(tokens: dict[str, Any]) -> None:
-    """Atomic: temp file + rename, so a crash never leaves a torn tokens.json."""
-    p = _tokens_path()
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(tokens, indent=2, sort_keys=True))
-    os.replace(tmp, p)
-
-
-def new_token(repos: list[str]) -> str:
-    """Mint a one-shot token bound to a repo list - NOT to a session.
-
-    The session is resolved when the button is TAPPED (the tap carries the live
-    chat, whose session row we can look up); binding at send time produced
-    tokens with session_id="" that created workspaces no session could resolve.
-    """
-    import secrets
-
-    with _TOKEN_LOCK:
-        tokens = _load_tokens()
-        token = secrets.token_hex(4)  # 8 chars: fits Telegram's 64-byte callback budget
-        tokens[token] = {"repos": repos, "at": time.time()}
-        # drop tokens older than an hour so the file cannot grow forever
-        cutoff = time.time() - 3600
-        tokens = {k: v for k, v in tokens.items() if not isinstance(v, dict) or v.get("at", 0) > cutoff}
-        _save_tokens(tokens)
-    return token
-
-
-def take_token(token: str) -> dict[str, Any] | None:
-    with _TOKEN_LOCK:
-        tokens = _load_tokens()
-        entry = tokens.pop(token, None)
-        if entry is not None:
-            _save_tokens(tokens)
-    return entry if isinstance(entry, dict) else None
+# ── sessions.json helpers (host state, read-only) ─────────────────────────────
 
 
 def session_entry(session_id: str) -> dict[str, Any] | None:
@@ -923,6 +757,7 @@ def chat_coords(session_key: str, chat_type: str) -> tuple[int | None, int | Non
     except Exception:
         return None, None
 
+
 def session_for_chat(chat_id: Any, thread_id: Any = None) -> dict[str, Any] | None:
     """The sessions.json row bound to a chat (and topic), if any.
 
@@ -939,6 +774,9 @@ def session_for_chat(chat_id: Any, thread_id: Any = None) -> dict[str, Any] | No
         if isinstance(entry, dict) and key.endswith(suffix):
             return {**entry, "session_key": key}
     return None
+
+
+# ── gc ────────────────────────────────────────────────────────────────────────
 
 
 def gc_tiers() -> dict[str, list[dict[str, Any]]]:
@@ -990,9 +828,38 @@ def gc_apply() -> list[str]:
     return done
 
 
-# ── remote repo listing (GitHub + Forgejo) ───────────────────────────────────
+# ── one-shot picker tokens ────────────────────────────────────────────────────
 
-_REMOTE_CACHE: dict[str, Any] | None = None
+_TOKEN_LOCK = threading.RLock()
+
+
+def new_token(repos: list[dict[str, Any]]) -> str:
+    """Mint a one-shot token that carries the repo list for a picker keyboard."""
+    with _TOKEN_LOCK:
+        tokens = db.get_kv_json("tokens", {}) or {}
+        token = secrets.token_hex(4)  # 8 chars: fits Telegram's 64-byte callback budget
+        tokens[token] = {"repos": repos, "at": time.time()}
+        # drop tokens older than an hour so the table cannot grow forever
+        cutoff = time.time() - 3600
+        tokens = {k: v for k, v in tokens.items() if not isinstance(v, dict) or v.get("at", 0) > cutoff}
+        db.set_kv_json("tokens", tokens)
+    return token
+
+
+def take_token(token: str) -> dict[str, Any] | None:
+    with _TOKEN_LOCK:
+        tokens = db.get_kv_json("tokens", {}) or {}
+        entry = tokens.pop(token, None)
+        if entry is not None:
+            db.set_kv_json("tokens", tokens)
+    return entry if isinstance(entry, dict) else None
+
+
+# ── remote repo listing (GitHub + Forgejo + local) ───────────────────────────
+
+# Mutated in place rather than rebound: a module-level name reassigned from a
+# function reads to static analysis as never used.
+_REMOTE_CACHE: dict[str, Any] = {}
 
 # Why the last catalogue lookup failed, so a caller can say "the catalogue was
 # unavailable" instead of "there are no remote repos" - the two mean very
@@ -1001,7 +868,7 @@ _REMOTE_ERROR: str = ""
 
 
 def remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> list[dict[str, Any]]:
-    """The user's repos from GitHub and Forgejo, most recently pushed first.
+    """The user's repos, most recently pushed first.
 
     Remote-first picker source. Falls back to the stale cache, then to local
     candidate_repos(), so a dead network never produces an empty keyboard.
@@ -1045,93 +912,33 @@ def remote_catalogue(limit_per_source: int = 5) -> tuple[list[dict[str, Any]], s
 
 def _remote_repos(limit_per_source: int = 5, cache_s: int = 600) -> tuple[list[dict[str, Any]], str]:
     """The catalogue lookup itself; returns (repos, error)."""
-    import urllib.request
-
-    global _REMOTE_CACHE
     now = time.time()
     if _REMOTE_CACHE and now - _REMOTE_CACHE.get("at", 0) < cache_s:
         return _REMOTE_CACHE["repos"], ""
 
-    repos: list[dict[str, Any]] = []
-    errors: list[str] = []
-    gh = shutil.which("gh")
-    try:
-        if not gh:
-            raise FileNotFoundError("gh is not on PATH")
-        raw = subprocess.run(
-            [gh, "repo", "list", "--limit", str(limit_per_source),
-             "--json", "nameWithOwner,url,pushedAt"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if raw.returncode != 0:
-            raise RuntimeError((raw.stderr or "").strip()[:200] or f"gh exited {raw.returncode}")
-        for r in json.loads(raw.stdout or "[]"):
-            repos.append({
-                "name": r["nameWithOwner"].split("/")[-1],
-                "owner": r["nameWithOwner"].split("/")[0],
-                "url": r["url"],
-                "source": "github",
-                "pushed_at": r.get("pushedAt", ""),
-            })
-    except Exception as exc:
-        logger.debug("gh repo list failed", exc_info=True)
-        errors.append(f"github: {type(exc).__name__}: {exc}")
-
-    try:
-        import os
-
-        url = os.environ["FORGEJO_URL"].rstrip("/") + "/api/v1/repos/search"
-        req = urllib.request.Request(
-            url + f"?limit={limit_per_source}&sort=updated",
-            headers={"Authorization": "token " + os.environ["FORGEJO_TOKEN"]},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        for r in data.get("data", []):
-            repos.append({
-                "name": r["name"],
-                "owner": (r.get("owner") or {}).get("login", ""),
-                "url": r.get("clone_url", ""),
-                "source": "forgejo",
-                "pushed_at": r.get("updated_at", ""),
-            })
-    except Exception as exc:
-        logger.debug("forgejo repo search failed", exc_info=True)
-        errors.append(f"forgejo: {type(exc).__name__}: {exc}")
-
-    # dedupe by name (github wins on ties), newest first
-    seen: dict[str, dict[str, Any]] = {}
-    for r in sorted(repos, key=lambda x: x.get("pushed_at", ""), reverse=True):
-        seen.setdefault(r["name"], r)
-    repos = sorted(seen.values(), key=lambda x: x.get("pushed_at", ""), reverse=True)[: limit_per_source * 2]
-
-    if repos:
-        _REMOTE_CACHE = {"at": now, "repos": repos}
-        try:
-            p = state_dir() / "remote_repos.json"
-            tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"at": now, "repos": repos}, indent=2))
-            os.replace(tmp, p)
-        except Exception:
-            # Not fatal: the catalogue is still usable in memory, only the
-            # on-disk fallback copy is lost.
-            logger.debug("could not persist remote catalogue", exc_info=True)
-        return repos, ""
+    entries, errors = discovery.discover(limit_per_source=limit_per_source)
+    if entries:
+        _REMOTE_CACHE.update({"at": now, "repos": entries})
+        db.set_kv_json("remote_repos", {"at": now, "repos": entries})
+        return entries, ""
 
     # stale cache, then local disk
-    try:
-        stale = json.loads((state_dir() / "remote_repos.json").read_text())
-        if stale.get("repos"):
-            return stale["repos"], ""
-    except Exception:
-        # No stale cache on disk (or it is unreadable): fall through to the
-        # local names. Not fatal - the caller still gets an answer.
-        logger.debug("no usable stale remote catalogue", exc_info=True)
+    stale = db.get_kv_json("remote_repos", {}) or {}
+    if stale.get("repos"):
+        return stale["repos"], ""
     err = ("remote catalogue unavailable: " + "; ".join(errors)) if errors else ""
     return (
-        [{"name": n, "owner": "", "url": "", "source": "local", "pushed_at": ""} for n in candidate_repos(limit=6)],
+        [r for r in discovery.local_repos(limit=6)],
         err,
     )
+
+
+def candidate_repos(limit: int = 8) -> list[str]:
+    """Repo names under the configured repo roots."""
+    return discovery.local_names(limit=limit)
+
+
+# ── cloning ───────────────────────────────────────────────────────────────────
 
 
 def clone_target(name: str) -> Path:
@@ -1140,17 +947,11 @@ def clone_target(name: str) -> Path:
     Read-only: the gate and ws_new both want to TELL the user the
     destination before anything is written to their disk.
     """
-    # Prefer the agent's own root: /Git itself is likivik's, and clones landing
-    # there would violate the likivik/hermes ownership split.
-    for b in ("/Git/hermes", "/Git"):
-        base = Path(b)
-        if base.is_dir() and os.access(base, os.W_OK):
-            return base / name
-    return Path(REPO_ROOTS[0]) / name
+    return clone_root() / name
 
 
 def clone_repo(name: str, url: str) -> Path:
-    """Clone `name` from `url` into the repo root. The explicit, approved step.
+    """Clone `name` from `url` into the clone root. The explicit, approved step.
 
     Separate from ensure_local() on purpose: ensure_local() clones as a
     side effect of "give me a checkout", while this one is only ever reached
@@ -1162,29 +963,40 @@ def clone_repo(name: str, url: str) -> Path:
     if dest.exists():
         raise WorkspaceError(f"{dest} already exists but is not a repo")
     base = dest.parent
+    base.mkdir(parents=True, exist_ok=True)
     run(["jj", "git", "clone", "--colocate", url, str(dest)], cwd=base)
     return dest
 
 
 def ensure_local(name: str, url: str) -> Path:
-    """Return a local checkout for a remote repo, cloning into the first
-    writable repo root (/Git/hermes) when it is not on disk yet."""
+    """Return a local checkout for a remote repo, cloning into the clone root
+    when it is not on disk yet."""
     try:
         return find_repo(name)
     except WorkspaceError:
         pass
     if not url:
         raise WorkspaceError(f"repo {name!r} is not local and has no clone URL")
-    # Prefer the agent's own root: /Git itself is likivik's, and clones landing
-    # there would violate the likivik/hermes ownership split.
-    for b in ("/Git/hermes", "/Git"):
-        base = Path(b)
-        if base.is_dir() and os.access(base, os.W_OK):
-            break
-    else:
-        raise WorkspaceError(f"no writable repo root under {REPO_ROOTS}")
+    base = clone_root()
+    if not base.is_dir():
+        raise WorkspaceError(f"no writable repo root under {repo_roots()}")
     dest = base / name
     if dest.exists():
         raise WorkspaceError(f"{dest} already exists but is not a repo")
     run(["jj", "git", "clone", "--colocate", url, str(dest)], cwd=base)
     return dest
+
+
+# ── migration ─────────────────────────────────────────────────────────────────
+
+
+def migrate_legacy(workspace_root: Path | None = None) -> dict[str, Any]:
+    """Import the legacy JSON records into the database. Idempotent."""
+    return db.migrate_legacy(workspace_root if workspace_root is not None else root_dir())
+
+
+def purge_legacy_records(dry_run: bool = False, workspace_root: Path | None = None) -> dict[str, Any]:
+    """Delete the in-tree ``.hermes/session.json`` files, after a backup."""
+    return db.purge_legacy_records(
+        dry_run=dry_run, workspace_root=workspace_root if workspace_root is not None else root_dir()
+    )

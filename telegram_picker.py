@@ -68,15 +68,9 @@ def _most_recent_chat() -> tuple[Any, Any] | None:
 
 def _allowlist() -> list[int]:
     """User ids allowed to tap the picker. Empty/unset means open (legacy)."""
-    try:
-        from hermes_cli.config import load_config_readonly  # type: ignore
+    from . import settings as _settings
 
-        cfg = load_config_readonly() or {}
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-treeps") or {}
-        ids = entry.get("allowed_user_ids") or []
-        return [int(i) for i in ids]
-    except Exception:
-        return []
+    return list(_settings.settings()["allowed_user_ids"])
 
 
 def _tapper_allowed(user_id: Any) -> bool:
@@ -225,6 +219,12 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
     """Send the repo picker keyboard to the session's chat."""
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+        from . import settings as _settings
+
+        if not _settings.settings()["picker_enabled"]:
+            logger.info("workspace picker skipped: picker_enabled is false")
+            return
 
         # The session's OWN key first: the last-update chat is only a fallback -
         # in a multi-topic group it can be a different thread entirely (that

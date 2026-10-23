@@ -23,6 +23,33 @@ def store():
     return STORE
 
 
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path, monkeypatch):
+    """Point the plugin's database (and every legacy path) at a tmp dir.
+    WHY: the plugin's state lives in ONE sqlite file under the host's
+    plugin-data directory. Without this fixture the suite reads and WRITES
+    the live database - a test binding a session would overwrite a real
+    session's binding, and rows from one test leak into the next. The
+    environment overrides are the plugin's own supported test seams
+    (``HERMES_TREEPS_DB_PATH`` and friends), so nothing has to be patched
+    inside the plugin to keep the live install untouched.
+    """
+    monkeypatch.setenv("HERMES_TREEPS_PLUGIN_DATA_DIR", str(tmp_path / "plugin-data"))
+    monkeypatch.setenv("HERMES_TREEPS_DB_PATH", str(tmp_path / "plugin-data" / "data.db"))
+    monkeypatch.setenv("HERMES_TREEPS_LEGACY_STATE_DIR", str(tmp_path / "legacy-state"))
+    monkeypatch.setenv("HERMES_TREEPS_LEGACY_WORKSPACE_ROOT", str(tmp_path / "legacy-workspaces"))
+    # The archive of retired workspaces also lives under the Hermes home.
+    monkeypatch.setattr(STORE, "hermes_home", lambda: tmp_path / "hermes-home")
+    # Environment overrides win over config.yaml, so the suite must not run
+    # with any of them set: a FORGEJO_URL in the developer's shell would
+    # otherwise change what settings() returns and fail the defaults test.
+    for var in STORE._settings.ENV_OVERRIDES:
+        monkeypatch.delenv(var, raising=False)
+    STORE.db.reset()
+    yield
+    STORE.db.reset()
+
+
 @pytest.fixture
 def state_home(tmp_path, monkeypatch):
     """Point the plugin's per-session state at a tmp dir.

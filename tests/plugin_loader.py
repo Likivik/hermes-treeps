@@ -33,3 +33,5 @@ def _load_plugin():
 
 PLUGIN = _load_plugin()
 STORE = PLUGIN.store
+SETTINGS = STORE._settings
+VCS = STORE._vcs

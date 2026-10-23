@@ -56,19 +56,55 @@ else's tree.
    that fix ships; until then a fresh session created within the 10-minute
    pointer window inherits too (the known residue).
 
-## Config
+## Configuration
+
+Every setting lives in one namespace: `plugins.entries.hermes-treeps.settings`.
+The same keys are editable from **Desktop → Settings → Plugins** (the form is
+generated from the manifest's `config_schema`) or by hand in `config.yaml`:
 
 ```yaml
 plugins:
   entries:
     hermes-treeps:
-      allowed_user_ids: [<telegram ids that may tap the picker>]
-      inject_first_message: false   # open gateway sessions with the question itself (runs an extra turn)
+      settings:
+        workspace_root: /Git/hermes/workspaces   # where <repo>/<slug> lives
+        repo_roots: [/Git, /Git/hermes, /Git/likivik, /Git/repos]
+        clone_root: /Git/hermes                 # where a new repo is created
+        repo_sources: [local, github, forgejo]  # which catalogues the picker reads
+        vcs: auto                               # auto | jj | git
+        extra_bin_dirs: [/run/current-system/sw/bin, /usr/local/bin, /usr/bin]
+        picker_enabled: true
+        inject_first_message: false             # open gateway sessions with the question itself
+        allowed_user_ids: []                    # telegram ids allowed to tap the picker
+        forgejo_url: ""                         # e.g. https://forgejo.example
 ```
 
-Environment: `FORGEJO_URL` + `FORGEJO_TOKEN` enable the Forgejo source; `gh`
-must be authenticated for GitHub. With neither reachable, the picker falls back
-to a stale cache, then to local repos under `REPO_ROOTS`.
+`forgejo_token` is a secret: it is declared in the manifest with
+`type: secret` and is stored in `.env`, never in `config.yaml`. Set it with
+`hermes plugins set-secret hermes-treeps forgejo_token` (or
+`FORGEJO_TOKEN` in the environment).
+
+There is no fallback to the old top-level `plugins.entries.hermes-treeps.<key>`
+form — one namespace, one source of truth. A relative path, an unknown
+`repo_sources` entry or an unknown `vcs` is refused with an error that names
+the key.
+
+Environment overrides exist for the same keys (`HERMES_TREEPS_WORKSPACE_ROOT`,
+`FORGEJO_URL`, …) and win over `config.yaml`.
+
+## State
+
+All state lives in one SQLite database under the host's plugin-data
+directory: `<hermes home>/plugin-data/hermes-treeps/data.db` (WAL mode). The
+session bindings, the workspace records and the remote-repo cache are tables
+in it, and every mutation is one transaction — the old JSON read-modify-write
+lost half of eight concurrent bindings.
+
+The plugin install directory holds no state, so `hermes plugins update` can
+replace it without touching anything. Legacy JSON records (the old
+`state/*.json` files and the in-tree `<workspace>/.hermes/session.json` files)
+are imported into the database on first open; `hermes ws migrate --purge`
+deletes the in-tree copies after writing a tarball backup of them.
 
 ## Requirements
 
