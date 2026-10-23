@@ -114,6 +114,20 @@ def test_migration_dry_run_imports_nothing(tmp_path, monkeypatch):
     assert DB.read_binding("sid-good") is not None, "the real run imported nothing"
 
 
+def test_store_wrapper_forwards_dry_run(tmp_path, monkeypatch):
+    """The `store` seam the CLI calls must forward `dry_run` too.
+
+    Prevents: `store.migrate_legacy` kept the old one-argument signature after
+    `db.migrate_legacy` gained `dry_run`, so the CLI raised TypeError - and
+    before that fix, the same wrapper silently imported under --dry-run.
+    """
+    _legacy_state(tmp_path, monkeypatch)
+
+    preview = STORE.migrate_legacy(workspace_root=tmp_path / "wsroot", dry_run=True)
+    assert preview["dry_run"] is True, preview
+    assert DB.read_binding("sid-good") is None, "the store wrapper swallowed dry_run"
+
+
 def test_migration_imports_the_in_tree_workspace_records(tmp_path, monkeypatch):
     """Every ``<workspace>/.hermes/session.json`` under the root is imported."""
     root = tmp_path / "wsroot"
