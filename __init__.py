@@ -113,7 +113,8 @@ def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
         "description": (
             "Diagnose why workspace resolution failed: binding state (unbound / stale / bound), "
             "the recorded path and whether it still exists, candidate repos, and whether jj/gh "
-            "are resolvable. Set forget=true to drop a dead record."
+            "are resolvable. forget=true drops a dead record only - the session is then unbound "
+            "and still gated until ws_new or ws_chatting is called."
         ),
         "parameters": {
             "type": "object",
@@ -385,10 +386,11 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                     "This session's workspace binding is STALE, not missing: "
                     f"{detail['reason']}\n"
                     "Tell the user the exact path that disappeared, then call ONE of:\n"
-                    "  ws_doctor()                    - full diagnosis (state, record, candidates, tool paths)\n"
-                    "  ws_doctor(forget=true)         - drop the dead record; the session starts unbound\n"
                     "  ws_new(path=<new path>, rebind=true) - bind where the tree lives now\n"
                     "  ws_chatting()                  - talk-only, if the work is no longer in a checkout\n"
+                    "  ws_doctor(forget=true)         - drop the dead record ONLY, then pick one of the two\n"
+                    "                                   above: forgetting alone leaves the session unbound\n"
+                    "                                   and still gated\n"
                     f"Candidate repos: {listing}"
                 ),
             }
