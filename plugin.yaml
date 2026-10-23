@@ -1,5 +1,7 @@
 name: hermes-treeps
-version: 0.2.0
+version: 0.3.0
+manifest_version: 2
+api_version: 1
 description: >
   One jj workspace per session, enforced. A session is either bound to a repo
   (its own workspace under /Git/hermes/workspaces/<repo>/<slug>) or explicitly
@@ -8,6 +10,12 @@ description: >
   never be created without a session record, and a session can never quietly
   work in someone else's tree.
 author: "Likivik"
+license: MIT
+homepage: https://github.com/Likivik/hermes-treeps
+tags:
+  - workspaces
+  - vcs
+  - sessions
 kind: standalone
 platforms:
   - linux
@@ -23,3 +31,50 @@ provides_hooks:
   - on_session_start
   - on_session_reset
   - on_session_finalize
+# Every key the plugin reads is declared here, so the Desktop settings form
+# and the code cannot drift apart. The test suite asserts that this set is
+# exactly the set settings() reads.
+config_schema:
+  workspace_root:
+    type: str
+    default: /Git/hermes/workspaces
+    description: Where session workspaces are created (<repo>/<slug> under this root).
+  repo_roots:
+    type: list
+    default: [/Git, /Git/hermes, /Git/likivik, /Git/repos]
+    description: Directories scanned for local repos.
+  clone_root:
+    type: str
+    default: /Git/hermes
+    description: Where a new repo is created or cloned.
+  repo_sources:
+    type: list
+    default: [local, github, forgejo]
+    description: Which remote catalogues the picker consults (local, github, forgejo).
+  vcs:
+    type: str
+    default: auto
+    description: Which VCS to use for new workspaces - auto (follow the repo), jj or git.
+  extra_bin_dirs:
+    type: list
+    default: [/run/current-system/sw/bin, /usr/local/bin, /usr/bin]
+    description: Extra PATH entries for gh, jj and git.
+  picker_enabled:
+    type: bool
+    default: true
+    description: Show the Telegram repo picker keyboard on /new.
+  inject_first_message:
+    type: bool
+    default: false
+    description: Open gateway sessions with the choice question itself (runs an extra turn).
+  allowed_user_ids:
+    type: list
+    default: []
+    description: Telegram user ids allowed to tap the picker (empty means open to everyone).
+  forgejo_url:
+    type: str
+    default: ""
+    description: Base URL of the Forgejo instance to search for repos.
+  forgejo_token:
+    type: secret
+    description: Forgejo API token (stored in .env, never in config.yaml).

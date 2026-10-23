@@ -2,11 +2,15 @@
 
 Each test names the failure it prevents. These are the bugs that turned a
 slug into a path OUTSIDE the workspace root - and retire() then deleted it.
+
+The workspace records live in the plugin's sqlite database now (the old
+``<ws>/.hermes/session.json`` files are only a migration source), so the
+fixtures below seed the database through ``store.write_record`` - the same
+public API the plugin itself uses.
 """
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 
@@ -16,13 +20,19 @@ from plugin_loader import STORE
 WorkspaceError = STORE.WorkspaceError
 
 
-def _fake_root(tmp_path, monkeypatch):
+def _fake_root(tmp_path, monkeypatch, repo="repo", slug="ws1", sessions=("sid-a",)):
     """A workspace root under tmp_path, with one real workspace in it."""
     root = tmp_path / "workspaces"
-    (root / "repo" / "ws1" / ".hermes").mkdir(parents=True)
-    rec = root / "repo" / "ws1" / ".hermes" / "session.json"
-    rec.write_text(json.dumps({"repo": "repo", "slug": "ws1", "sessions": ["sid-a"]}))
+    ws = root / repo / slug
+    ws.mkdir(parents=True)
     monkeypatch.setattr(STORE, "root_dir", lambda: root)
+    STORE.write_record(ws, {
+        "repo": repo,
+        "slug": slug,
+        "path": str(ws),
+        "vcs": "jj",
+        "sessions": list(sessions),
+    })
     return root
 
 
@@ -61,8 +71,8 @@ def test_find_workspace_refuses_traversal_slugs(tmp_path, monkeypatch, bad_slug)
     """
     _fake_root(tmp_path, monkeypatch)
     victim = tmp_path / "outside" / "victim"
-    (victim / ".hermes").mkdir(parents=True)
-    (victim / ".hermes" / "session.json").write_text(json.dumps({"repo": "repo", "slug": "victim"}))
+    victim.mkdir(parents=True)
+    STORE.write_record(victim, {"repo": "repo", "slug": "victim", "path": str(victim)})
     assert victim.exists()
     with pytest.raises(WorkspaceError) as exc:
         STORE.find_workspace(bad_slug)
@@ -79,9 +89,12 @@ def test_find_workspace_refuses_a_hit_outside_the_root(tmp_path, monkeypatch):
     """
     root = _fake_root(tmp_path, monkeypatch)
     outside = tmp_path / "outside"
-    (outside / ".hermes").mkdir(parents=True)
-    (outside / ".hermes" / "session.json").write_text(json.dumps({"repo": "repo", "slug": "linked"}))
-    (root / "repo" / "linked").symlink_to(outside)
+    outside.mkdir(parents=True)
+    link = root / "repo" / "linked"
+    link.symlink_to(outside)
+    # The record points at the symlink: the lookup finds it, and only the
+    # resolved-path check can refuse it.
+    STORE.write_record(link, {"repo": "repo", "slug": "linked", "path": str(link)})
     with pytest.raises(WorkspaceError):
         STORE.find_workspace("linked")
 
@@ -111,11 +124,20 @@ def test_rename_refuses_an_invalid_old_slug(tmp_path, monkeypatch):
 
 
 def test_rename_moves_a_real_workspace(tmp_path, monkeypatch):
-    """The happy path still works."""
+    """The happy path still works - and the record follows the directory."""
     root = _fake_root(tmp_path, monkeypatch)
     STORE.rename("ws1", "ws2")
-    assert (root / "repo" / "ws2" / ".hermes" / "session.json").exists()
     assert not (root / "repo" / "ws1").exists()
+    assert (root / "repo" / "ws2").is_dir()
+    # The record moved with it: keyed by (repo, slug), so the old row is gone
+    # and the new one carries the new path.
+    assert STORE.read_record(root / "repo" / "ws1") is None
+    rec = STORE.read_record(root / "repo" / "ws2")
+    assert rec is not None and rec["path"] == str(root / "repo" / "ws2"), rec
+    assert rec["slug"] == "ws2", rec
+    # The session rows moved with the workspace (a stale row would keep the
+    # old workspace claiming the session, and retire() would refuse it).
+    assert rec["sessions"] == ["sid-a"], rec
 
 
 # ── detach ────────────────────────────────────────────────────────────────────
@@ -131,21 +153,17 @@ def test_detach_removes_the_session_from_a_record(tmp_path, monkeypatch):
     root = _fake_root(tmp_path, monkeypatch)
     ws = root / "repo" / "ws1"
     STORE.detach(ws, "sid-a")
-    rec = json.loads((ws / ".hermes" / "session.json").read_text())
-    assert rec["sessions"] == []
+    rec = STORE.read_record(ws)
+    assert rec is not None and rec["sessions"] == [], rec
 
 
 def test_detach_leaves_other_sessions_alone(tmp_path, monkeypatch):
     """detach() removes one session, not all of them."""
-    root = _fake_root(tmp_path, monkeypatch)
+    root = _fake_root(tmp_path, monkeypatch, sessions=("sid-a", "sid-b"))
     ws = root / "repo" / "ws1"
-    rec_path = ws / ".hermes" / "session.json"
-    rec = json.loads(rec_path.read_text())
-    rec["sessions"] = ["sid-a", "sid-b"]
-    rec_path.write_text(json.dumps(rec))
     STORE.detach(ws, "sid-a")
-    rec = json.loads(rec_path.read_text())
-    assert rec["sessions"] == ["sid-b"]
+    rec = STORE.read_record(ws)
+    assert rec is not None and rec["sessions"] == ["sid-b"], rec
 
 
 def test_detach_on_an_unknown_workspace_is_a_noop(tmp_path):
@@ -197,16 +215,14 @@ def test_retire_runs_the_vcs_cleanup_in_the_source_repo(tmp_path, monkeypatch):
     workspace. The call must use `jj -R <repo> workspace forget <slug>` and
     a non-zero returncode must abort the retirement.
     """
-    root = _fake_root(tmp_path, monkeypatch)
-    ws = root / "repo" / "ws1"
+    root = _fake_root(tmp_path, monkeypatch, repo="source-repo", sessions=())
+    ws = root / "source-repo" / "ws1"
     source = tmp_path / "source-repo"
-    source.mkdir()
-    rec_path = ws / ".hermes" / "session.json"
-    rec = json.loads(rec_path.read_text())
-    rec["repo"] = "source-repo"
-    rec["vcs"] = "jj"
-    rec["sessions"] = []
-    rec_path.write_text(json.dumps(rec))
+    source.mkdir(exist_ok=True)
+    STORE.write_record(ws, {
+        "repo": "source-repo", "slug": "ws1", "path": str(ws),
+        "vcs": "jj", "sessions": [],
+    })
 
     calls = []
 
@@ -240,16 +256,14 @@ def test_retire_aborts_when_the_vcs_cleanup_fails(tmp_path, monkeypatch):
     directory while the repo kept a stale workspace entry pointing at a
     directory that no longer exists.
     """
-    root = _fake_root(tmp_path, monkeypatch)
-    ws = root / "repo" / "ws1"
+    root = _fake_root(tmp_path, monkeypatch, repo="source-repo", sessions=())
+    ws = root / "source-repo" / "ws1"
     source = tmp_path / "source-repo"
-    source.mkdir()
-    rec_path = ws / ".hermes" / "session.json"
-    rec = json.loads(rec_path.read_text())
-    rec["repo"] = "source-repo"
-    rec["vcs"] = "jj"
-    rec["sessions"] = []
-    rec_path.write_text(json.dumps(rec))
+    source.mkdir(exist_ok=True)
+    STORE.write_record(ws, {
+        "repo": "source-repo", "slug": "ws1", "path": str(ws),
+        "vcs": "jj", "sessions": [],
+    })
 
     monkeypatch.setattr(
         STORE.subprocess, "run",
@@ -288,9 +302,13 @@ def test_create_returns_the_canonical_slug_and_path(tmp_path, monkeypatch):
     rec = STORE.create("repo", "Fix The Widget", purpose="test")
     assert rec["slug"] == "fix-the-widget", rec
     on_disk = root / "repo" / rec["slug"]
-    assert on_disk.is_dir(), f"the record's slug does not match the directory: {on_disk}"
-    assert (on_disk / ".hermes" / "session.json").exists()
     assert rec["path"] == str(on_disk), rec
+    # The record is in the database, keyed by (repo, slug), and readable back
+    # through the same API every other caller uses.
+    stored = STORE.read_record(on_disk)
+    assert stored is not None, "the workspace record was not stored"
+    assert stored["slug"] == "fix-the-widget", stored
+    assert stored["path"] == str(on_disk), stored
 
 
 def test_sanitize_slug_is_canonical():

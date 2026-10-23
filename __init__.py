@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -467,7 +468,7 @@ def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
             "path": detail["path"],
             "path_exists": bool(detail["path"]) and Path(str(detail["path"])).exists(),
             "record": detail["record"],
-            "repo_roots": list(store.REPO_ROOTS),
+            "repo_roots": store.repo_roots(),
             "candidate_repos": local_candidates,
             "local_candidates": local_candidates,
             "remote_candidates": [
@@ -480,7 +481,8 @@ def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
             ],
             "remote_error": remote_error,
             "tools": {"jj": shutil.which("jj"), "gh": shutil.which("gh")},
-            "state_dir": str(store.state_dir()),
+            "db_path": str(store.db_path()),
+            "workspace_root": str(store.root_dir()),
         }
         if args.get("forget"):
             out["forgot"] = store.forget(sid)
@@ -650,18 +652,16 @@ def _inject_first_message_enabled() -> bool:
     Default off. Injection runs a turn, so on Telegram it lands right after the
     /new greeting - the question twice. The prompt section already puts the
     question in that greeting, which is why this is a switch, not the default.
-    """
-    import os
 
+    The switch lives in the settings namespace
+    (``plugins.entries.hermes-treeps.settings.inject_first_message``), like
+    every other user-visible setting of this plugin.
+    """
     env = os.environ.get("HERMES_WS_INJECT_FIRST")
     if env is not None:
         return env.strip().lower() in {"1", "true", "yes", "on"}
     try:
-        from hermes_cli.config import load_config_readonly  # type: ignore
-
-        cfg = load_config_readonly() or {}
-        entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("hermes-treeps") or {}
-        return bool(entry.get("inject_first_message"))
+        return bool(store.settings()["inject_first_message"])
     except Exception:
         return False
 
@@ -765,6 +765,21 @@ def _register_cli(subparser) -> None:
     p_chat = sub.add_parser("chatting", help="mark a session as talk-only")
     p_chat.add_argument("--session", default="")
 
+    p_mig = sub.add_parser(
+        "migrate",
+        help="import the legacy JSON records into the plugin database (idempotent)",
+    )
+    p_mig.add_argument(
+        "--purge",
+        action="store_true",
+        help="after importing, delete the in-tree .hermes/session.json files (backed up first)",
+    )
+    p_mig.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --purge: list the files that would be deleted and delete none",
+    )
+
     subparser.set_defaults(ws_action="list")
 
 
@@ -845,6 +860,18 @@ def _cli(args) -> int:
             store.mark_chatting(args.session or "cli")
             print("session marked as chatting")
             return 0
+        if action == "migrate":
+            out = store.migrate_legacy()
+            print(json.dumps(out, indent=2, default=str))
+            if not getattr(args, "purge", False):
+                return 0
+            purge = store.purge_legacy_records(dry_run=bool(getattr(args, "dry_run", False)))
+            print(json.dumps(purge, indent=2, default=str))
+            if getattr(args, "dry_run", False):
+                print("dry run: nothing was deleted")
+            else:
+                print(f"purged {len(purge.get('purged') or [])} legacy record(s)")
+            return 0
     except store.WorkspaceError as e:
         print(f"refused: {e}")
         return 2
@@ -864,7 +891,7 @@ def register(ctx) -> None:
         handler_fn=_cli,
         description=(
             "Session-owned workspaces under /Git/hermes/workspaces/<repo>/<slug>. "
-            "Creates the jj workspace and its .hermes/session.json together."
+            "Creates the jj workspace and its record in the plugin database together."
         ),
     )
 
