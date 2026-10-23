@@ -990,9 +990,17 @@ def ensure_local(name: str, url: str) -> Path:
 # ── migration ─────────────────────────────────────────────────────────────────
 
 
-def migrate_legacy(workspace_root: Path | None = None) -> dict[str, Any]:
-    """Import the legacy JSON records into the database. Idempotent."""
-    return db.migrate_legacy(workspace_root if workspace_root is not None else root_dir())
+def migrate_legacy(workspace_root: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """Import the legacy JSON records into the database. Idempotent.
+
+    ``dry_run`` is forwarded, not swallowed: this wrapper dropped it once and
+    the CLI then imported 38 rows under --dry-run while the underlying
+    function was already fixed. The wrapper is the seam the CLI actually
+    calls, so it carries every argument.
+    """
+    return db.migrate_legacy(
+        workspace_root if workspace_root is not None else root_dir(), dry_run=dry_run
+    )
 
 
 def purge_legacy_records(dry_run: bool = False, workspace_root: Path | None = None) -> dict[str, Any]:
