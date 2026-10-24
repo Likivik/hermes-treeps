@@ -318,3 +318,37 @@ def test_sanitize_slug_is_canonical():
     assert STORE.sanitize_slug("a/b") == "a-b"
     assert STORE.sanitize_slug("..") == ""
     assert STORE.sanitize_slug("Fix The Widget") == STORE.sanitize_slug("fix-the-widget")
+
+
+def test_a_clean_child_workspace_becomes_retirable_after_the_ttl(tmp_path, monkeypatch):
+    """Child workspaces are collected by age, not by "is it pushed".
+
+    Prevents: every delegation leaving a full checkout on disk forever - a
+    child's commit is the handoff artifact and is usually not pushed, so the
+    pushed-state test kept them in tier2 permanently.
+    """
+    ws = tmp_path / "repo" / "parent-child-abc123"
+    ws.mkdir(parents=True)
+    monkeypatch.setattr(
+        STORE,
+        "settings",
+        lambda: {"workspace_root": str(tmp_path), "repo_roots": [str(tmp_path)]},
+    )
+    STORE.write_record(
+        ws,
+        {
+            "repo": "repo",
+            "slug": ws.name,
+            "path": str(ws),
+            "vcs": "jj",
+            "purpose": f"{STORE.CHILD_PURPOSE_PREFIX}parent-1",
+            "sessions": ["child-1"],
+            "created_at": "2020-01-01T00:00:00",
+        },
+    )
+    STORE.write_state("child-1", {"mode": "repo", "repo": "repo", "slug": ws.name, "path": str(ws), "session_ended_at": "2020-01-02T00:00:00"})
+    monkeypatch.setattr(STORE, "dirty", lambda path: False)
+
+    tiers = STORE.gc_tiers()
+    slugs = [item["slug"] for item in tiers["tier1"]]
+    assert ws.name in slugs, tiers
