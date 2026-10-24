@@ -12,6 +12,7 @@ No network, no jj, no Hermes install: tmp dirs and the stdlib only.
 from __future__ import annotations
 
 import importlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -42,8 +43,15 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def workspace(tmp_path: Path) -> Path:
+    """A git workspace that ignores .env.
+
+    git matters: prepare only copies a file git already ignores there, because
+    a copied .env in a checkout is one `git add -A` away from being committed.
+    """
     ws = tmp_path / "workspace"
     ws.mkdir()
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    (ws / ".gitignore").write_text(".env\n")
     return ws
 
 
@@ -212,3 +220,17 @@ def test_register_adds_the_ws_prepare_tool():
     assert spec["toolset"] == "workspaces"
     assert spec["schema"]["name"] == "ws_prepare"
     assert callable(spec["handler"])
+
+
+def test_a_file_git_does_not_ignore_is_never_copied(repo, workspace):
+    """A .env the workspace would COMMIT is refused, not copied.
+
+    Prevents: prepare turning the operator's real .env into a staged secret in
+    a child's checkout - one `git add -A` from being pushed.
+    """
+    (workspace / ".gitignore").write_text("node_modules/\n")  # .env is NOT ignored
+    out = PREPARE.run_prepare(repo, workspace, _settings())
+    assert out["ok"] is True, out
+    assert out["copied"] == [], out
+    assert not (workspace / ".env").exists(), "a committable .env was copied anyway"
+    assert any("not gitignored" in s for s in out["skipped"]), out

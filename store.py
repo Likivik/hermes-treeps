@@ -744,6 +744,33 @@ def session_for_chat(chat_id: Any, thread_id: Any = None) -> dict[str, Any] | No
 # ── gc ────────────────────────────────────────────────────────────────────────
 
 
+# A child workspace is throwaway by design: its commit is the handoff artifact,
+# so it is rarely pushed, and `gc` would otherwise keep every delegation's
+# checkout forever ("unpushed commits", tier2). After this many days it is
+# reclaimable once its session ended and its tree is clean.
+CHILD_TTL_DAYS = 7
+
+# Written into a workspace record's `purpose` by childspace when a delegated
+# child gets its own tree. One definition, imported by childspace, so gc and
+# the creator cannot disagree about what a child workspace is.
+CHILD_PURPOSE_PREFIX = "child:"
+
+
+def _workspace_age_days(record: dict[str, Any], path: Path) -> float:
+    """Age in days from the record's created_at, else from the tree's mtime."""
+    raw = str(record.get("created_at") or "")
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+        try:
+            created = time.mktime(time.strptime(raw[:19], fmt))
+            return max(0.0, (time.time() - created) / 86400)
+        except Exception:
+            continue
+    try:
+        return max(0.0, (time.time() - path.stat().st_mtime) / 86400)
+    except Exception:
+        return 0.0
+
+
 def gc_tiers() -> dict[str, list[dict[str, Any]]]:
     """Classify workspaces for reclamation. Dry-run by design: this only labels.
 
@@ -762,6 +789,22 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
         states = [read_state(sid) or {} for sid in sids]
         if not all(st.get("session_ended_at") for st in states):
             tiers["tier3"].append({**item, "why": "session still live"})
+            continue
+        # Child workspaces: unpublished by design, so the "pushed" test that
+        # protects a session's own work does not apply. Age does.
+        if str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX):
+            if dirty(path):
+                tiers["tier2"].append({**item, "why": "child workspace with uncommitted changes"})
+                continue
+            age_days = _workspace_age_days(record, path)
+            if age_days >= CHILD_TTL_DAYS:
+                tiers["tier1"].append(
+                    {**item, "why": f"child workspace, clean, {age_days:.0f}d old"}
+                )
+            else:
+                tiers["tier2"].append(
+                    {**item, "why": f"child workspace, clean, {age_days:.0f}d old (ttl {CHILD_TTL_DAYS}d)"}
+                )
             continue
         prs, gh_ok = open_prs(path)
         mine = _workspace_branches(path)

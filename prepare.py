@@ -57,6 +57,26 @@ def _within(child: Path, parent: Path) -> bool:
     return True
 
 
+def _is_ignored(workspace: Path, rel: str) -> bool:
+    """True when git would ignore ``rel`` inside this workspace.
+
+    WHY this exists: prepare copies the repo's real ``.env`` into a checkout
+    that a child agent will work in. A child that runs ``git add -A`` would
+    then commit the operator's secrets. So a file is only copied when git
+    already ignores it there - otherwise it is skipped and reported, because
+    a missing .env is a fixable inconvenience and a committed one is not.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workspace), "check-ignore", "-q", rel],
+            capture_output=True,
+            timeout=20,
+        )
+    except Exception:
+        return False  # no git, no timeout budget: refuse the copy
+    return proc.returncode == 0
+
+
 def _copy_files(
     repo_root: Path, workspace: Path, files: list[str]
 ) -> tuple[list[str], list[str], list[str]]:
@@ -88,6 +108,11 @@ def _copy_files(
         dst = workspace / rel
         if dst.exists():
             skipped.append(f"{rel}: already present in the workspace, not overwritten")
+            continue
+        if not _is_ignored(workspace, rel):
+            # Copying a file git does not ignore turns the operator's .env into
+            # a commit waiting to happen (one `git add -A` in the child).
+            skipped.append(f"{rel}: not gitignored in this workspace, not copied")
             continue
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)

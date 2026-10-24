@@ -30,7 +30,7 @@ from typing import Any
 
 from . import store
 
-CHILD_PURPOSE_PREFIX = "child:"
+CHILD_PURPOSE_PREFIX = store.CHILD_PURPOSE_PREFIX
 
 
 def is_child_workspace(record: dict[str, Any]) -> bool:
