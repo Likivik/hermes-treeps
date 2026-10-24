@@ -516,12 +516,6 @@ def list_workspaces() -> list[dict[str, Any]]:
 # ── VCS inspection (through the adapter) ─────────────────────────────────────
 
 
-def _remote_url(workspace: Path) -> str:
-    """The origin URL without relying on git (jj workspaces have no .git dir,
-    which makes plain `gh pr list` fail with 'not a git repository')."""
-    return _vcs.remote_url(workspace)
-
-
 def _workspace_branches(workspace: Path) -> set[str]:
     """Branch/bookmark names owned by THIS workspace - the unit that open PRs
     must be matched against. A repo-wide PR list would block retiring a fresh

@@ -26,8 +26,7 @@ provides_tools:
   - ws_status
   - ws_doctor
   # ws_prepare lives in prepare.py and is registered through
-  # prepare.register(ctx). The wiring line in __init__.py is part of this
-  # PR's description - without it the tool does not exist.
+  # prepare.register(ctx) in the plugin's register().
   - ws_prepare
 provides_hooks:
   - pre_tool_call

@@ -416,3 +416,34 @@ def test_the_manifest_declares_the_manifest_v2_fields():
     assert re.search(r"^license:\s*\S+", text, re.M), text
     assert re.search(r"^homepage:\s*\S+", text, re.M), text
     assert re.search(r"^tags:", text, re.M), text
+
+
+def test_manifest_defaults_match_settings_defaults():
+    """plugin.yaml's declared defaults must equal settings.DEFAULTS values.
+
+    Prevents the silent third copy: the drift test compared key SETS and
+    types, so the manifest could declare a different default than the code
+    uses and nothing would notice until a user reset the key in the Desktop
+    settings form.
+    """
+    declared = _manifest_config_schema()
+    for key, spec in declared.items():
+        raw = spec.get("default")
+        if raw is None:
+            continue
+        # The hand parser returns strings; normalise the two shapes we declare.
+        value = settings_module.DEFAULTS[key]
+        if isinstance(value, bool):
+            assert raw == ("true" if value else "false"), (key, raw, value)
+        elif isinstance(value, int) and not isinstance(value, bool):
+            assert raw == str(value), (key, raw, value)
+        elif isinstance(value, (list, tuple)):
+            # a flow list in the manifest: strip brackets, compare members
+            inner = raw.strip()[1:-1] if raw.startswith("[") else raw
+            # the hand parser keeps yaml quoting: '".env"' is .env
+            got = [p.strip().strip('"').strip("'") for p in inner.split(",") if p.strip()]
+            assert got == [str(v) for v in value], (key, got, value)
+        else:
+            # the hand parser keeps the yaml quoting: '""' is the empty string
+            raw = raw.strip().strip('"').strip("'")
+            assert raw == value, (key, raw, value)

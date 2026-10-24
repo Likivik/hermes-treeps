@@ -281,7 +281,7 @@ def _open_connection(path: str) -> sqlite3.Connection:
 
     The schema is created BEFORE the connection is handed out, and the
     creation happens under ``_INIT_LOCK``: the old code published the
-    connection and only then ran ``init_schema()``, so a concurrent reader
+    connection and only then created the schema, so a concurrent reader
     could hit "no such table: bindings" on a database that existed for
     microseconds.
     """
@@ -313,6 +313,11 @@ def _open_connection(path: str) -> sqlite3.Connection:
             ).fetchone()
             if have is None:
                 conn.executescript(SCHEMA)
+                # Record the version on the SAME connection that created the
+                # schema: a future migration reads this row to decide what to
+                # do. (This row never existed before: the writer lived only
+                # in a dead function nothing called.)
+                _write_kv(conn, "schema_version", str(SCHEMA_VERSION))
                 conn.commit()
     except Exception:
         # Never hand out a half-initialised connection.
@@ -455,19 +460,6 @@ def transaction(commit: bool = True) -> Iterator[sqlite3.Connection]:
                 conn.rollback()
 
 
-def init_schema(conn: sqlite3.Connection | None = None) -> None:
-    """Create the schema if it is missing. Idempotent."""
-    if conn is None:
-        conn = connect()
-    with _INIT_LOCK:
-        conn.executescript(SCHEMA)
-        conn.commit()
-        # On THIS connection, and without going through set_kv(): see
-        # _write_kv for why the lock order matters.
-        _write_kv(conn, "schema_version", str(SCHEMA_VERSION))
-        conn.commit()
-
-
 # ── kv helpers (tokens, caches, markers) ─────────────────────────────────────
 
 
@@ -487,7 +479,7 @@ def set_kv(key: str, value: str) -> None:
 def _write_kv(conn: sqlite3.Connection, key: str, value: str) -> None:
     """The kv upsert, on a given connection.
 
-    WHY it is separate: ``init_schema()`` has to record the schema version
+    WHY it is separate: schema creation has to record the schema version
     on the SAME connection it created the schema on, and it must not call
     ``set_kv()`` while holding ``_INIT_LOCK`` - that would take the locks
     in the opposite order to ``transaction()`` (``_WRITE_LOCK`` then
@@ -608,16 +600,6 @@ def read_workspace(path: str | Path) -> dict[str, Any] | None:
     row = rows[0]
     record = _workspace_row_to_dict(conn, row)
     return record
-
-
-def read_workspace_by_key(repo: str, slug: str) -> dict[str, Any] | None:
-    conn = connect()
-    row = conn.execute(
-        "SELECT * FROM workspaces WHERE repo=? AND slug=?", (repo, slug)
-    ).fetchone()
-    if row is None:
-        return None
-    return _workspace_row_to_dict(conn, row)
 
 
 def _workspace_row_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
@@ -755,14 +737,6 @@ def delete_workspace(repo: str, slug: str) -> None:
     with transaction() as conn:
         conn.execute("DELETE FROM workspace_sessions WHERE repo=? AND slug=?", (repo, slug))
         conn.execute("DELETE FROM workspaces WHERE repo=? AND slug=?", (repo, slug))
-
-
-def list_workspace_rows() -> list[dict[str, Any]]:
-    conn = connect()
-    return [_workspace_row_to_dict(conn, row) for row in conn.execute("SELECT * FROM workspaces")]
-
-
-# ── migration from the legacy JSON records ───────────────────────────────────
 
 
 def legacy_state_dir() -> Path:

@@ -19,7 +19,6 @@ import pytest
 from plugin_loader import PLUGIN
 
 PREPARE = importlib.import_module("hermes_treeps.prepare")
-SETTINGS_MODULE = importlib.import_module("hermes_treeps.settings")
 
 
 def _settings(**over):
