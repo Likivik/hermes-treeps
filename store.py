@@ -824,12 +824,19 @@ def gc_apply() -> list[str]:
 _TOKEN_LOCK = threading.RLock()
 
 
-def new_token(repos: list[dict[str, Any]]) -> str:
-    """Mint a one-shot token that carries the repo list for a picker keyboard."""
+def new_token(repos: list[dict[str, Any]], session_id: str = "") -> str:
+    """Mint a one-shot token that carries the repo list for a picker keyboard.
+
+    ``session_id`` travels with the token: on tap, the binding must go to the
+    session the keyboard was sent FOR. Resolving the session from a
+    process-global recency tracker instead bound whichever session started
+    last - in a group chat with two live sessions, a fresh /new session got
+    "already bound to <another session's workspace>".
+    """
     with _TOKEN_LOCK:
         tokens = db.get_kv_json("tokens", {}) or {}
         token = secrets.token_hex(4)  # 8 chars: fits Telegram's 64-byte callback budget
-        tokens[token] = {"repos": repos, "at": time.time()}
+        tokens[token] = {"repos": repos, "at": time.time(), "sid": str(session_id or "")}
         # drop tokens older than an hour so the table cannot grow forever
         cutoff = time.time() - 3600
         tokens = {k: v for k, v in tokens.items() if not isinstance(v, dict) or v.get("at", 0) > cutoff}

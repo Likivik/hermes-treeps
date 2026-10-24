@@ -262,7 +262,7 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
         if not repos:
             logger.info("workspace picker skipped: no repos from any source")
             return
-        token = store.new_token(repos)
+        token = store.new_token(repos, session_id=session_id)
         rows = []
         for i in range(0, len(repos), 2):
             pair = repos[i : i + 2]
@@ -315,17 +315,29 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
         await q.answer("This prompt expired - send /wsbtn for a fresh one.", show_alert=True)
         return
 
-    # Resolve the session NOW, at tap time: the token predates the reset, so the
-    # session id it would have carried is already dead.
-    session_id = last_session()
+    # Resolve the session NOW, at tap time. Order matters:
+    # 1. the session the token was minted for - IF it is still alive (a /new
+    #    reset kills it, which is why the token alone is not trusted);
+    # 2. the chat's sessions.json row - the reset updates it, so it names the
+    #    session that is actually waiting for an answer;
+    # 3. last_session() - recency tracker, LAST resort only: it is
+    #    process-global, and in a chat with two live sessions it names
+    #    whichever session started last, which bound one session's choice to
+    #    another session's workspace.
+    chat = getattr(update, "effective_chat", None)
+    msg = getattr(update, "effective_message", None)
+    session_id = ""
+    token_sid = str((record or {}).get("sid") or "")
+    if token_sid and store.session_entry(token_sid):
+        session_id = token_sid
     if not session_id:
-        chat = getattr(update, "effective_chat", None)
-        msg = getattr(update, "effective_message", None)
         row = store.session_for_chat(
             getattr(chat, "id", None),
             getattr(msg, "message_thread_id", None) if msg is not None else None,
         )
         session_id = str((row or {}).get("session_id") or "")
+    if not session_id:
+        session_id = last_session()
     if not session_id:
         await q.answer("No active session for this chat - cannot bind a workspace.", show_alert=True)
         return
