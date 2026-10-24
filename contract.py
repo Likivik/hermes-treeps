@@ -32,6 +32,10 @@ SECTION_TITLE = "Delegation contract"
 #: Imperative rules, one per line. ``{ws_new}``-style placeholders are
 #: replaced by ``render()`` with the plugin's tool names.
 RULES = """\
+- First action in a fresh session: run ws_doctor and cd into the workspace
+  path it names. The gate binds you to your own workspace, but your shell may
+  still start in the parent's tree - one cd fixes that; working from the wrong
+  tree is the collision this whole contract exists to prevent.
 - One concern per PR. Split anything else.
 - Report defects as a numbered list with file:line, never as prose.
 - New tests must fail on today's code before the fix; show the red run.
