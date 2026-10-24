@@ -706,7 +706,22 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         }
     except Exception:
         logger.exception("workspace gate failed")
-        return None  # fail open: a broken plugin must not brick the agent
+        # Fail CLOSED for the tools this gate exists to stop. Failing open meant
+        # a locked or corrupt database silently allowed `terminal` - the exact
+        # hole the audits found. Repair stays possible: read-only tools are
+        # allowed, and ws_new / ws_chatting / ws_doctor are not gated tools.
+        if tool_name in store.GATED_TOOLS and not _readonly_allowed(tool_name, kw):
+            return {
+                "action": "block",
+                "message": (
+                    "Workspace gate unavailable: the plugin could not read its own state "
+                    "(database error). Repo-touching tools are blocked until it recovers.\n"
+                    "  ws_doctor   - show the binding and the error\n"
+                    "  ws_chatting - declare a talk-only session, which needs no state read\n"
+                    "Report the error above to the user; do not retry the same tool."
+                ),
+            }
+        return None
 
 
 def _opening_prompt() -> str:
