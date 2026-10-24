@@ -31,7 +31,6 @@ provides_tools:
   - ws_prepare
 provides_hooks:
   - pre_tool_call
-  - pre_gateway_dispatch
   - on_session_start
   - on_session_reset
   - on_session_finalize
@@ -67,10 +66,6 @@ config_schema:
     type: bool
     default: true
     description: Show the Telegram repo picker keyboard on /new.
-  inject_first_message:
-    type: bool
-    default: false
-    description: Open gateway sessions with the choice question itself (runs an extra turn).
   allowed_user_ids:
     type: list
     default: []

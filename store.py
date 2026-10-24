@@ -104,14 +104,6 @@ GATED_TOOLS: dict[str, str] = {
 }
 
 
-def is_gated(tool_name: str) -> bool:
-    """True when the tool must be blocked until the session resolves a workspace."""
-    return tool_name in GATED_TOOLS
-
-
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
-
-
 def hermes_home() -> Path:
     try:
         from utils.paths import get_hermes_home  # type: ignore
@@ -253,35 +245,6 @@ def session_title(session_id: str) -> str:
     except Exception:
         logger.debug("session title lookup failed for %s", session_id, exc_info=True)
         return ""
-
-
-def sync_title(session_id: str) -> dict[str, Any]:
-    """Mirror a renamed session's title into the session state and workspace record."""
-    title = session_title(session_id)
-    if not title:
-        return {"changed": False, "title": ""}
-    st = read_state(session_id)
-    if not st:
-        return {"changed": False, "title": title}
-    changed = st.get("title") != title
-    if changed:
-        st["title"] = title
-        write_state(session_id, st)
-    path = str(st.get("path") or "")
-    if path:
-        ws = Path(path)
-        if ws.is_dir():
-            rec = read_record(ws) or {}
-            titles = dict(rec.get("titles") or {})
-            if titles.get(session_id) != title:
-                titles[session_id] = title
-                rec["titles"] = titles
-                write_record(ws, rec)
-                changed = True
-    return {"changed": changed, "title": title}
-
-
-# ── repo + workspace discovery ────────────────────────────────────────────────
 
 
 def find_repo(name: str) -> Path:
@@ -482,6 +445,11 @@ def rename(old_slug: str, new_slug: str) -> str:
             st["slug"] = new_slug
             write_state(str(sid), st)
     return f"renamed {old_slug} -> {dest}"
+
+
+# Slugs are the only user-supplied path component: this pattern is what keeps
+# a traversal from ever reaching the filesystem (see rename(), find_workspace()).
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def find_workspace(slug: str) -> Path:

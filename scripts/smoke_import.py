@@ -30,7 +30,7 @@ def main() -> int:
     assert not missing, f"missing tools: {sorted(missing)}"
 
     store = module.store
-    for attr in ("resolve_detail", "sync_title", "forget", "remote_repos", "ensure_tool_path"):
+    for attr in ("resolve_detail", "forget", "remote_repos", "ensure_tool_path"):
         assert hasattr(store, attr), f"store.{attr} is missing"
 
     detail = store.resolve_detail("ci-smoke-session-that-does-not-exist")

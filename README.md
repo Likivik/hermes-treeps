@@ -80,7 +80,6 @@ plugins:
         vcs: auto                               # auto | jj | git
         extra_bin_dirs: [/run/current-system/sw/bin, /usr/local/bin, /usr/bin]
         picker_enabled: true
-        inject_first_message: false             # open gateway sessions with the question itself
         allowed_user_ids: []                    # telegram ids allowed to tap the picker
         forgejo_url: ""                         # e.g. https://forgejo.example
         prepare_enabled: true                  # run the workspace prepare step

@@ -591,14 +591,6 @@ def delete_binding(session_id: str) -> bool:
         return cur.rowcount > 0
 
 
-def bindings_with_path(path: str) -> list[str]:
-    conn = connect()
-    return [str(r[0]) for r in conn.execute("SELECT session_id FROM bindings WHERE path=?", (path,))]
-
-
-# ── workspace records (the old <ws>/.hermes/session.json) ────────────────────
-
-
 def workspace_key(record: dict[str, Any]) -> tuple[str, str]:
     repo = str(record.get("repo") or "")
     slug = str(record.get("slug") or "")
@@ -783,22 +775,6 @@ def legacy_state_dir() -> Path:
     if override:
         return Path(override)
     return hermes_home() / "plugins" / PLUGIN_NAME / "state"
-
-
-def legacy_workspace_root() -> Path | None:
-    """The workspace root the legacy in-tree records live under.
-
-    ``HERMES_TREEPS_LEGACY_WORKSPACE_ROOT`` overrides it (tests).
-    """
-    override = os.environ.get("HERMES_TREEPS_LEGACY_WORKSPACE_ROOT")
-    if override:
-        return Path(override)
-    try:
-        from .settings import settings
-
-        return Path(settings()["workspace_root"])
-    except Exception:
-        return None
 
 
 def legacy_workspace_records(workspace_root: Path) -> list[Path]:
