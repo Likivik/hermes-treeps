@@ -56,6 +56,9 @@ SETTINGS_KEYS: tuple[str, ...] = (
     "prepare_command",
     "prepare_files",
     "prepare_timeout_seconds",
+    "verify_command",
+    "verify_timeout_seconds",
+    "landing_gate_enabled",
 )
 
 # Keys whose schema entry is a SECRET: they live in .env, never in config.yaml.
@@ -97,6 +100,16 @@ DEFAULTS: dict[str, Any] = {
     "prepare_files": [".env"],
     # Hard ceiling on the prepare command.
     "prepare_timeout_seconds": 300,
+    # The verification command: run in the CHILD's workspace to find out
+    # whether its work actually passes the repo's tests. Empty means no
+    # verification runs at all. It runs arbitrary code by design, exactly
+    # like prepare_command.
+    "verify_command": "",
+    # Hard ceiling on the verification command.
+    "verify_timeout_seconds": 900,
+    # Whether a parent may land a child's work only when the child's
+    # verification verdict is green and fresh.
+    "landing_gate_enabled": True,
 }
 
 ALLOWED_SOURCES = ("local", "github", "forgejo")
@@ -253,6 +266,26 @@ def _validate(values: dict[str, Any]) -> dict[str, Any]:
         raise SettingsError(
             "hermes-treeps settings.prepare_timeout_seconds: must be between 1 and 3600, "
             f"got {timeout}"
+        )
+
+    # ── the verification step ──────────────────────────────────────────────
+    if not isinstance(out.get("verify_command"), str):
+        raise SettingsError("hermes-treeps settings.verify_command: must be a string")
+
+    verify_timeout = out.get("verify_timeout_seconds")
+    if isinstance(verify_timeout, bool) or not isinstance(verify_timeout, int):
+        raise SettingsError(
+            "hermes-treeps settings.verify_timeout_seconds: must be an integer number of seconds"
+        )
+    if not 60 <= verify_timeout <= 3600:
+        raise SettingsError(
+            "hermes-treeps settings.verify_timeout_seconds: must be between 60 and 3600, "
+            f"got {verify_timeout}"
+        )
+
+    if not isinstance(out.get("landing_gate_enabled"), bool):
+        raise SettingsError(
+            "hermes-treeps settings.landing_gate_enabled: must be true or false"
         )
     return out
 

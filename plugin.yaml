@@ -104,3 +104,20 @@ config_schema:
     type: int
     default: 300
     description: Hard ceiling (1-3600 seconds) on the prepare command.
+  verify_command:
+    type: str
+    default: ""
+    description: >-
+      Shell command run with `bash -lc` inside the CHILD workspace to find out
+      whether its work actually passes the repo's tests (empty means no
+      verification runs). Operator-configured; it runs arbitrary code by design.
+  verify_timeout_seconds:
+    type: int
+    default: 900
+    description: Hard ceiling (60-3600 seconds) on the verification command.
+  landing_gate_enabled:
+    type: bool
+    default: true
+    description: >-
+      Refuse to land a child's work unless its recorded verification verdict
+      is green and fresh.
