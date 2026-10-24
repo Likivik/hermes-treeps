@@ -246,3 +246,23 @@ def test_gate_blocks_when_the_pinned_cwd_is_outside(tmp_path, monkeypatch, state
     _install_fake_runtime_cwd(monkeypatch, path=str(outside))
     res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-pinned-2")
     assert res is not None and res["action"] == "block", res
+
+
+def test_the_gate_fails_closed_when_its_own_state_read_breaks(monkeypatch, state_home):
+    """A database error blocks gated tools instead of silently allowing them.
+
+    Prevents the hole the audits found: `except Exception: return None` meant a
+    locked or corrupt db let `terminal` run for a session that was never bound.
+    Repair stays possible - read-only tools and the ws_* tools are not gated.
+    """
+    def boom(*a, **kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(PLUGIN.store, "resolve", boom)
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-broken-db")
+    assert res is not None and res["action"] == "block", res
+    assert "unavailable" in res["message"], res
+
+    assert PLUGIN._on_pre_tool_call(tool_name="read_file", session_id="sid-broken-db") is None, (
+        "read-only tools must stay usable so the session can be repaired"
+    )

@@ -105,12 +105,14 @@ GATED_TOOLS: dict[str, str] = {
 
 
 def hermes_home() -> Path:
-    try:
-        from utils.paths import get_hermes_home  # type: ignore
+    """The Hermes home directory, resolved by the one implementation in db.
 
-        return Path(get_hermes_home())
-    except Exception:
-        return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    WHY one: three copies of this resolver lived here (one importing
+    ``utils.paths``, which does not exist in the host, so it always fell
+    through the env fallback while the others used the host's profile-aware
+    resolver) and they could disagree under a profile switch.
+    """
+    return db.hermes_home()
 
 
 def state_dir() -> Path:
@@ -215,36 +217,6 @@ def mark_chatting(session_id: str, title: str = "") -> dict[str, Any]:
 # records are reconciled lazily from the state DB instead. Metadata only: the
 # workspace PATH is derived from the session id and never follows a rename
 # (moving a jj workspace leaves jj's internal workspace name stale).
-
-
-def _hermes_home() -> Path:
-    try:
-        from hermes_constants import get_hermes_home  # type: ignore
-
-        return Path(get_hermes_home())
-    except Exception:
-        return Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
-
-
-def session_title(session_id: str) -> str:
-    """The session's current title from ``state.db``, or "" when unavailable."""
-    if not session_id:
-        return ""
-    dbfile = _hermes_home() / "state.db"
-    if not dbfile.exists():
-        return ""
-    try:
-        import sqlite3
-
-        con = sqlite3.connect(f"file:{dbfile}?mode=ro", uri=True, timeout=2)
-        try:
-            row = con.execute("SELECT title FROM sessions WHERE id=?", (session_id,)).fetchone()
-        finally:
-            con.close()
-        return str(row[0] or "") if row else ""
-    except Exception:
-        logger.debug("session title lookup failed for %s", session_id, exc_info=True)
-        return ""
 
 
 def find_repo(name: str) -> Path:
