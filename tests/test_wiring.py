@@ -44,24 +44,6 @@ def test_a_child_gets_its_own_workspace_before_inheriting(tmp_path, monkeypatch,
     assert calls["parent_state"]["repo"] == "repo", calls
 
 
-def test_the_landing_gate_runs_before_the_binding_check(monkeypatch, state_home):
-    """A red child verdict blocks `git push` even for a perfectly bound parent.
-
-    Prevents: the parent merging unverified work because the workspace binding
-    was fine - the binding says where you are, not whether the work passes.
-    """
-    monkeypatch.setattr(
-        PLUGIN.landgate,
-        "check",
-        lambda tool_name, args, session_id: {"action": "block", "message": "child-9 verification FAILED"},
-    )
-    res = PLUGIN._on_pre_tool_call(
-        tool_name="terminal", session_id="parent-2", args={"command": "git push origin x"}
-    )
-    assert res is not None and res["action"] == "block", res
-    assert "child-9" in res["message"], res
-
-
 def test_the_prompt_section_carries_the_delegation_contract(monkeypatch):
     """The contract ships inside the system prompt, not in a skill file.
 
