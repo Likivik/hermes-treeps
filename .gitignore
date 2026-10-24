@@ -4,3 +4,4 @@ state/
 
 # hermes-treeps writes per-workspace bookkeeping here; never commit it.
 .hermes/
+.worktrees/

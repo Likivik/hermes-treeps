@@ -205,6 +205,16 @@ def _remote_lookup(repo: str) -> tuple[dict[str, Any] | None, str, list[str]]:
 _PIN_LOGGED = {"at": False}
 
 
+def _turn_key_for_log() -> str:
+    """The gateway turn key the terminal layer would read, for the pin log."""
+    try:
+        from tools.terminal_tool import get_current_session_key
+
+        return str(get_current_session_key() or "")
+    except Exception:
+        return "<unavailable>"
+
+
 def _pin_session_cwd(
     path: str | os.PathLike[str] | None, sid: str = "", task_id: str = ""
 ) -> None:
@@ -227,6 +237,14 @@ def _pin_session_cwd(
         return
     try:
         set_session_cwd(str(path or ""))
+        # One INFO line per pin: the terminal reads its cwd back under one of
+        # three keys (agent session id, gateway turn key, child task id) and
+        # the live probe showed the child's shell STILL landing in the parent
+        # tree - this line is how we find out which key the write missed.
+        logger.info(
+            "cwd pin: sid=%r task_id=%r turn_key=%r path=%s",
+            sid, task_id, _turn_key_for_log(), path,
+        )
         if sid:
             from tools.terminal_tool import get_current_session_key, record_session_cwd
 
