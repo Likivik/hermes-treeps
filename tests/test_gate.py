@@ -156,3 +156,87 @@ def test_unbound_session_does_not_inherit_another_sessions_workspace(state_home,
     finally:
         PLUGIN._LAST_DELEGATION["sid"] = ""
         PLUGIN._LAST_DELEGATION["at"] = 0.0
+
+
+# ── cwd pinning ──────────────────────────────────────────────────────────────
+
+
+class _FakeRuntimeCwd:
+    """Stand-in for agent.runtime_cwd: records pins, answers scoped_session_cwd."""
+
+    def __init__(self, path: str = ""):
+        self.pinned: list[str] = []
+        self.cleared = 0
+        self._path = path
+
+    def set_session_cwd(self, cwd):
+        self.pinned.append(cwd)
+        self._path = cwd
+        return object()
+
+    def clear_session_cwd(self):
+        self.cleared += 1
+        self._path = ""
+
+    def scoped_session_cwd(self):
+        return self._path
+
+
+def _install_fake_runtime_cwd(monkeypatch, path: str = ""):
+    import sys as _sys
+    import types
+
+    fake = _FakeRuntimeCwd(path)
+    mod = types.ModuleType("agent.runtime_cwd")
+    mod.set_session_cwd = fake.set_session_cwd
+    mod.clear_session_cwd = fake.clear_session_cwd
+    mod.scoped_session_cwd = fake.scoped_session_cwd
+    monkeypatch.setitem(_sys.modules, "agent.runtime_cwd", mod)
+    return fake
+
+
+def test_binding_pins_the_session_cwd(tmp_path, monkeypatch, state_home):
+    """ws_new moves the session into the workspace it just bound.
+
+    Prevents: a bound session whose tools still run in the gateway's own
+    directory - the gate said "bound" while every writes landed somewhere else.
+    """
+    fake = _install_fake_runtime_cwd(monkeypatch)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    PLUGIN._pin_session_cwd(ws)
+    assert fake.pinned == [str(ws)], fake.pinned
+
+
+def test_chatting_clears_the_pin(monkeypatch, state_home):
+    """Declaring chatting drops the pin, so the tree is not written by accident."""
+    fake = _install_fake_runtime_cwd(monkeypatch, path="/somewhere")
+    PLUGIN._tool_chatting({}, session_id="sid-chat-pin")
+    assert fake.cleared == 1, "ws_chatting left the previous workspace pinned"
+
+
+def test_gate_allows_when_the_pinned_cwd_is_a_workspace(tmp_path, monkeypatch, state_home):
+    """A pinned cwd inside the workspace root satisfies the gate on its own.
+
+    Prevents the worst failure mode: when the binding read fails, the gate used
+    to fail open with no floor under it. Now the physical cwd is the floor.
+    """
+    ws_root = tmp_path / "workspaces"
+    ws = ws_root / "repo" / "slug"
+    ws.mkdir(parents=True)
+    monkeypatch.setattr(STORE, "settings", lambda: {"workspace_root": str(ws_root)})
+    _install_fake_runtime_cwd(monkeypatch, path=str(ws))
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-pinned-1")
+    assert res is None, f"a pinned workspace must not be blocked: {res}"
+
+
+def test_gate_blocks_when_the_pinned_cwd_is_outside(tmp_path, monkeypatch, state_home):
+    """A pin outside the workspace root is not a workspace and must not pass."""
+    ws_root = tmp_path / "workspaces"
+    ws_root.mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    monkeypatch.setattr(STORE, "settings", lambda: {"workspace_root": str(ws_root)})
+    _install_fake_runtime_cwd(monkeypatch, path=str(outside))
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-pinned-2")
+    assert res is not None and res["action"] == "block", res
