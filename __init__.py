@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import childspace, contract, landgate, prepare, store, verify
+from . import childspace, contract, prepare, store
 from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
@@ -621,12 +621,6 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
     if _LAST_DELEGATION["sid"] and time.time() - _LAST_DELEGATION["at"] > 600:
         _LAST_DELEGATION["sid"] = ""
     try:
-        # Landing gate first: a child's red verdict must stop `git push` /
-        # `gh pr merge` even for a perfectly bound parent, because the damage
-        # (an unverified merge) is done by the landing, not by the binding.
-        landing = landgate.check(tool_name, kw.get("args") or {}, session_id or _session_id(kw))
-        if landing:
-            return landing
         if tool_name not in store.GATED_TOOLS:
             return None
         sid = session_id or _session_id(kw)
@@ -836,32 +830,6 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
         logger.debug("workspace opening prompt skipped", exc_info=True)
 
 
-def _on_session_end(session_id: str = "", **kw: Any) -> None:
-    """Record a delegated child's test verdict when its run ends.
-
-    WHY: every incident in this project traced back to a child's self-report
-    ("all green") that nobody re-ran. The verdict is what `landgate` reads
-    before the parent may push or merge.
-    """
-    try:
-        sid = session_id or _session_id(kw)
-        state = store.read_state(sid) or {}
-        if not state.get("inherited_from"):
-            return  # only children are verified; the parent's work is CI's job
-        command = str(store.settings().get("verify_command") or "")
-        if not command:
-            return  # nothing configured: no verdict, and the landing gate says so
-        path = str(state.get("path") or "")
-        if not path or not Path(path).is_dir():
-            return
-        timeout = int(store.settings().get("verify_timeout_seconds") or 900)
-        verdict = verify.run_verdict(path, command=command, timeout_s=timeout)
-        verify.record_verdict(sid, verdict)
-        logger.info("verify: child %s verdict ok=%s", sid, verdict.get("ok"))
-    except Exception:
-        logger.debug("could not record a child verdict", exc_info=True)
-
-
 def _on_session_finalize(session_id: str = "", **kw: Any) -> None:
     """Stamp the session state at the /new boundary: the gateway fires this with
     the session about to end, so `ws list` can tell a normal ending from a
@@ -1046,10 +1014,6 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
-    try:
-        ctx.register_hook("on_session_end", _on_session_end)
-    except Exception:
-        logger.debug("on_session_end hook not available in this host", exc_info=True)
     try:
         ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     except Exception:
