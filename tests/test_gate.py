@@ -344,3 +344,28 @@ def test_the_fail_closed_message_names_the_actual_error(monkeypatch, state_home)
     monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("database is locked")))
     res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-db-err")
     assert "database is locked" in res["message"], res
+
+
+def test_a_failed_childspace_for_a_repo_parent_blocks_instead_of_inheriting(monkeypatch, state_home):
+    """A git-only parent must not hand the child its own tree via inheritance.
+
+    Prevents the P2 the second audit found: childspace refuses non-jj repos,
+    the old fallback then wrote the PARENT's binding into the child - the
+    two-agents-one-tree collision the child branch exists to prevent.
+    """
+    import types
+    fake_childspace = types.ModuleType("childspace")
+    fake_childspace.ensure_child_workspace = lambda sid, parent_state, **kw: {
+        "ok": False, "reason": "repo 'repo' is not a jj repo - no child workspace",
+    }
+    monkeypatch.setattr(PLUGIN, "childspace", fake_childspace)
+    fake_delegation = types.ModuleType("agent.delegation_context")
+    fake_delegation.is_delegated_child_context = lambda: True
+    monkeypatch.setitem(__import__("sys").modules, "agent.delegation_context", fake_delegation)
+    PLUGIN._LAST_DELEGATION["sid"] = "parent-1"
+    PLUGIN._LAST_DELEGATION["at"] = __import__("time").time()
+    monkeypatch.setattr(PLUGIN.store, "read_state", lambda sid: {
+        "mode": "repo", "repo": "repo", "slug": "parent", "path": "/Git/hermes/workspaces/repo/parent"})
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="child-git-parent")
+    assert res is not None and res["action"] == "block", res
+    assert "own workspace" in res["message"], res

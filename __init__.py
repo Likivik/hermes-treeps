@@ -226,9 +226,18 @@ def _pin_session_cwd(path: str | os.PathLike[str] | None, sid: str = "") -> None
     try:
         set_session_cwd(str(path or ""))
         if sid:
-            from tools.terminal_tool import record_session_cwd
+            from tools.terminal_tool import get_current_session_key, record_session_cwd
 
             record_session_cwd(sid, str(path or ""))
+            # The terminal resolves its cwd from get_current_session_key() -
+            # the gateway's turn key ("agent:...:<chat>") - NOT from the agent
+            # session id. Record under both: the sid for the file-tools layer,
+            # the turn key for the shell. An empty key collapses to "default",
+            # which would re-point EVERY session, so it is only written when
+            # the key is known.
+            key = get_current_session_key()
+            if key:
+                record_session_cwd(key, str(path or ""))
     except Exception:
         logger.debug("could not pin the session cwd", exc_info=True)
 
@@ -241,9 +250,17 @@ def _unpin_session_cwd(sid: str = "") -> None:
     try:
         clear_session_cwd()
         if sid:
-            from tools.terminal_tool import clear_session_cwd as _clear_terminal_cwd
+            from tools.terminal_tool import (
+                clear_session_cwd as _clear_terminal_cwd,
+            )
+            from tools.terminal_tool import (
+                get_current_session_key,
+            )
 
             _clear_terminal_cwd(sid)
+            key = get_current_session_key()
+            if key:
+                _clear_terminal_cwd(key)
     except Exception:
         logger.debug("could not clear the session cwd", exc_info=True)
 
@@ -275,6 +292,13 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         sid = _session_id(kw)
         title = str(args.get("title") or "").strip()
         slug = str(args.get("slug") or "").strip()
+        purpose = str(args.get("purpose") or "")
+        if purpose.startswith("child:"):
+            # Reserved: childspace writes this prefix into workspace records,
+            # and gc classifies child workspaces by it. A user-set purpose with
+            # the same prefix would make a normal workspace look like a
+            # throwaway child and get collected on age alone.
+            return json.dumps({"ok": False, "error": "purpose: the 'child:' prefix is reserved for delegated-child workspaces"})
 
         existing = store.read_state(sid)
         path = str(args.get("path") or "").strip()
@@ -394,7 +418,7 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
                     tail = " No remote repos found in the catalogue."
                 return json.dumps({"ok": False, "error": disk_error + tail})
 
-        record = store.create(repo, slug, purpose=str(args.get("purpose") or ""))
+        record = store.create(repo, slug, purpose=purpose)
         # WHY the record's slug/path and not our own copy: create() SANITISES
         # the slug ("Fix The Widget" -> "fix-the-widget"). Binding the raw slug
         # pointed at a path that does not exist, so the session stayed unbound
@@ -666,6 +690,21 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 )
                 return None
             logger.debug("gate: no child workspace for %s (%s)", sid, made.get("reason"))
+            if parent_state.get("mode") == "repo":
+                # A repo parent with a failed childspace (git-only repo, jj
+                # error) must NOT fall through to inheritance: that puts the
+                # child into the PARENT'S tree - the exact two-agents-one-tree
+                # collision this branch exists to prevent. Inheritance is only
+                # for parents with no repo to branch from (chatting/external).
+                return {
+                    "action": "block",
+                    "message": (
+                        "Delegated child could not get its own workspace: "
+                        f"{made.get('reason')}. Repo-touching tools are blocked.\n"
+                        "Run the child's task directly in this session instead, or "
+                        "convert the repo to jj (jj git init --colocate) and re-dispatch."
+                    ),
+                }
             # Non-destructive inheritance: the child's own record wins. If the
             # child already has a record (it resolved its own workspace, or it
             # was written by an earlier hook), it is NOT overwritten - the old

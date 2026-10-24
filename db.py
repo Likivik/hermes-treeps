@@ -313,10 +313,12 @@ def _open_connection(path: str) -> sqlite3.Connection:
             ).fetchone()
             if have is None:
                 conn.executescript(SCHEMA)
-                # Record the version on the SAME connection that created the
-                # schema: a future migration reads this row to decide what to
-                # do. (This row never existed before: the writer lived only
-                # in a dead function nothing called.)
+                conn.commit()
+            # Record the version on the SAME connection, for fresh AND existing
+            # databases alike: a future migration reads this row to decide what
+            # to do, and an upgraded install must not look like a v1 database.
+            row = conn.execute("SELECT value FROM kv WHERE key='schema_version'").fetchone()
+            if row is None or str(row[0]) != str(SCHEMA_VERSION):
                 _write_kv(conn, "schema_version", str(SCHEMA_VERSION))
                 conn.commit()
     except Exception:

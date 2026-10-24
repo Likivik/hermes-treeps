@@ -66,11 +66,33 @@ def _is_ignored(workspace: Path, rel: str) -> bool:
     already ignores it there - otherwise it is skipped and reported, because
     a missing .env is a fixable inconvenience and a committed one is not.
     """
+    env = dict(os.environ)
+    if not (workspace / ".git").exists():
+        # jj workspaces carry only .jj: the shared .git lives in the MAIN
+        # workspace, so plain `git -C <ws>` dies with "not a git repository"
+        # and every file would be skipped. `jj root` in a subworkspace returns
+        # THAT workspace, not the main one - but `.jj/repo` is a relative
+        # symlink to the main workspace's repo dir, and for a colocated repo
+        # the git dir sits next to it. Point git at it with the child
+        # workspace as the work tree; check-ignore evaluates the same rules
+        # without needing a repo in the workspace itself.
+        try:
+            repo_link = (workspace / ".jj" / "repo")
+            if repo_link.exists():
+                # a plain file holding a RELATIVE path to the main workspace's
+                # .jj/repo (not a symlink) - resolve it against .jj/
+                target = Path(repo_link.read_text().strip())
+                main_repo = (workspace / ".jj" / target).resolve()
+                git_dir = main_repo.parent.parent / ".git"
+                if git_dir.exists():
+                    env["GIT_DIR"] = str(git_dir)
+                    env["GIT_WORK_TREE"] = str(workspace)
+        except Exception:
+            return False  # cannot even locate the repo: refuse the copy
     try:
         proc = subprocess.run(
             ["git", "-C", str(workspace), "check-ignore", "-q", rel],
-            capture_output=True,
-            timeout=20,
+            capture_output=True, timeout=20, env=env,
         )
     except Exception:
         return False  # no git, no timeout budget: refuse the copy

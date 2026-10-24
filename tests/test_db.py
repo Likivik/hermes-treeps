@@ -258,3 +258,20 @@ def test_forget_leaves_no_ghost_in_the_workspace():
 
     left = DB.read_workspace("/tmp/ghost")["sessions"]
     assert left == [], f"the ghost survived forget(): {left}"
+
+
+def test_an_existing_database_gets_the_schema_version_row(state_home):
+    """A database created before schema_version existed must still get the row.
+
+    Prevents: the write lived inside the create-schema branch, so every
+    upgraded install had no version row and a future migration could not tell
+    an upgraded v2 from a v1.
+    """
+    DB.reset()
+    DB.connect()  # first open creates the schema
+    # simulate an upgraded install: drop the row, then force a fresh connection
+    conn = DB.connect()
+    conn.execute("DELETE FROM kv WHERE key='schema_version'")
+    conn.commit()
+    DB.reset()  # bump the generation so the next connect() opens a new connection
+    assert DB.get_kv("schema_version") == str(DB.SCHEMA_VERSION), "upgraded db left unversioned"
