@@ -578,32 +578,6 @@ def _readonly_allowed(tool_name: str, kw: dict[str, Any]) -> bool:
     return True
 
 
-_TITLE_SYNC = {"at": 0.0, "interval": 60.0}
-
-
-def _on_pre_gateway_dispatch(**kw: Any) -> None:
-    """Mirror a renamed session's title into its records, at most once a minute.
-
-    Lazy by necessity: this build has no session-rename hook, and polling the
-    state DB on every message would be wasteful. Metadata only - the workspace
-    path is id-derived and never follows the title.
-    """
-    now = time.time()
-    if now - _TITLE_SYNC["at"] < _TITLE_SYNC["interval"]:
-        return None
-    sid = _session_id(kw) or picker.last_session(max_age_s=600)
-    if not sid or sid == "unknown":
-        return None
-    _TITLE_SYNC["at"] = now
-    try:
-        result = store.sync_title(sid)
-        if result.get("changed"):
-            logger.info("title synced for %s -> %r", sid, result.get("title"))
-    except Exception:
-        logger.debug("title sync failed for %s", sid, exc_info=True)
-    return None
-
-
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
     """Block repo-touching tools until the session resolves a workspace."""
     # Read the recency tracker BEFORE noting this call's session id: the tracker
@@ -734,26 +708,6 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         return None  # fail open: a broken plugin must not brick the agent
 
 
-def _inject_first_message_enabled() -> bool:
-    """Opt-in: let the plugin open gateway sessions with the question itself.
-
-    Default off. Injection runs a turn, so on Telegram it lands right after the
-    /new greeting - the question twice. The prompt section already puts the
-    question in that greeting, which is why this is a switch, not the default.
-
-    The switch lives in the settings namespace
-    (``plugins.entries.hermes-treeps.settings.inject_first_message``), like
-    every other user-visible setting of this plugin.
-    """
-    env = os.environ.get("HERMES_WS_INJECT_FIRST")
-    if env is not None:
-        return env.strip().lower() in {"1", "true", "yes", "on"}
-    try:
-        return bool(store.settings()["inject_first_message"])
-    except Exception:
-        return False
-
-
 def _opening_prompt() -> str:
     repos = store.candidate_repos()
     listing = ", ".join(repos) if repos else "(none found under /Git)"
@@ -768,11 +722,9 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
     """Seed the first turn so the choice prompt is the first thing the user sees.
 
     On Telegram the picker keyboard is that first thing (see telegram_picker).
-    Elsewhere, inject_message() queues user-role input so the session opens with
-    the question itself - gateway sessions additionally need a session_key/origin
-    plus `plugins.entries.hermes-treeps.settings.inject_first_message: true`
-    (the settings namespace; the old top-level
-    `plugins.entries.hermes-treeps.inject_first_message` is never read).
+    Elsewhere, inject_message() queues user-role input, which needs a
+    session_key or an origin - without one there is nowhere to inject, and the
+    system-prompt section already asks the question on the next turn.
     """
     try:
         sid = session_id or _session_id(kw)
@@ -812,19 +764,10 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
         elif isinstance(origin, dict) and origin:
             kwargs["origin"] = origin
         else:
-            if not _inject_first_message_enabled():
-                return
-            # store has no session_key_for(); the durable key lives in the
-            # host's sessions.json row for this session id, which
-            # store.session_entry() returns as {**entry, "session_key": key}.
-            # Calling a non-existent function raised AttributeError, which the
-            # bare except below swallowed - gateway first-message injection
-            # was dead code.
-            entry = store.session_entry(sid)
-            key = (entry or {}).get("session_key")
-            if not key:
-                return
-            kwargs["session_key"] = str(key)
+            # No session_key and no origin: nothing to inject into. The system
+            # prompt section already asks the question, which is why this path
+            # needs no setting any more.
+            return
         _CTX.inject_message(_opening_prompt(), role="user", **kwargs)
     except Exception:
         logger.debug("workspace opening prompt skipped", exc_info=True)
@@ -1014,9 +957,5 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
-    try:
-        ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
-    except Exception:
-        logger.debug("pre_gateway_dispatch hook not available in this host", exc_info=True)
     picker.register(ctx)
     prepare.register(ctx)

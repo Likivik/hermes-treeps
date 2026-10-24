@@ -49,7 +49,6 @@ SETTINGS_KEYS: tuple[str, ...] = (
     "vcs",
     "extra_bin_dirs",
     "picker_enabled",
-    "inject_first_message",
     "allowed_user_ids",
     "forgejo_url",
     "prepare_enabled",
@@ -72,11 +71,6 @@ DEFAULTS: dict[str, Any] = {
     "vcs": "auto",
     "extra_bin_dirs": ["/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin"],
     "picker_enabled": True,
-    # Prevents the "declared but never returned" drift: inject_first_message
-    # was in SETTINGS_KEYS and in plugin.yaml but NOT here, so settings()
-    # never returned it and __init__.py's getter raised KeyError (swallowed
-    # by a bare except) - the feature was permanently dead.
-    "inject_first_message": False,
     "allowed_user_ids": [],
     # forgejo_token is deliberately NOT here: it is a SECRET, read through
     # get_secret() below, and a secret must never travel through the config
