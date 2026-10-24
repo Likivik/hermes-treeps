@@ -101,6 +101,10 @@ GATED_TOOLS: dict[str, str] = {
     "computer_use": "drives the host desktop: clicks, keys, arbitrary actions",
     "cronjob_manage": "installs no_agent script jobs that run commands on a schedule",
     "process_manage": "signals and kills host processes",
+    # These two write host files / spawn tool-running children without touching
+    # the repo through a gated tool first:
+    "skill_manage": "writes SKILL.md files under HERMES_HOME/skills",
+    "delegate_task": "spawns tool-running child sessions",
 }
 
 

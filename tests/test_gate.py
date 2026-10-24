@@ -266,3 +266,81 @@ def test_the_gate_fails_closed_when_its_own_state_read_breaks(monkeypatch, state
     assert PLUGIN._on_pre_tool_call(tool_name="read_file", session_id="sid-broken-db") is None, (
         "read-only tools must stay usable so the session can be repaired"
     )
+
+
+def test_the_child_branch_runs_before_the_pinned_fallback(monkeypatch, state_home):
+    """A delegated child must reach childspace even though it inherits the
+    parent's pinned cwd.
+
+    Prevents: the pinned-cwd fallback used to return before the child branch,
+    and a child inherits the parent's ContextVar pin - so every child passed
+    the gate inside the PARENT's tree and the child-workspace isolation was
+    dead code.
+    """
+    import sys
+    import types
+    _install_fake_runtime_cwd(monkeypatch, path="/Git/hermes/workspaces/repo/parent")
+    # A bound parent's pin is in the child's inherited context; force the
+    # fallback to fire so the test proves the ORDER, not the fallback's mood.
+    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/parent")
+
+    child_calls = []
+    fake_childspace = types.ModuleType("childspace")
+    fake_childspace.ensure_child_workspace = lambda sid, parent_state, **kw: (
+        child_calls.append((sid, dict(parent_state)))
+        or {"ok": True, "path": "/Git/hermes/workspaces/repo/parent-child-abc123", "slug": "child"}
+    )
+    monkeypatch.setitem(sys.modules, "childspace", fake_childspace)
+    monkeypatch.setattr(PLUGIN, "childspace", fake_childspace)
+
+    fake_delegation = types.ModuleType("agent.delegation_context")
+    fake_delegation.is_delegated_child_context = lambda: True
+    monkeypatch.setitem(sys.modules, "agent.delegation_context", fake_delegation)
+
+    PLUGIN._LAST_DELEGATION["sid"] = "parent-1"
+    PLUGIN._LAST_DELEGATION["at"] = __import__("time").time()
+    monkeypatch.setattr(PLUGIN.store, "read_state", lambda sid: {"mode": "repo", "repo": "repo", "slug": "parent", "path": "/Git/hermes/workspaces/repo/parent"})
+
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="child-abc123")
+    assert res is None, res
+    assert child_calls, "the child never reached childspace - it stayed in the parent's tree"
+
+
+def test_fail_closed_still_allows_a_session_pinned_into_a_workspace(monkeypatch, state_home):
+    """The error path must accept the same evidence the normal path accepts.
+
+    Prevents: a session sitting in a real workspace being blocked by a db
+    hiccup, then allowed the moment the db recovers - the two branches
+    disagreeing about what a pinned cwd proves.
+    """
+    _install_fake_runtime_cwd(monkeypatch, path="/Git/hermes/workspaces/repo/ws")
+    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/ws")
+    monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("database is locked")))
+    assert PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-pinned-ok") is None
+
+
+def test_a_chatting_parent_may_delegate_but_an_unbound_one_may_not(monkeypatch, state_home):
+    """delegate_task is gated: no workspace binding, no delegation.
+
+    Prevents: an unbound session spawning tool-running children that inherit
+    nothing and land nowhere - the exact residue the 10-minute pointer window
+    used to create.
+    """
+    res = PLUGIN._on_pre_tool_call(tool_name="delegate_task", session_id="sid-no-binding")
+    assert res is not None and res["action"] == "block", res
+
+    PLUGIN._tool_chatting({}, session_id="sid-chat-delegate")
+    assert PLUGIN._on_pre_tool_call(tool_name="delegate_task", session_id="sid-chat-delegate") is None, (
+        "a chatting session is bound (to HERMES_HOME) and must be able to delegate"
+    )
+
+
+def test_the_fail_closed_message_names_the_actual_error(monkeypatch, state_home):
+    """The block message must carry the exception, not point at a log line.
+
+    Prevents: 'Report the error above' with nothing above - the error lived
+    only in the gateway log.
+    """
+    monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("database is locked")))
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-db-err")
+    assert "database is locked" in res["message"], res

@@ -205,8 +205,17 @@ def _remote_lookup(repo: str) -> tuple[dict[str, Any] | None, str, list[str]]:
 _PIN_LOGGED = {"at": False}
 
 
-def _pin_session_cwd(path: str | os.PathLike[str] | None) -> None:
-    """Pin this session's logical cwd to a workspace path. Never raises."""
+def _pin_session_cwd(path: str | os.PathLike[str] | None, sid: str = "") -> None:
+    """Pin this session's logical cwd to a workspace path. Never raises.
+
+    Two layers on purpose: `agent.runtime_cwd.set_session_cwd` moves what
+    context resolvers see, while `tools.terminal_tool.record_session_cwd` moves
+    where the terminal tool's shell actually starts (terminal_tool resolves cwd
+    from its own per-task record and TERMINAL_CWD, never from the ContextVar).
+    The terminal record is keyed by session id and is only written when we know
+    it: an empty key collapses to "default", which would re-point EVERY
+    session without its own record.
+    """
     try:
         from agent.runtime_cwd import set_session_cwd
     except Exception:
@@ -216,17 +225,25 @@ def _pin_session_cwd(path: str | os.PathLike[str] | None) -> None:
         return
     try:
         set_session_cwd(str(path or ""))
+        if sid:
+            from tools.terminal_tool import record_session_cwd
+
+            record_session_cwd(sid, str(path or ""))
     except Exception:
         logger.debug("could not pin the session cwd", exc_info=True)
 
 
-def _unpin_session_cwd() -> None:
+def _unpin_session_cwd(sid: str = "") -> None:
     try:
         from agent.runtime_cwd import clear_session_cwd
     except Exception:
         return
     try:
         clear_session_cwd()
+        if sid:
+            from tools.terminal_tool import clear_session_cwd as _clear_terminal_cwd
+
+            _clear_terminal_cwd(sid)
     except Exception:
         logger.debug("could not clear the session cwd", exc_info=True)
 
@@ -301,7 +318,7 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         if path:
             state = store.bind_external(path, sid, title=title)
             _detach_previous(existing, state["path"], sid, args.get("rebind"))
-            _pin_session_cwd(state["path"])
+            _pin_session_cwd(state["path"], sid=sid)
             return json.dumps({"ok": True, "mode": "external", "path": state["path"]})
 
         # Idempotence: re-requesting the workspace this session is ALREADY
@@ -395,7 +412,7 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         store.write_state(sid, state)
         # The workspace exists and is bound: move the session INTO it, so the
         # next tool call runs there instead of in the gateway directory.
-        _pin_session_cwd(bound_path)
+        _pin_session_cwd(bound_path, sid=sid)
         # prepare runs inside the response so a broken setup script is visible
         # in the same call that created the workspace, not on the next one.
         return json.dumps(
@@ -489,7 +506,7 @@ def _tool_chatting(args: dict[str, Any], **kw: Any) -> str:
         # Chatting means "no workspace": pin HERMES_HOME rather than clearing,
         # because dropping the override falls back to os.getcwd() - the
         # gateway's own directory - when TERMINAL_CWD is unset.
-        _pin_session_cwd(store.hermes_home())
+        _pin_session_cwd(store.hermes_home(), sid=_session_id(kw))
         return json.dumps({"ok": True, "mode": "chatting"})
     except Exception as e:
         logger.exception("ws_chatting failed")
@@ -601,11 +618,6 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         sid = session_id or _session_id(kw)
         if store.resolve(sid):
             return None
-        # Second line of defence: a pinned cwd inside the workspace root means
-        # the tool physically runs in a workspace, whatever the database read
-        # says - so a corrupted or unreachable binding row cannot fail open.
-        if _pinned_workspace():
-            return None
         # AIRTIGHT inheritance: only a real delegate_task child may inherit.
         # `is_delegated_child_context()` is a task-local ContextVar set by
         # `_run_single_child` and inherited by the child's tool dispatch - it is
@@ -648,7 +660,7 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             # only the fallback, for a parent with no repo to branch from.
             made = childspace.ensure_child_workspace(sid, parent_state)
             if made.get("ok"):
-                _pin_session_cwd(str(made.get("path") or ""))
+                _pin_session_cwd(str(made.get("path") or ""), sid=sid)
                 logger.info(
                     "gate: delegated child %s got its own workspace %s", sid, made.get("slug")
                 )
@@ -667,6 +679,11 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 inherited["inherited_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 store.write_state(sid, inherited)
             logger.info("gate: delegated child %s inherits binding of %s", sid, parent)
+            return None
+        # Second line of defence: a pinned cwd inside the workspace root means
+        # the tool physically runs in a workspace, whatever the database read
+        # says - so a corrupted or unreachable binding row cannot fail open.
+        if _pinned_workspace():
             return None
         try:
             repos = store.candidate_repos(limit=6)
@@ -704,8 +721,16 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 "Ask in one short line offering these repos or 'just chatting'."
             ),
         }
-    except Exception:
+    except Exception as exc:
         logger.exception("workspace gate failed")
+        # A pinned cwd inside the workspace root is independent evidence the
+        # session sits in a workspace - the SAME evidence the normal path
+        # accepts, so the error path accepts it too. Without this, a session
+        # whose cwd is a real workspace is blocked on a db hiccup but allowed
+        # the moment the db recovers - the two branches disagreeing about what
+        # a pinned cwd proves.
+        if _pinned_workspace():
+            return None
         # Fail CLOSED for the tools this gate exists to stop. Failing open meant
         # a locked or corrupt database silently allowed `terminal` - the exact
         # hole the audits found. Repair stays possible: read-only tools are
@@ -714,8 +739,9 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             return {
                 "action": "block",
                 "message": (
-                    "Workspace gate unavailable: the plugin could not read its own state "
-                    "(database error). Repo-touching tools are blocked until it recovers.\n"
+                    "Workspace gate unavailable: the plugin could not read its own state.\n"
+                    f"  error: {type(exc).__name__}: {exc}\n"
+                    "Repo-touching tools are blocked until it recovers.\n"
                     "  ws_doctor   - show the binding and the error\n"
                     "  ws_chatting - declare a talk-only session, which needs no state read\n"
                     "Report the error above to the user; do not retry the same tool."
@@ -750,15 +776,15 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
             # Resumed session: re-pin (a chatting session has no path, and
             # pinning "" would look like a workspace).
             if detail.get("path"):
-                _pin_session_cwd(detail["path"])
+                _pin_session_cwd(detail["path"], sid=sid)
             else:
-                _unpin_session_cwd()
+                _unpin_session_cwd(sid=sid)
             return  # already resolved once: don't re-ask on every resume
         if detail["state"] == "stale":
             # A dead path must not stay pinned: the session would keep running
             # tools in a directory it no longer owns. HERMES_HOME, not an
             # empty pin (see ws_chatting for why).
-            _pin_session_cwd(store.hermes_home())
+            _pin_session_cwd(store.hermes_home(), sid=sid)
             # Do NOT go quiet on a dead path: fall through to the picker/inject
             # path so the user gets a fresh choice instead of a session that
             # silently refuses every tool.
