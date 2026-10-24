@@ -205,7 +205,9 @@ def _remote_lookup(repo: str) -> tuple[dict[str, Any] | None, str, list[str]]:
 _PIN_LOGGED = {"at": False}
 
 
-def _pin_session_cwd(path: str | os.PathLike[str] | None, sid: str = "") -> None:
+def _pin_session_cwd(
+    path: str | os.PathLike[str] | None, sid: str = "", task_id: str = ""
+) -> None:
     """Pin this session's logical cwd to a workspace path. Never raises.
 
     Two layers on purpose: `agent.runtime_cwd.set_session_cwd` moves what
@@ -238,6 +240,13 @@ def _pin_session_cwd(path: str | os.PathLike[str] | None, sid: str = "") -> None
             key = get_current_session_key()
             if key:
                 record_session_cwd(key, str(path or ""))
+            # A delegated child's tools read their cwd under the CHILD's
+            # task_id ("subagent-N-..."), which the host seeds from the
+            # PARENT's record at spawn. Overwrite it with the child's own
+            # workspace - verified live: without this, the child's shell runs
+            # in the parent's tree even though its binding points elsewhere.
+            if task_id:
+                record_session_cwd(task_id, str(path or ""))
     except Exception:
         logger.debug("could not pin the session cwd", exc_info=True)
 
@@ -684,7 +693,9 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             # only the fallback, for a parent with no repo to branch from.
             made = childspace.ensure_child_workspace(sid, parent_state)
             if made.get("ok"):
-                _pin_session_cwd(str(made.get("path") or ""), sid=sid)
+                _pin_session_cwd(
+                    str(made.get("path") or ""), sid=sid, task_id=str(kw.get("task_id") or "")
+                )
                 logger.info(
                     "gate: delegated child %s got its own workspace %s", sid, made.get("slug")
                 )

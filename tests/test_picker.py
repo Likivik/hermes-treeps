@@ -1,3 +1,10 @@
+from __future__ import annotations
+
+from plugin_loader import PLUGIN, STORE
+
+TP = PLUGIN.telegram_picker
+
+
 
 
 def test_the_token_carries_its_session_and_the_tap_prefers_it(state_home):
@@ -26,22 +33,36 @@ def test_a_dead_token_session_falls_back_to_the_chat_row(monkeypatch, state_home
     )
     token = STORE.new_token([{"name": "repo", "url": "x", "source": "local"}], session_id="sid-dead")
 
-    import telegram_picker as TP
-
     class Q:
-        data = f"ws:{token}:chat"
-        from_user = None
         answered = []
+
+        def __init__(self, token):
+            self.data = f"ws:{token}:chat"
+            self.from_user = None
+
         async def answer(self, text=None, show_alert=False):
             self.answered.append(text)
-    class Chat: id = -100123
-    class Msg: message_thread_id = 42
-    class Upd: effective_chat = Chat(); effective_message = Msg()
+
+        async def edit_message_text(self, *a, **kw):
+            return None
+
+    class Chat:
+        id = -100123
+
+    class Msg:
+        message_thread_id = 42
+
+    q = Q(token)
+
+    class Upd:
+        effective_chat = Chat()
+        effective_message = Msg()
+        callback_query = q
 
     import asyncio
     # stub the bind side: mark_chatting is what choice "chat" calls
     calls = {}
     monkeypatch.setattr(STORE, "mark_chatting", lambda sid, **kw: calls.setdefault("sid", sid))
-    monkeypatch.setattr(TP, "_retire_keyboard", lambda *a, **kw: None)
+
     asyncio.run(TP._on_choice_callback(Upd(), None))
-    assert calls.get("sid") == "sid-after-reset", calls
+    assert calls.get("sid") == "sid-after-reset", (calls, Q.answered)
