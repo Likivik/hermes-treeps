@@ -486,9 +486,10 @@ def _tool_rename(args: dict[str, Any], **kw: Any) -> str:
 def _tool_chatting(args: dict[str, Any], **kw: Any) -> str:
     try:
         store.mark_chatting(_session_id(kw), title=str(args.get("title") or ""))
-        # Chatting means "no workspace": drop the pin, or the session keeps
-        # writing into the tree it just declared it was not using.
-        _unpin_session_cwd()
+        # Chatting means "no workspace": pin HERMES_HOME rather than clearing,
+        # because dropping the override falls back to os.getcwd() - the
+        # gateway's own directory - when TERMINAL_CWD is unset.
+        _pin_session_cwd(store.hermes_home())
         return json.dumps({"ok": True, "mode": "chatting"})
     except Exception as e:
         logger.exception("ws_chatting failed")
@@ -740,8 +741,9 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
             return  # already resolved once: don't re-ask on every resume
         if detail["state"] == "stale":
             # A dead path must not stay pinned: the session would keep running
-            # tools in a directory it no longer owns.
-            _unpin_session_cwd()
+            # tools in a directory it no longer owns. HERMES_HOME, not an
+            # empty pin (see ws_chatting for why).
+            _pin_session_cwd(store.hermes_home())
             # Do NOT go quiet on a dead path: fall through to the picker/inject
             # path so the user gets a fresh choice instead of a session that
             # silently refuses every tool.

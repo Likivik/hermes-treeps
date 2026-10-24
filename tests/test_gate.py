@@ -208,11 +208,17 @@ def test_binding_pins_the_session_cwd(tmp_path, monkeypatch, state_home):
     assert fake.pinned == [str(ws)], fake.pinned
 
 
-def test_chatting_clears_the_pin(monkeypatch, state_home):
-    """Declaring chatting drops the pin, so the tree is not written by accident."""
+def test_chatting_pins_hermes_home(monkeypatch, state_home):
+    """Chatting re-points the cwd at HERMES_HOME instead of clearing it.
+
+    Prevents: clearing the override falls back to os.getcwd() - the gateway's
+    own directory - when TERMINAL_CWD is unset, so a "talk only" session could
+    still write into whatever directory the gateway was launched from.
+    """
     fake = _install_fake_runtime_cwd(monkeypatch, path="/somewhere")
     PLUGIN._tool_chatting({}, session_id="sid-chat-pin")
-    assert fake.cleared == 1, "ws_chatting left the previous workspace pinned"
+    assert fake.pinned, "ws_chatting left the previous workspace pinned"
+    assert str(STORE.hermes_home()) in fake.pinned[-1], fake.pinned
 
 
 def test_gate_allows_when_the_pinned_cwd_is_a_workspace(tmp_path, monkeypatch, state_home):
