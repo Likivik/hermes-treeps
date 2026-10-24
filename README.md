@@ -226,3 +226,29 @@ hermes plugins install Likivik/hermes-treeps
 ## License
 
 MIT
+
+## Delegation contract
+
+`contract.py` holds a compact block of imperative rules for delegating work -
+one concern per PR, numbered defect lists with `file:line`, new tests that
+fail on today's code, never touching live state, one pytest run per iteration,
+dropping the P2s out loud, and verifying behaviour yourself rather than
+trusting a green suite. The rules are derived from measured failures, not
+preferences: a three-paragraph brief ran 52 minutes, died at 60% and needed
+three follow-up PRs while an equivalent numbered checklist finished in 13
+minutes; a child wrote into the live state dir and deleted a live session
+record; a test run wrote 38 rows into the live database; three defects passed
+a green suite and appeared only when the live command ran.
+
+The text is meant to be injected into the system prompt of every session, so
+it is deliberately short - `RULES` is under 1500 characters, and brevity is
+the point: a long block gets skimmed. `render()` returns the block with the
+plugin's own tool names (`ws_new`, `ws_chatting`, `ws_doctor`) substituted, and
+`as_prompt_section()` wraps it as `## Delegation contract` for appending to a
+prompt. Rendering is idempotent, so calling it twice never doubles the text.
+
+To extend the rules, edit the `RULES` string in `contract.py` and add a
+matching assertion in `tests/test_contract.py` - the tests assert on
+substrings rather than the full wording, so wording changes do not need a
+test rewrite, but a new rule should still be pinned by at least one
+substring check.
