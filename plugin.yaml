@@ -34,6 +34,7 @@ provides_hooks:
   - pre_gateway_dispatch
   - on_session_start
   - on_session_reset
+  - on_session_end
   - on_session_finalize
 # Every key the plugin reads is declared here, so the Desktop settings form
 # and the code cannot drift apart. The test suite asserts that this set is
