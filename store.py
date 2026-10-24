@@ -23,6 +23,7 @@ The paths, the VCS and the discovery sources come from the configuration (see
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import os
@@ -729,9 +730,12 @@ CHILD_PURPOSE_PREFIX = "child:"
 def _workspace_age_days(record: dict[str, Any], path: Path) -> float:
     """Age in days from the record's created_at, else from the tree's mtime."""
     raw = str(record.get("created_at") or "")
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d %H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            created = time.mktime(time.strptime(raw[:19], fmt))
+            # created_at is written with time.gmtime() - UTC. time.mktime would
+            # read it as local time and make every workspace look hours
+            # younger than it is (UTC+3 here: the 7-day TTL fires 3h late).
+            created = calendar.timegm(time.strptime(raw[:19], fmt))
             return max(0.0, (time.time() - created) / 86400)
         except Exception:
             continue
@@ -767,6 +771,15 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
                 tiers["tier2"].append({**item, "why": "child workspace with uncommitted changes"})
                 continue
             age_days = _workspace_age_days(record, path)
+            if unpushed_commits(path):
+                # The agreed rule: a workspace whose commit is neither applied
+                # nor pushed is never deleted - a child's handoff commit is
+                # exactly that until the parent lands it. tier2 keeps it
+                # visible instead of silently skipping at retire time.
+                tiers["tier2"].append(
+                    {**item, "why": "child workspace, handoff commit not applied/pushed"}
+                )
+                continue
             if age_days >= CHILD_TTL_DAYS:
                 tiers["tier1"].append(
                     {**item, "why": f"child workspace, clean, {age_days:.0f}d old"}

@@ -12,6 +12,7 @@ No network, no jj, no Hermes install: tmp dirs and the stdlib only.
 from __future__ import annotations
 
 import importlib
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -233,3 +234,28 @@ def test_a_file_git_does_not_ignore_is_never_copied(repo, workspace):
     assert out["copied"] == [], out
     assert not (workspace / ".env").exists(), "a committable .env was copied anyway"
     assert any("not gitignored" in s for s in out["skipped"]), out
+
+
+def test_prepare_copies_into_a_jj_workspace(tmp_path):
+    """prepare must resolve ignore rules through the colocated repo's .git.
+
+    Prevents the P1 the second audit found: a jj workspace has no .git, so
+    plain `git check-ignore` died with rc=128 and EVERY file was skipped -
+    the .env copy the feature exists for was dead exactly where it matters.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # .gitignore BEFORE init: the workspace's checkout is a snapshot of @, so
+    # the ignore rule has to be in the initial working-copy commit.
+    (repo / ".gitignore").write_text(".env\n")
+    subprocess.run(["jj", "git", "init", "--colocate", str(repo)], check=True, capture_output=True)
+    # the workspace's checkout is a snapshot of @: commit the ignore rule so
+    # the workspace actually carries it (an empty initial @ has nothing)
+    subprocess.run(["jj", "commit", "-m", "gitignore"], cwd=repo, check=True, capture_output=True)
+    if not shutil.which("jj"):
+        pytest.skip("jj not installed")
+    (repo / ".env").write_text("TOKEN=1\n")
+    ws = tmp_path / "ws"
+    subprocess.run(["jj", "workspace", "add", str(ws)], cwd=repo, check=True, capture_output=True)
+    out = PREPARE.run_prepare(repo, ws, _settings())
+    assert out["copied"] == [".env"], out

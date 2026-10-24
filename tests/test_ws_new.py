@@ -308,3 +308,16 @@ def test_ws_doctor_reports_a_dead_catalogue(state_home, monkeypatch):
     out = json.loads(PLUGIN._tool_doctor({}, session_id="sid-doctor-2"))
     assert out["remote_candidates"] == [], out
     assert out["remote_error"], out
+
+
+def test_a_user_purpose_cannot_use_the_reserved_child_prefix(monkeypatch, state_home):
+    """ws_new must refuse purpose='child:...' from a user.
+
+    Prevents: gc classifies child workspaces by the purpose prefix, so a user
+    purpose with the same prefix would make a normal workspace look like a
+    throwaway child and get collected on age alone.
+    """
+    args = {"repo": "repo", "slug": "user-purpose", "purpose": "child: release prep"}
+    out = json.loads(PLUGIN._tool_new(args, session_id="sid-reserved"))
+    assert out["ok"] is False, out
+    assert "reserved" in out["error"], out
