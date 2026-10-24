@@ -195,6 +195,64 @@ def _remote_lookup(repo: str) -> tuple[dict[str, Any] | None, str, list[str]]:
     return _match_remote(entries, repo), err, _remote_names(entries)
 
 
+# ── session cwd pinning ───────────────────────────────────────────────────────
+# The gate blocks tools while the session still sits in the gateway's own
+# directory. The host can instead PIN a logical cwd per session
+# (agent.runtime_cwd._SESSION_CWD, read by resolve_agent_cwd()), which is what
+# Claude Code's --worktree and its jj equivalent do: the tool then physically
+# runs in the workspace. The gate stays as the second line of defence.
+
+_PIN_LOGGED = {"at": False}
+
+
+def _pin_session_cwd(path: str | os.PathLike[str] | None) -> None:
+    """Pin this session's logical cwd to a workspace path. Never raises."""
+    try:
+        from agent.runtime_cwd import set_session_cwd
+    except Exception:
+        if not _PIN_LOGGED["at"]:
+            _PIN_LOGGED["at"] = True
+            logger.debug("agent.runtime_cwd unavailable: the gate stays the only barrier")
+        return
+    try:
+        set_session_cwd(str(path or ""))
+    except Exception:
+        logger.debug("could not pin the session cwd", exc_info=True)
+
+
+def _unpin_session_cwd() -> None:
+    try:
+        from agent.runtime_cwd import clear_session_cwd
+    except Exception:
+        return
+    try:
+        clear_session_cwd()
+    except Exception:
+        logger.debug("could not clear the session cwd", exc_info=True)
+
+
+def _pinned_workspace() -> str:
+    """The pinned cwd when it really points inside the workspace root, else "".
+
+    Deliberately narrow: a pinned path only counts as a workspace when it lives
+    under the configured workspace_root. Anything else (the gateway dir, /, a
+    hand-pinned tmp path) must fall through to the gate.
+    """
+    try:
+        from agent.runtime_cwd import scoped_session_cwd
+
+        raw = scoped_session_cwd()
+        if not raw:
+            return ""
+        candidate = Path(raw).resolve()
+        root = Path(store.settings()["workspace_root"]).resolve()
+    except Exception:
+        return ""
+    if candidate == root or root not in candidate.parents:
+        return ""
+    return str(candidate) if candidate.is_dir() else ""
+
+
 def _tool_new(args: dict[str, Any], **kw: Any) -> str:
     try:
         sid = _session_id(kw)
@@ -243,6 +301,7 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         if path:
             state = store.bind_external(path, sid, title=title)
             _detach_previous(existing, state["path"], sid, args.get("rebind"))
+            _pin_session_cwd(state["path"])
             return json.dumps({"ok": True, "mode": "external", "path": state["path"]})
 
         # Idempotence: re-requesting the workspace this session is ALREADY
@@ -334,6 +393,9 @@ def _tool_new(args: dict[str, Any], **kw: Any) -> str:
         if title:
             state["title"] = title
         store.write_state(sid, state)
+        # The workspace exists and is bound: move the session INTO it, so the
+        # next tool call runs there instead of in the gateway directory.
+        _pin_session_cwd(bound_path)
         # prepare runs inside the response so a broken setup script is visible
         # in the same call that created the workspace, not on the next one.
         return json.dumps(
@@ -424,6 +486,9 @@ def _tool_rename(args: dict[str, Any], **kw: Any) -> str:
 def _tool_chatting(args: dict[str, Any], **kw: Any) -> str:
     try:
         store.mark_chatting(_session_id(kw), title=str(args.get("title") or ""))
+        # Chatting means "no workspace": drop the pin, or the session keeps
+        # writing into the tree it just declared it was not using.
+        _unpin_session_cwd()
         return json.dumps({"ok": True, "mode": "chatting"})
     except Exception as e:
         logger.exception("ws_chatting failed")
@@ -561,6 +626,11 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         sid = session_id or _session_id(kw)
         if store.resolve(sid):
             return None
+        # Second line of defence: a pinned cwd inside the workspace root means
+        # the tool physically runs in a workspace, whatever the database read
+        # says - so a corrupted or unreachable binding row cannot fail open.
+        if _pinned_workspace():
+            return None
         # AIRTIGHT inheritance: only a real delegate_task child may inherit.
         # `is_delegated_child_context()` is a task-local ContextVar set by
         # `_run_single_child` and inherited by the child's tool dispatch - it is
@@ -697,8 +767,17 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
         picker.note_session_id(sid)
         detail = store.resolve_detail(sid)
         if detail["state"] == "bound":
+            # Resumed session: re-pin (a chatting session has no path, and
+            # pinning "" would look like a workspace).
+            if detail.get("path"):
+                _pin_session_cwd(detail["path"])
+            else:
+                _unpin_session_cwd()
             return  # already resolved once: don't re-ask on every resume
         if detail["state"] == "stale":
+            # A dead path must not stay pinned: the session would keep running
+            # tools in a directory it no longer owns.
+            _unpin_session_cwd()
             # Do NOT go quiet on a dead path: fall through to the picker/inject
             # path so the user gets a fresh choice instead of a session that
             # silently refuses every tool.
