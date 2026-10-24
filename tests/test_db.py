@@ -236,3 +236,22 @@ def test_purge_tars_then_deletes_only_known_workspaces(tmp_path):
     with tarfile.open(backup) as tar:
         names = tar.getnames()
     assert any("session.json" in n for n in names), names
+
+
+def test_forget_leaves_no_ghost_in_the_workspace():
+    """forget() must also drop the workspace's claim on the session.
+
+    Prevents: a forgotten session stayed listed in the record's `sessions`, so
+    `retire()` refused the workspace forever ("bound session(s) still live")
+    while nothing was bound to it and there was no way to clear the ghost.
+    """
+    DB.write_workspace({"repo": "repo", "slug": "ghost", "path": "/tmp/ghost"}, path="/tmp/ghost")
+    DB.add_workspace_session("repo", "ghost", "sid-ghost")
+    assert DB.read_workspace_by_key("repo", "ghost")["sessions"] == ["sid-ghost"]
+
+    assert DB.delete_binding("sid-ghost") is False  # no binding row yet
+    DB.write_binding("sid-ghost", {"mode": "repo", "repo": "repo", "slug": "ghost", "path": "/tmp/ghost"})
+    assert DB.delete_binding("sid-ghost") is True
+
+    left = DB.read_workspace_by_key("repo", "ghost")["sessions"]
+    assert left == [], f"the ghost survived forget(): {left}"

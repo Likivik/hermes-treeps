@@ -578,9 +578,16 @@ def write_binding(session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def delete_binding(session_id: str) -> bool:
-    """Drop a session record. True when one existed."""
+    """Drop a session record and its claim on any workspace. True when one existed.
+
+    WHY the join row goes too: `forget()` used to delete only the binding, so
+    the workspace kept listing the session in `sessions` and `retire()` refused
+    it forever with "bound session(s) still live" - a ghost with no binding,
+    no record and no way to clear it from the workspace.
+    """
     with transaction() as conn:
         cur = conn.execute("DELETE FROM bindings WHERE session_id=?", (session_id,))
+        conn.execute("DELETE FROM workspace_sessions WHERE session_id=?", (session_id,))
         return cur.rowcount > 0
 
 
