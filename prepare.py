@@ -356,9 +356,8 @@ def _tool_prepare(args: dict[str, Any], **kw: Any) -> str:
 def register(ctx: Any) -> None:
     """Register the ``ws_prepare`` tool.
 
-    NOTE: the plugin's ``register()`` in ``__init__.py`` does not call this
-    yet - it needs one line (``prepare.register(ctx)`` next to
-    ``picker.register(ctx)``) plus the import. See the PR description.
+    Wired: the plugin's ``register()`` in ``__init__.py`` calls this next to
+    ``picker.register(ctx)``; the manifest declares the ``ws_prepare`` tool.
     """
     try:
         ctx.register_tool(

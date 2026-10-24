@@ -90,7 +90,8 @@ def test_migration_imports_the_legacy_json_and_is_idempotent(tmp_path, monkeypat
     second = DB.migrate_legacy(workspace_root=tmp_path / "wsroot")
     assert second["imported_bindings"] == 0, second
     assert second["imported_workspaces"] == 0, second
-    assert len(DB.list_workspace_rows()) == 0, "the second run created rows"
+    with DB.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM workspaces").fetchone()[0] == 0, "the second run created rows"
 
 
 def test_migration_dry_run_imports_nothing(tmp_path, monkeypatch):
@@ -158,7 +159,9 @@ def test_migration_derives_repo_and_slug_when_the_record_has_neither(tmp_path):
 
     out = DB.migrate_legacy(workspace_root=tmp_path, dry_run=False)
     assert out["imported_workspaces"] == 1, out
-    rows = DB.list_workspace_rows()
+    with DB.connect() as conn:
+        rows = [dict(zip(("repo", "slug", "path"), row)) for row in conn.execute(
+            "SELECT repo, slug, path FROM workspaces").fetchall()]
     assert [(r["repo"], r["slug"]) for r in rows] == [("hermes-treeps", "hermes-treeps-ee445923")], rows
     assert rows[0]["path"] == str(ws), rows
 
@@ -247,11 +250,11 @@ def test_forget_leaves_no_ghost_in_the_workspace():
     """
     DB.write_workspace({"repo": "repo", "slug": "ghost", "path": "/tmp/ghost"}, path="/tmp/ghost")
     DB.add_workspace_session("repo", "ghost", "sid-ghost")
-    assert DB.read_workspace_by_key("repo", "ghost")["sessions"] == ["sid-ghost"]
+    assert DB.read_workspace("/tmp/ghost")["sessions"] == ["sid-ghost"]
 
     assert DB.delete_binding("sid-ghost") is False  # no binding row yet
     DB.write_binding("sid-ghost", {"mode": "repo", "repo": "repo", "slug": "ghost", "path": "/tmp/ghost"})
     assert DB.delete_binding("sid-ghost") is True
 
-    left = DB.read_workspace_by_key("repo", "ghost")["sessions"]
+    left = DB.read_workspace("/tmp/ghost")["sessions"]
     assert left == [], f"the ghost survived forget(): {left}"

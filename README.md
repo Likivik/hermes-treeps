@@ -20,6 +20,9 @@ else's tree.
 | `settings.py` | one accessor for the config: defaults, env overrides, validation, the manifest schema contract |
 | `discovery.py` | repo discovery: local roots plus the GitHub/Forgejo catalogue |
 | `vcs.py` | the jj/git adapter: one API, two backends |
+| `prepare.py` | workspace prepare step: copies ignored files (`.env`), optional setup command |
+| `childspace.py` | per-delegation child workspaces (one tree per child, never shared) |
+| `contract.py` | the delegation contract rendered into the system-prompt section |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
 
 ## Behavior
@@ -55,13 +58,9 @@ else's tree.
 
 ## Delegated children (airtightness layers)
 
-1. `is_delegated_child_context()` — exact, single-path children.
-2. Delegation-pointer fallback — covers **batch** children while upstream
-   [#96483](https://github.com/NousResearch/hermes-agent/issues/96483) is open
-   (`_run_single_child` never enters the child context). Remove this layer when
-   that fix ships; until then a fresh session created within the 10-minute
-   pointer window inherits too (the known residue).
-
+Children are detected exactly, by `is_delegated_child_context()` (single-path;
+no recency fallback - the upstream #96483 workaround layer is gone because the
+upstream bug is fixed).
 ## Configuration
 
 Every setting lives in one namespace: `plugins.entries.hermes-treeps.settings`.

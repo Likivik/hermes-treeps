@@ -77,7 +77,7 @@ def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "repo name under /Git, e.g. hermes-pylon"},
-                "slug": {"type": "string", "description": "session name, lowercase - use the session TITLE slugified"},
+                "slug": {"type": "string", "description": "workspace name, lowercase; defaults to <repo>-<last 6 of session id> - pass one only if the user asked for a specific name"},
                 "title": {"type": "string", "description": "the session title the user gave (required when known)"},
                 "purpose": {"type": "string", "description": "one line: what this session is for"},
                 "rebind": {"type": "boolean", "description": "true to move this session from its current workspace to the new one"},
@@ -687,9 +687,10 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             return None
         try:
             repos = store.candidate_repos(limit=6)
-            listing = ", ".join(repos) if repos else "(none found under /Git)"
-        except Exception:
-            listing = "(could not scan /Git)"
+            roots = ", ".join(store.settings()["repo_roots"])
+            listing = ", ".join(repos) if repos else f"(none found under {roots})"
+        except Exception as scan_exc:
+            listing = f"(could not scan the configured repo roots: {type(scan_exc).__name__})"
         detail = store.resolve_detail(sid)
         if detail["state"] == "unbound" and _readonly_allowed(tool_name, kw):
             return None
