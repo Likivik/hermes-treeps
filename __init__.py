@@ -1373,6 +1373,17 @@ def _register_cli(subparser) -> None:
     p_gc.add_argument("--apply", action="store_true", help="retire the tier1 set (ended + clean + pushed + no open PRs)")
     p_gc.add_argument("--children", action="store_true", help="only child workspaces (delegated children); with --apply, safe for an unattended cron - never decides for user workspaces")
 
+    p_forget = sub.add_parser(
+        "forget",
+        help="targeted removal of a stale workspace record; refuses live sessions and unforced trees",
+    )
+    p_forget.add_argument("--slug", required=True, help="the workspace record to forget (by slug)")
+    p_forget.add_argument(
+        "--force",
+        action="store_true",
+        help="snapshots the work first when the tree is still on disk",
+    )
+
     # The IMMEDIATE reclamation path: a child that is done has its tree
     # reclaimed at once, and the work is preserved as a jj snapshot commit.
     p_reclaim = sub.add_parser(
@@ -1435,6 +1446,115 @@ def _register_cli(subparser) -> None:
     subparser.set_defaults(ws_action="list")
 
 
+def _cli_ws_forget(args) -> int:
+    """``hermes ws forget --slug <slug>``: targeted removal of ONE record.
+
+    WHY this exists next to ``retire``: retire is the LADDER (open PRs, dirty
+    tree, unpushed commits, live sessions - a user's own workspace), while
+    forget is the OPERATOR's targeted cleanup of a STALE record - one named
+    slug, one transaction, and every guard that could delete somebody's work
+    still in front of it.
+
+    The order is deliberate:
+      1. the record must exist (the slug is resolved through the DATABASE,
+         not through the filesystem - a stale record's tree is gone);
+      2. a LIVE session may not be bound to it;
+      3. a tree still on disk needs --force, because --force is what
+         authorizes the snapshot-first retirement of that tree;
+      4. a user-class record needs --force too: the gc caveat for user
+         workspaces ("never decided for you") applies here as well;
+      5. the record and its bindings go in ONE transaction.
+    """
+    slug = str(getattr(args, "slug", "") or "")
+    force = bool(getattr(args, "force", False))
+
+    record = None
+    for row in store.db.all_workspaces():
+        if str(row.get("slug") or "") == slug:
+            record = dict(row)
+            break
+    if record is None:
+        available = sorted(
+            {
+                str(row.get("slug") or "")
+                for row in store.db.all_workspaces()
+                if str(row.get("slug") or "")
+            }
+        )
+        print(f"refused: no workspace record for slug {slug!r}")
+        print("available slugs: " + (", ".join(available) if available else "(none)"))
+        return 1
+
+    path = Path(str(record.get("path") or ""))
+    purpose = str(record.get("purpose") or "")
+    is_child = purpose.startswith(store.CHILD_PURPOSE_PREFIX)
+
+    # (2) liveness: the same check the reclamation primitive uses - a LIVE
+    # session bound to (or pinned at) the tree. A record whose tree is
+    # already gone has nothing a live session can still be using.
+    if path.is_dir() and os.path.normpath(str(path)) in store.jjlayout.live_session_paths(store.db):
+        print(f"refused: {slug} is bound to (or pinned by) a live session")
+        return 1
+
+    tree_exists = path.is_dir()
+
+    # (3) a tree on disk is never removed without --force: --force is the
+    # explicit "snapshot the work first" authorization.
+    if tree_exists and not force:
+        print(
+            f"refused: the tree for {slug} is still on disk ({path}); "
+            "repeat with --force to snapshot the work first and remove it"
+        )
+        return 1
+
+    # (4) a user-class record is a human's workspace: the gc caveat applies
+    # here too - the operator has to say so explicitly.
+    if not is_child and not force:
+        print(
+            f"refused: {slug} is a user workspace ({purpose or 'no purpose'}); "
+            "repeat with --force to forget its record"
+        )
+        return 1
+
+    snapshot_commit_id = ""
+    if tree_exists:
+        if is_child:
+            # The child-classified dirty/unpushed protection lives inside the
+            # reclamation primitive - reuse it, do NOT re-implement the checks
+            # and do NOT write a second removal path.
+            result = store.reclaim_child_workspace(path)
+            if not result.get("ok"):
+                detail = str(result.get("detail") or result.get("reason") or "retirement refused")
+                print(f"refused: {slug} was not retired: {detail}")
+                return 1
+            snapshot_commit_id = str(result.get("snapshot_commit_id") or "")
+        else:
+            # A user workspace is retired by the SAME ladder `ws retire`
+            # uses - --force acknowledges the unverifiable checks, and
+            # --ultraforce is what lets a dirty tree go (the work is archived
+            # first, so the record is still recoverable).
+            try:
+                store.retire(slug, force=True, ultraforce=True)
+            except store.WorkspaceError as exc:
+                print(f"refused: {slug} was not retired: {exc}")
+                return 1
+
+    # (5) ONE transaction: the record and its bindings go together, or
+    # neither goes.
+    repo = str(record.get("repo") or "")
+    with store.db.transaction() as conn:
+        cur_ws = conn.execute(
+            "DELETE FROM workspaces WHERE repo=? AND slug=?", (repo, slug)
+        )
+        cur_bind = conn.execute("DELETE FROM bindings WHERE slug=?", (slug,))
+        rows_removed = int(cur_ws.rowcount or 0) + int(cur_bind.rowcount or 0)
+
+    print(f"forgot {slug} ({path}) - removed {rows_removed} row(s)")
+    if snapshot_commit_id:
+        print(f"snapshot commit: {snapshot_commit_id}")
+    return 0
+
+
 def _cli(args) -> int:
     action = getattr(args, "ws_action", "list") or "list"
     try:
@@ -1479,6 +1599,8 @@ def _cli(args) -> int:
                 ultraforce=getattr(args, "ultraforce", False),
             ))
             return 0
+        if action == "forget":
+            return _cli_ws_forget(args)
         if action == "gc":
             tiers = store.gc_tiers()
             if getattr(args, "children", False):

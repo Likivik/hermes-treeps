@@ -28,6 +28,20 @@ else's tree.
 | `contract.py` | the delegation contract rendered into the system-prompt section |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
 
+## CLI verbs
+
+| Verb | What it does |
+|---|---|
+| `ws new` | create a workspace + session record |
+| `ws list` | list workspaces and their records |
+| `ws status` | detail for one workspace |
+| `ws retire` | archive + forget a workspace through the safety ladder |
+| `ws gc` | classify reclaimable workspaces (dry-run unless `--apply`) |
+| `ws reclaim` | reclaim a finished child's workspace now (work preserved as a snapshot commit) |
+| `ws forget` | targeted removal of a stale workspace record; refuses live sessions and unforced trees |
+| `ws migrate` | the one-time move to the dot-dir workspace layout |
+| `ws chatting` | mark this session as talk-only |
+
 ## Behavior
 
 - **Picker on `/new`** — the gateway's `on_session_reset` hook fires one flat
