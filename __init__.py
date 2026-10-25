@@ -859,22 +859,6 @@ def _opening_prompt() -> str:
     )
 
 
-def _maybe_child_gc() -> None:
-    """Once a day: retire expired CHILD workspaces (never user workspaces)."""
-    try:
-        import time as _t
-
-        last = float(store.db.get_kv("last_child_gc_at") or 0)
-        if _t.time() - last < 86400:
-            return
-        store.db.set_kv("last_child_gc_at", str(_t.time()))
-        done = store.gc_children_apply()
-        if done:
-            logger.info("child gc: retired %s", ", ".join(done))
-    except Exception:
-        logger.debug("child gc skipped", exc_info=True)
-
-
 def _on_session_start(session_id: str = "", **kw: Any) -> None:
     """Seed the first turn so the choice prompt is the first thing the user sees.
 
@@ -886,7 +870,6 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
     try:
         sid = session_id or _session_id(kw)
         picker.note_session_id(sid)
-        _maybe_child_gc()
         detail = store.resolve_detail(sid)
         if detail["state"] == "bound":
             # Resumed session: re-pin (a chatting session has no path, and
@@ -969,6 +952,7 @@ def _register_cli(subparser) -> None:
 
     p_gc = sub.add_parser("gc", help="classify reclaimable workspaces (dry-run unless --apply)")
     p_gc.add_argument("--apply", action="store_true", help="retire the tier1 set (ended + clean + pushed + no open PRs)")
+    p_gc.add_argument("--children", action="store_true", help="only child workspaces (delegated children); with --apply, safe for an unattended cron - never decides for user workspaces")
 
     p_chat = sub.add_parser("chatting", help="mark a session as talk-only")
     p_chat.add_argument("--session", default="")
@@ -1037,6 +1021,12 @@ def _cli(args) -> int:
             return 0
         if action == "gc":
             tiers = store.gc_tiers()
+            if getattr(args, "children", False):
+                for name in ("tier1", "tier2", "tier3"):
+                    tiers[name] = [
+                        row for row in tiers[name]
+                        if str((row.get("record") or {}).get("purpose") or "").startswith(store.CHILD_PURPOSE_PREFIX)
+                    ]
             titles = {
                 "tier1": "safe to retire (session ended, clean, pushed, no open PRs)",
                 "tier2": "needs a look first (unverified, orphans, open PRs, or dirty)",
@@ -1054,7 +1044,7 @@ def _cli(args) -> int:
                     print(f"    {row['path']}")
                     print(f"    why: {row['why']}")
             if getattr(args, "apply", False):
-                done = store.gc_apply()
+                done = store.gc_children_apply() if getattr(args, "children", False) else store.gc_apply()
                 print(f"\nretired: {len(done)}" if done else "\nretired: nothing eligible")
                 for path in done:
                     print(f"  {path}")

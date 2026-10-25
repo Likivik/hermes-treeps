@@ -61,6 +61,21 @@ else's tree.
 Children are detected exactly, by `is_delegated_child_context()` (single-path;
 no recency fallback - the upstream #96483 workaround layer is gone because the
 upstream bug is fixed).
+## Automatic child collection (optional)
+
+Child workspaces (delegated children) are reclaimable once they are 14 days
+old, their session ended and their tree is clean - committed work survives
+retirement in the shared repo store. Collection is manual by default:
+
+    hermes ws gc            # classify, dry-run
+    hermes ws gc --children --apply   # retire expired CHILD workspaces only
+
+To run it unattended, add a cron line (the `--children` flag makes it safe for
+an unattended run: it never retires a user workspace, never decides pushed/PR
+questions):
+
+    0 4 * * * hermes ws gc --children --apply >> ~/.hermes/ws-gc.log 2>&1
+
 ## Configuration
 
 Every setting lives in one namespace: `plugins.entries.hermes-treeps.settings`.
