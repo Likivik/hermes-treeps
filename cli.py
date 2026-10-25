@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 
-from . import migrate_layout, store
+from . import store
 
 
 def _register_cli(subparser) -> None:
@@ -74,17 +74,6 @@ def _register_cli(subparser) -> None:
 
     p_chat = sub.add_parser("chatting", help="mark a session as talk-only")
     p_chat.add_argument("--session", default="")
-
-    p_mig = sub.add_parser(
-        "migrate",
-        help="move workspaces from the old <workspace_root>/<repo>/<slug> layout "
-             "to the new <repo_dir>/.workspaces/<repo>/<slug> layout (one-time)",
-    )
-    p_mig.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="report what would move, move nothing",
-    )
 
     subparser.set_defaults(ws_action="list")
 
@@ -302,24 +291,8 @@ def _cli(args) -> int:
             store.mark_chatting(args.session or "cli")
             print("session marked as chatting")
             return 0
-        if action == "migrate":
-            # The one-time LAYOUT migration: move the workspaces that live
-            # under the old root into the dot-dir layout. It never runs
-            # implicitly - the operator asks for it once.
-            out = migrate_layout.migrate_workspaces(dry_run=bool(getattr(args, "dry_run", False)))
-            print(migrate_layout.report_text(out))
-            if getattr(args, "dry_run", False):
-                print("\ndry run: nothing was moved")
-            else:
-                print(
-                    f"\nmoved {len(out.get('moved') or [])}, "
-                    f"skipped {len(out.get('skipped_dirty') or [])} dirty, "
-                    f"in use {len(out.get('in_use') or [])}, "
-                    f"verify failed {len(out.get('verify_failed') or [])}, "
-                    f"repair failed {len(out.get('repair_failed') or [])}"
-                )
-            return 0
-    except store.WorkspaceError as e:
-        print(f"refused: {e}")
         return 2
+    except store.WorkspaceError as exc:
+        print(f"error: {exc}")
+        return 1
     return 0

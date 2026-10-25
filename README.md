@@ -23,7 +23,6 @@ else's tree.
 | `prepare.py` | workspace prepare step: copies ignored files (`.env`), optional setup command |
 | `childspace.py` | per-delegation child workspaces (one tree per child, never shared) |
 | `childreport.py` | child-end reporting: the child's end state for the parent, and the immediate reclamation that follows it |
-| `migrate_layout.py` | the one-time move from the old workspace root to the dot-dir layout |
 | `jjlayout.py` | jj workspace layout facts: is this a jj workspace, is it the primary one, which session paths are live |
 | `contract.py` | the delegation contract rendered into the system-prompt section |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
@@ -39,7 +38,6 @@ else's tree.
 | `ws gc` | classify reclaimable workspaces (dry-run unless `--apply`) |
 | `ws reclaim` | reclaim a finished child's workspace now (work preserved as a snapshot commit) |
 | `ws forget` | targeted removal of a stale workspace record; refuses live sessions and unforced trees |
-| `ws migrate` | the one-time move to the dot-dir workspace layout |
 | `ws chatting` | mark this session as talk-only |
 
 ## Behavior
@@ -491,86 +489,6 @@ hold.
 
 The slug format is unchanged: `<repo>-<last 6 of the session id>` for a
 session workspace, `<repo>-<sid6>-child-<hex>` for a delegated child.
-
-### `hermes ws migrate` — the one-time move
-
-Existing workspaces are **not** moved automatically. Run it once, by hand:
-
-```
-hermes ws migrate --dry-run    # report the plan, move nothing
-hermes ws migrate              # do it
-```
-
-The migration walks the database, and for every workspace whose recorded path
-is under the old root it applies these rules **in this order**:
-
-| rule | result | why |
-| --- | --- | --- |
-| the tree has uncommitted changes | `skipped_dirty` — **not moved** | silently relocating uncommitted work leaves it in a tree nobody is looking at; the files are still there, but the session that owned them finds a path that is gone |
-| a live session is bound to it (or has it pinned as its cwd) | `in_use` — **not moved** | moving a tree out from under a running session breaks it mid-task |
-| otherwise | `moved` | the directory is renamed, and the workspace record *and* every session binding that named the old path are rewritten |
-| it is a git worktree | `git -C <main checkout> worktree repair <new path>` | the main checkout's worktree list still names the old path, so git marks the entry `prunable` |
-| the `.jj/repo` pointer no longer resolves to the same store | `verify_failed` — **not rolled back** | a rollback is a second move, and a second move can fail in a new place; the workspace stays moved and the failure is named |
-| the worktree repair failed | `repair_failed` — **not fatal** | the move itself succeeded and the records are correct; run the repair by hand |
-
-The command prints the five buckets and their counts. The same data is
-available as a dict (`moved`, `skipped_dirty`, `in_use`, `verify_failed`,
-`repair_failed`) for anything that wants to read it.
-
-## Prepare
-
-A workspace is not usable the moment `jj workspace add` returns. Every other
-harness for this job runs a **prepare step** right after creating the
-workspace: copy the `.env`, symlink the dependency directories, run the
-install. This plugin does the same, in `prepare.py`, with four settings:
-
-| key | default | meaning |
-| --- | --- | --- |
-| `prepare_enabled` | `true` | master switch — when false, nothing is copied and no command runs |
-| `prepare_files` | `[".env"]` | repo-relative files copied into the new workspace |
-| `prepare_command` | `""` | shell command run with `bash -lc` **inside** the new workspace (empty means none) |
-| `prepare_timeout_seconds` | `300` | hard ceiling on the command (1–3600) |
-
-**What runs when.** After a workspace is created, the prepare step copies
-each file in `prepare_files` from the repo root into the workspace, then runs
-`prepare_command` with the workspace as the working directory.
-
-**Files.** Only regular files that exist are copied. A missing file is
-skipped with a note, not an error — a repo without a `.env` is normal. An
-existing file in the workspace is **never overwritten** (your hand-edit
-survives). A path that points outside the repo root is skipped.
-
-**The command runs arbitrary code by design.** It is operator-configured:
-anyone who can edit `config.yaml` can already run code as you, so the
-command is not sandboxed. What the plugin does guarantee is that the command
-runs with its working directory set to the workspace — never anywhere else —
-and that it is killed when it exceeds `prepare_timeout_seconds`.
-
-**On failure.** A non-zero exit code or a timeout is *reported*, not raised:
-the workspace stays on disk and stays bound, and the result comes back with
-`ok: false` and the tail of the command's output. Fix it by hand and re-run
-the step — nothing is deleted, and no session is taken down.
-
-The result is returned under a `prepare` key in the `ws_new` response:
-
-```json
-{
-  "ok": true,
-  "path": "/Git/hermes/.workspaces/hermes-pylon/fix-the-widget",
-  "vcs": "jj",
-  "prepare": {
-    "ok": true,
-    "copied": [".env"],
-    "skipped": [],
-    "command": {"ran": true, "exit_code": 0, "output_tail": ""},
-    "duration_s": 0.412
-  }
-}
-```
-
-To run the step again — after fixing a failed prepare, or on a workspace
-created before this feature existed — use the `ws_prepare` tool with the
-workspace path (it defaults to this session's workspace).
 
 ### Example: a nix devshell project
 

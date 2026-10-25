@@ -3,14 +3,9 @@
 WHY this module exists: three different flows need to answer the SAME
 questions about a directory ("is this a jj workspace?", "is this the MAIN
 checkout?", "is a live session standing in it?"), and each answer has to be
-identical in all of them. The first implementation lived in
-``migrate_layout`` (the one-time layout move). The immediate child
-reclamation needs the same answers, and importing ``migrate_layout`` from
-``store`` would be a CIRCULAR import: ``migrate_layout`` already imports
-``store``.
-
-So the geometry lives here, and ``migrate_layout`` re-exports the old
-private names so its own tests (and any caller) keep working unchanged.
+identical in all of them. Keeping one copy here is what stops the gate, the
+reclamation path and the retirement path from disagreeing about whether a
+directory is a workspace at all.
 
 The facts, once:
 
