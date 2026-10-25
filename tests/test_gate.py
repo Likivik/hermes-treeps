@@ -369,3 +369,35 @@ def test_a_failed_childspace_for_a_repo_parent_blocks_instead_of_inheriting(monk
     res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="child-git-parent")
     assert res is not None and res["action"] == "block", res
     assert "own workspace" in res["message"], res
+
+
+def test_a_stale_session_is_warned_even_when_pinned(monkeypatch, state_home):
+    """The stale warning must survive the pinned-cwd floor.
+
+    Prevents: a session whose binding names a dead tree but whose cwd is still
+    pinned inside the workspace root was silently allowed - the user was never
+    told the binding was dead.
+    """
+    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/ws")
+    monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: None)
+    monkeypatch.setattr(PLUGIN.store, "resolve_detail", lambda *a, **kw: {
+        "state": "stale", "reason": "path /old/tree no longer exists"})
+    monkeypatch.setattr(PLUGIN.store, "candidate_repos", lambda limit=6: [])
+    res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-stale-pinned")
+    assert res is not None and res["action"] == "block", res
+    assert "STALE" in res["message"], res
+
+
+def test_a_bound_session_rearms_the_pin_after_a_restart(monkeypatch, state_home):
+    """A resumed session must re-pin on its first gated call.
+
+    Prevents: after a gateway restart the runtime pin is gone and
+    on_session_start does not re-fire - the shell silently fell back to the
+    gateway directory until the session rebound.
+    """
+    fake = _install_fake_runtime_cwd(monkeypatch, path="")
+    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "")
+    monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: {
+        "mode": "repo", "path": "/Git/hermes/workspaces/repo/ws"})
+    assert PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-resumed") is None
+    assert any("workspaces/repo/ws" in p for p in fake.pinned), fake.pinned

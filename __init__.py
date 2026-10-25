@@ -647,6 +647,34 @@ def _readonly_allowed(tool_name: str, kw: dict[str, Any]) -> bool:
     return True
 
 
+def _candidate_listing() -> str:
+    """One line of candidate repos for the gate's block messages."""
+    try:
+        repos = store.candidate_repos(limit=6)
+        roots = ", ".join(store.settings()["repo_roots"])
+        return ", ".join(repos) if repos else f"(none found under {roots})"
+    except Exception as scan_exc:
+        return f"(could not scan the configured repo roots: {type(scan_exc).__name__})"
+
+
+def _stale_block(detail: dict, listing: str) -> dict:
+    """The stale-binding block: name the dead path and the two recovery routes."""
+    return {
+        "action": "block",
+        "message": (
+            "This session's workspace binding is STALE, not missing: "
+            f"{detail['reason']}\n"
+            "Tell the user the exact path that disappeared, then call ONE of:\n"
+            "  ws_new(path=<new path>, rebind=true) - bind where the tree lives now\n"
+            "  ws_chatting()                  - talk-only, if the work is no longer in a checkout\n"
+            "  ws_doctor(forget=true)         - drop the dead record ONLY, then pick one of the two\n"
+            "                                   above: forgetting alone leaves the session unbound\n"
+            "                                   and still gated\n"
+            f"Candidate repos: {listing}"
+        ),
+    }
+
+
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
     """Block repo-touching tools until the session resolves a workspace."""
     # Read the recency tracker BEFORE noting this call's session id: the tracker
@@ -667,7 +695,18 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         if tool_name not in store.GATED_TOOLS:
             return None
         sid = session_id or _session_id(kw)
-        if store.resolve(sid):
+        bound = store.resolve(sid)
+        if bound:
+            # Resumed after a gateway restart: the runtime pin is gone and
+            # on_session_start does not re-fire for a resumed session, so the
+            # shell silently falls back to the gateway directory. Re-arm the
+            # pin lazily on the first gated call; the pin-present check makes
+            # this a no-op for every later call.
+            if not _pinned_workspace():
+                if bound.get("mode") == "chatting":
+                    _pin_session_cwd(store.hermes_home(), sid=sid)
+                else:
+                    _pin_session_cwd(str(bound.get("path") or ""), sid=sid)
             return None
         # AIRTIGHT inheritance: only a real delegate_task child may inherit.
         # `is_delegated_child_context()` is a task-local ContextVar set by
@@ -748,9 +787,20 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 store.write_state(sid, inherited)
             logger.info("gate: delegated child %s inherits binding of %s", sid, parent)
             return None
+        # The state is resolved ONCE here and reused by every branch below.
+        detail = store.resolve_detail(sid)
+        if detail["state"] == "stale":
+            # A stale binding must warn EVEN WHEN the cwd is pinned: the pin
+            # means the shell runs in a workspace, but the workspace it NAMES
+            # is dead - the user is never told if the pin floor wins.
+            listing = _candidate_listing()
+            return _stale_block(detail, listing)
+        if detail["state"] == "unbound" and _readonly_allowed(tool_name, kw):
+            return None
         # Second line of defence: a pinned cwd inside the workspace root means
         # the tool physically runs in a workspace, whatever the database read
         # says - so a corrupted or unreachable binding row cannot fail open.
+        # Unbound (not stale) only: a stale session was already warned above.
         if _pinned_workspace():
             return None
         try:
@@ -759,26 +809,6 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             listing = ", ".join(repos) if repos else f"(none found under {roots})"
         except Exception as scan_exc:
             listing = f"(could not scan the configured repo roots: {type(scan_exc).__name__})"
-        detail = store.resolve_detail(sid)
-        if detail["state"] == "unbound" and _readonly_allowed(tool_name, kw):
-            return None
-        if detail["state"] == "stale":
-            # A dead path is NOT "no choice yet". Say which tree vanished: the
-            # user can usually point straight at where it moved.
-            return {
-                "action": "block",
-                "message": (
-                    "This session's workspace binding is STALE, not missing: "
-                    f"{detail['reason']}\n"
-                    "Tell the user the exact path that disappeared, then call ONE of:\n"
-                    "  ws_new(path=<new path>, rebind=true) - bind where the tree lives now\n"
-                    "  ws_chatting()                  - talk-only, if the work is no longer in a checkout\n"
-                    "  ws_doctor(forget=true)         - drop the dead record ONLY, then pick one of the two\n"
-                    "                                   above: forgetting alone leaves the session unbound\n"
-                    "                                   and still gated\n"
-                    f"Candidate repos: {listing}"
-                ),
-            }
         return {
             "action": "block",
             "message": (
