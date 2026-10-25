@@ -127,7 +127,6 @@ def test_heartbeat_write_failure_does_not_gate_block(tmp_path, monkeypatch):
         "read_state",
         lambda sid: {"mode": "repo", "repo": "repo", "slug": "parent", "path": "/tmp/parent"},
     )
-    monkeypatch.setattr(PLUGIN, "_LAST_DELEGATION", {"sid": "parent-1", "at": time.time()})
     monkeypatch.setattr(
         PLUGIN.childspace,
         "ensure_child_workspace",
@@ -139,6 +138,8 @@ def test_heartbeat_write_failure_does_not_gate_block(tmp_path, monkeypatch):
             "path": str(ws),
         },
     )
+    # Per-child parent map (child_runs) - not a module global.
+    STORE.db.write_child_run("child-1", "parent-1")
 
     def boom(*args, **kwargs):
         raise RuntimeError("heartbeat database is broken")

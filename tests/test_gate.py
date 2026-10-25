@@ -143,8 +143,8 @@ def test_unbound_session_does_not_inherit_another_sessions_workspace(state_home,
     # A fresh, unrelated session with NO record of its own.
     assert STORE.read_state("sid-stranger") is None
     # Simulate a recent delegation pointer - the old fallback keyed off this.
-    PLUGIN._LAST_DELEGATION["sid"] = "sid-owner"
-    PLUGIN._LAST_DELEGATION["at"] = 1e12
+    # (Today there is no such pointer: the parent is resolved per child from
+    # the child's own row, so a stranger cannot be mistaken for a child.)
     try:
         res = _gate("terminal", "sid-stranger")
         assert res is not None and res["action"] == "block", (
@@ -154,8 +154,7 @@ def test_unbound_session_does_not_inherit_another_sessions_workspace(state_home,
             "an unrelated session must not inherit another session's binding"
         )
     finally:
-        PLUGIN._LAST_DELEGATION["sid"] = ""
-        PLUGIN._LAST_DELEGATION["at"] = 0.0
+        pass
 
 
 # ── cwd pinning ──────────────────────────────────────────────────────────────
@@ -297,10 +296,8 @@ def test_the_child_branch_runs_before_the_pinned_fallback(monkeypatch, state_hom
     fake_delegation.is_delegated_child_context = lambda: True
     monkeypatch.setitem(sys.modules, "agent.delegation_context", fake_delegation)
 
-    PLUGIN._LAST_DELEGATION["sid"] = "parent-1"
-    PLUGIN._LAST_DELEGATION["at"] = __import__("time").time()
+    STORE.db.write_child_run("child-abc123", "parent-1")
     monkeypatch.setattr(PLUGIN.store, "read_state", lambda sid: {"mode": "repo", "repo": "repo", "slug": "parent", "path": "/Git/hermes/workspaces/repo/parent"})
-
     res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="child-abc123")
     assert res is None, res
     assert child_calls, "the child never reached childspace - it stayed in the parent's tree"
@@ -362,8 +359,7 @@ def test_a_failed_childspace_for_a_repo_parent_blocks_instead_of_inheriting(monk
     fake_delegation = types.ModuleType("agent.delegation_context")
     fake_delegation.is_delegated_child_context = lambda: True
     monkeypatch.setitem(__import__("sys").modules, "agent.delegation_context", fake_delegation)
-    PLUGIN._LAST_DELEGATION["sid"] = "parent-1"
-    PLUGIN._LAST_DELEGATION["at"] = __import__("time").time()
+    STORE.db.write_child_run("child-git-parent", "parent-1")
     monkeypatch.setattr(PLUGIN.store, "read_state", lambda sid: {
         "mode": "repo", "repo": "repo", "slug": "parent", "path": "/Git/hermes/workspaces/repo/parent"})
     res = PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="child-git-parent")

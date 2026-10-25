@@ -29,10 +29,6 @@ from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
 
-# sid of the most recent delegate_task DISPATCH (the parent), and when. Only
-# dispatches move it - ordinary tool calls from other sessions cannot clobber.
-_LAST_DELEGATION = {"sid": "", "at": 0.0}
-
 # {repos} is filled at register() from the live candidate list: a hardcoded
 # example here went stale the first time a repo moved.
 _PROMPT_TEMPLATE = """\
@@ -691,22 +687,71 @@ def _stale_block(detail: dict, listing: str) -> dict:
     }
 
 
+def _resolve_child_parent(child_sid: str) -> str:
+    """The parent session id of THIS child, from per-child channels only.
+
+    WHY this exists and WHY there is no global any more: the plugin used to
+    keep the sid of "the most recent delegate_task dispatch" in a module
+    global and read it back when the child's first gated call arrived. Two
+    concurrent delegations overwrote that global, so child A resolved its
+    parent as B - and A then built its own workspace inside B's repo, with
+    B's parent stamped as ``inherited_from``. A module global can only ever
+    name ONE parent, so it is structurally incapable of answering "who is
+    MY parent" for more than one live child.
+
+    The channels used here are all keyed by the CHILD's own session id, so
+    two children can never see each other's parent:
+
+    1. ``child_runs`` - written by the ``subagent_start`` hook, whose payload
+       names BOTH the parent and the child. The host fires it synchronously
+       when the child agent is constructed and BEFORE the child runs its
+       first tool call, so the row is there when the child asks.
+    2. the child's own binding row - ``parent_session_id``, written when the
+       child's workspace is created. It survives a restart and a re-dispatch.
+
+    WHY NOT the recency tracker: ``picker.last_session()`` is process-global
+    too. It is only consulted as a LAST resort, and only when the tracker
+    names a session that is the child's own recorded parent - never as a
+    guess about who dispatched this child. A child whose parent cannot be
+    resolved is BLOCKED, not pointed at a stranger's workspace.
+    """
+    if not child_sid:
+        return ""
+    # 1. the child_runs row (subagent_start) - the authoritative per-child map
+    try:
+        run = store.db.read_child_run(child_sid)
+    except Exception:
+        logger.debug("could not read the child run row for %s", child_sid, exc_info=True)
+        run = None
+    if run:
+        parent = str(run.get("parent_session_id") or "")
+        if parent:
+            return parent
+    # 2. the child's own binding row
+    try:
+        state = store.read_state(child_sid) or {}
+    except Exception:
+        logger.debug("could not read the child's binding for %s", child_sid, exc_info=True)
+        state = {}
+    for key in ("parent_session_id", "inherited_from"):
+        parent = str(state.get(key) or "")
+        if parent and parent != child_sid:
+            return parent
+    # 3. the recency tracker - ONLY when it names the child's own recorded
+    #    parent. Never a guess: a stranger's workspace is worse than a block.
+    tracked = picker.last_session(max_age_s=600)
+    if tracked and tracked == str(state.get("parent_session_id") or ""):
+        return tracked
+    return ""
+
+
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
     """Block repo-touching tools until the session resolves a workspace."""
-    # Read the recency tracker BEFORE noting this call's session id: the tracker
-    # must still hold the PARENT here - noting first would overwrite it with the
-    # child's own (unresolved) id and inheritance could never fire.
-    parent = picker.last_session(max_age_s=600)
+    # WHY the recency tracker is NOT read here any more: it is process-global,
+    # so it can only ever name ONE session, and using it as a parent source
+    # is what let two concurrent delegations cross-inherit. A child's parent
+    # is resolved per child, in _resolve_child_parent().
     picker.note_session_id(session_id)
-    # Only delegate_task dispatches may set the parent pointer: a plain tool
-    # call from ANY other session used to clobber it before the child's first
-    # gated call (the test suite caught exactly that).
-    dispatch_sid = session_id or _session_id(kw)
-    if tool_name == "delegate_task" and dispatch_sid:
-        _LAST_DELEGATION["sid"] = dispatch_sid
-        _LAST_DELEGATION["at"] = time.time()
-    if _LAST_DELEGATION["sid"] and time.time() - _LAST_DELEGATION["at"] > 600:
-        _LAST_DELEGATION["sid"] = ""
     try:
         if tool_name not in store.GATED_TOOLS:
             return None
@@ -748,19 +793,35 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             is_child = False
         # NOTE: there is deliberately NO "recent delegation dispatch" fallback
         # here any more. The old fallback set is_child=True for ANY unresolved
-        # session while `_LAST_DELEGATION` was younger than 600 s, so an
+        # session while the delegation pointer was younger than 600 s, so an
         # unrelated pre-existing session inherited another session's workspace
         # (verified live). The upstream bug it worked around (#96483,
         # `_run_single_child` not entering delegated_child_context) is FIXED in
         # the installed Hermes: children run inside delegated_child_context(),
-        # so is_delegated_child_context() is authoritative. `_LAST_DELEGATION`
-        # is now used ONLY to pick WHICH parent id to inherit from, never to
-        # decide whether this session is a child at all.
+        # so is_delegated_child_context() is authoritative.
         if is_child:
-            # Parent = the dispatching session (delegation pointer first -
-            # ordinary tool calls cannot move it - then the general recency
-            # tracker). The durable copy written here covers the child's life.
-            parent = _LAST_DELEGATION["sid"] or parent
+            # WHICH parent: resolved from per-child channels only (the
+            # child's own child_runs row, its own binding row). The old
+            # module global could name only ONE parent, so two concurrent
+            # delegations made the second child inherit the first child's
+            # parent - and build its workspace in the WRONG repo.
+            parent = _resolve_child_parent(sid) or ""
+            if not parent:
+                # No per-child record of who dispatched this child. Guessing
+                # (the recency tracker) is what let two children cross-
+                # inherit, so the child is refused instead: a blocked child
+                # is recoverable, a child in a stranger's tree is not.
+                return {
+                    "action": "block",
+                    "message": (
+                        "Delegated child, but this session's parent could not be "
+                        "identified. The plugin records the child->parent mapping "
+                        "at dispatch (subagent_start); that record is missing, so "
+                        "the child is not allowed to guess a parent's workspace.\n"
+                        "Report this to the user: re-dispatch the task, or run it "
+                        "directly in the parent session."
+                    ),
+                }
             parent_state = store.read_state(parent) or {} if parent else {}
             if parent_state.get("mode") not in {"repo", "chatting", "external"}:
                 return {
@@ -817,9 +878,13 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             if store.read_state(sid) is None:
                 inherited = {
                     k: v for k, v in parent_state.items()
-                    if k not in {"session_id", "inherited_from", "inherited_at"}
+                    if k not in {"session_id", "inherited_from", "inherited_at", "parent_session_id"}
                 }
                 inherited["inherited_from"] = parent
+                # The explicit parent link, so the NEXT gated call of this
+                # child (or of a re-dispatched one) can resolve its parent
+                # from its own row instead of from any shared/global state.
+                inherited["parent_session_id"] = parent
                 inherited["inherited_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 store.write_state(sid, inherited)
             logger.info("gate: delegated child %s inherits binding of %s", sid, parent)

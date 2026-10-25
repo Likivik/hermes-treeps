@@ -29,7 +29,10 @@ def test_a_child_gets_its_own_workspace_before_inheriting(tmp_path, monkeypatch,
     ws.mkdir(parents=True)
     _fake_child_context(monkeypatch)
     STORE.write_state("parent-1", {"mode": "repo", "repo": "repo", "slug": "parent", "path": "/tmp/parent"})
-    monkeypatch.setattr(PLUGIN, "_LAST_DELEGATION", {"sid": "parent-1", "at": __import__("time").time()})
+    # The child->parent map is per child (child_runs), never a module global:
+    # a global can only name ONE parent, so two concurrent delegations made
+    # the second child inherit the first child's parent.
+    STORE.db.write_child_run("child-1", "parent-1")
     calls = {}
 
     def fake_ensure(sid, parent_state, **kw):

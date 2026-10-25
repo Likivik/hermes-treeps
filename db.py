@@ -178,7 +178,12 @@ CREATE TABLE IF NOT EXISTS child_reports (
     workspace_repo   TEXT NOT NULL DEFAULT '',
     dirty            TEXT NOT NULL DEFAULT 'unknown',
     unpushed         INTEGER,
-    created_at       TEXT NOT NULL DEFAULT ''
+    created_at       TEXT NOT NULL DEFAULT '',
+    -- WHY report_seq: the row is rewritten in place when the child is
+    -- re-dispatched, so "delete by child id" can destroy a report that was
+    -- never delivered. The sequence lets the delivery name the exact
+    -- version it read - see V5_COLUMNS.
+    report_seq       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
 
@@ -292,7 +297,12 @@ CREATE TABLE IF NOT EXISTS child_reports (
     workspace_repo   TEXT NOT NULL DEFAULT '',
     dirty            TEXT NOT NULL DEFAULT 'unknown',
     unpushed         INTEGER,
-    created_at       TEXT NOT NULL DEFAULT ''
+    created_at       TEXT NOT NULL DEFAULT '',
+    -- WHY report_seq: the row is rewritten in place when the child is
+    -- re-dispatched, so "delete by child id" can destroy a report that was
+    -- never delivered. The sequence lets the delivery name the exact
+    -- version it read - see V5_COLUMNS.
+    report_seq       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
 
@@ -351,7 +361,12 @@ CREATE TABLE IF NOT EXISTS child_reports (
     workspace_repo   TEXT NOT NULL DEFAULT '',
     dirty            TEXT NOT NULL DEFAULT 'unknown',
     unpushed         INTEGER,
-    created_at       TEXT NOT NULL DEFAULT ''
+    created_at       TEXT NOT NULL DEFAULT '',
+    -- WHY report_seq: the row is rewritten in place when the child is
+    -- re-dispatched, so "delete by child id" can destroy a report that was
+    -- never delivered. The sequence lets the delivery name the exact
+    -- version it read - see V5_COLUMNS.
+    report_seq       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
 
@@ -368,6 +383,27 @@ CREATE TABLE IF NOT EXISTS child_reclaims (
 CREATE INDEX IF NOT EXISTS child_reclaims_snapshot_idx
     ON child_reclaims(snapshot_commit_id);
 """
+
+# Columns added to a table that already exists in the live install.
+#
+# WHY an explicit list and not "run the whole SCHEMA again": a CREATE TABLE
+# IF NOT EXISTS does NOT add a column to a table that is already there, so
+# the CREATE-based migration cannot deliver a new column. These are the
+# ALTER TABLE ADD COLUMN statements, and they are additive: SQLite's
+# ADD COLUMN cannot drop or retype anything, so running it on the live
+# database can never lose a row.
+#
+# WHY a new column at all (report_seq): the child's report row is keyed by
+# child_session_id and REWRITTEN in place when the child is re-dispatched.
+# The delivery side read the pending rows, then deleted "the rows for these
+# child ids" - so a report that arrived between the read and the delete was
+# destroyed WITHOUT EVER BEING DELIVERED. The sequence number lets the
+# delete name the exact version it read: a rewrite bumps the sequence, the
+# stale delete no longer matches, and the newer report survives to the
+# parent's next turn.
+V5_COLUMNS = (
+    ("child_reports", "report_seq", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 # The keys of a session record that get their own column. Everything else a
 # caller stored (e.g. ``not_a_repo``) rides along in ``extra``.
@@ -575,8 +611,41 @@ def _migrate_to_current(conn: sqlite3.Connection) -> None:
     try:
         conn.executescript(V3_TABLES)
         conn.commit()
+        _add_missing_columns(conn)
+        conn.commit()
     except Exception:
         logger.warning("plugin db migration failed; continuing on the old schema", exc_info=True)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Add the columns a newer release needs to an OLDER table.
+
+    WHY this exists: the CREATE-based migration above cannot add a column to
+    a table that already exists, and the live install's database predates
+    every column added after v3. SQLite's ``ALTER TABLE ... ADD COLUMN`` is
+    additive by construction - it cannot drop or retype a row - so this is
+    safe to run on the live database.
+
+    WHY the failure is swallowed per column: one missing column must not
+    stop the others from being added, and a database that cannot be altered
+    must still open.
+    """
+    for table, column, decl in V5_COLUMNS:
+        try:
+            cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except Exception:
+            logger.debug("could not inspect %s for the %s column", table, column, exc_info=True)
+            continue
+        if not cols:
+            # The table itself does not exist yet (a fresh database): the
+            # CREATE-based migration creates it with the column inline.
+            continue
+        if column in cols:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except Exception:
+            logger.warning("could not add the %s.%s column", table, column, exc_info=True)
 
 
 def _open_connection(path: str) -> sqlite3.Connection:
@@ -1027,17 +1096,24 @@ def write_child_report(
     stops twice (or is re-dispatched under the same session id) overwrites
     its own earlier report instead of showing the parent two lines about the
     same child.
+
+    WHY ``report_seq`` is bumped on every write: the row is overwritten IN
+    PLACE, so a delivery that read the old version cannot tell it apart from
+    the new one by id alone. Bumping the sequence on each write lets the
+    delivery name the exact version it read - so a report rewritten between
+    the read and the delete is NOT deleted, and the parent still gets it.
     """
     with transaction() as conn:
         conn.execute(
             "INSERT INTO child_reports(child_session_id, parent_session_id, child_role,"
             " child_status, workspace_path, workspace_slug, workspace_repo, dirty, unpushed,"
-            " created_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+            " created_at, report_seq) VALUES(?,?,?,?,?,?,?,?,?,?,1)"
             " ON CONFLICT(child_session_id) DO UPDATE SET parent_session_id=excluded.parent_session_id,"
             " child_role=excluded.child_role, child_status=excluded.child_status,"
             " workspace_path=excluded.workspace_path, workspace_slug=excluded.workspace_slug,"
             " workspace_repo=excluded.workspace_repo, dirty=excluded.dirty,"
-            " unpushed=excluded.unpushed, created_at=excluded.created_at",
+            " unpushed=excluded.unpushed, created_at=excluded.created_at,"
+            " report_seq=child_reports.report_seq+1",
             (
                 child_session_id,
                 parent_session_id,
@@ -1077,12 +1153,13 @@ def write_child_report_at(
         conn.execute(
             "INSERT INTO child_reports(child_session_id, parent_session_id, child_role,"
             " child_status, workspace_path, workspace_slug, workspace_repo, dirty, unpushed,"
-            " created_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+            " created_at, report_seq) VALUES(?,?,?,?,?,?,?,?,?,?,1)"
             " ON CONFLICT(child_session_id) DO UPDATE SET parent_session_id=excluded.parent_session_id,"
             " child_role=excluded.child_role, child_status=excluded.child_status,"
             " workspace_path=excluded.workspace_path, workspace_slug=excluded.workspace_slug,"
             " workspace_repo=excluded.workspace_repo, dirty=excluded.dirty,"
-            " unpushed=excluded.unpushed, created_at=excluded.created_at",
+            " unpushed=excluded.unpushed, created_at=excluded.created_at,"
+            " report_seq=child_reports.report_seq+1",
             (
                 child_session_id,
                 parent_session_id,
@@ -1115,7 +1192,14 @@ def read_child_reports(parent_session_id: str) -> list[dict[str, Any]]:
 
 
 def delete_child_reports(child_session_ids: list[str]) -> int:
-    """Delete the reports that were delivered. Returns the row count."""
+    """Delete the reports that were delivered. Returns the row count.
+
+    WHY this is ID-ONLY and why that is a trap: the caller passes the child
+    ids it read. The row is rewritten IN PLACE when the child is
+    re-dispatched, so a report that arrived between the read and this
+    delete shares the id and is destroyed WITHOUT EVER BEING DELIVERED. Use
+    :func:`delete_delivered_reports` - it names the exact version.
+    """
     ids = [str(x) for x in child_session_ids if x]
     if not ids:
         return 0
@@ -1123,6 +1207,48 @@ def delete_child_reports(child_session_ids: list[str]) -> int:
         marks = ",".join("?" for _ in ids)
         cur = conn.execute(
             f"DELETE FROM child_reports WHERE child_session_id IN ({marks})", tuple(ids)
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_delivered_reports(delivered: list[dict[str, Any]]) -> int:
+    """Delete EXACTLY the report versions that were delivered.
+
+    WHY this exists (P1-2): the delivery reads the pending rows, renders
+    them, and then deletes them. Between the read and the delete the child
+    can be re-dispatched, and its report thread REWRITES the same row (the
+    primary key is the child session id). Deleting by child id then
+    destroyed the NEW report - one the parent never saw. The parent silently
+    lost the child's end state, which is the whole point of the report.
+
+    The fix names the version: every write bumps ``report_seq``, the read
+    captures it, and this delete matches on ``(child_session_id, report_seq)``.
+    A rewrite between the read and the delete changes the sequence, so the
+    delete matches nothing and the newer report survives to the parent's next
+    turn.
+
+    Rows with NO sequence (an old database written before the column
+    existed) are deleted by id alone - there is nothing else to match on,
+    and leaving them pending forever would be worse.
+    """
+    clauses: list[str] = []
+    params: list[Any] = []
+    for row in delivered:
+        child_id = str(row.get("child_session_id") or "")
+        if not child_id:
+            continue
+        seq = row.get("report_seq")
+        if seq is None:
+            clauses.append("(child_session_id=? AND report_seq=0)")
+            params.append(child_id)
+        else:
+            clauses.append("(child_session_id=? AND report_seq=?)")
+            params.extend([child_id, int(seq)])
+    if not clauses:
+        return 0
+    with transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM child_reports WHERE " + " OR ".join(clauses), tuple(params)
         )
         return int(cur.rowcount or 0)
 

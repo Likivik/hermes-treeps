@@ -136,6 +136,13 @@ def ensure_child_workspace(session_id: str, parent_state: dict[str, Any], *, tit
             "slug": bound_slug,
             "path": bound_path,
             "inherited_from": parent_session_id,
+            # WHY BOTH keys: ``parent_session_id`` is the explicit
+            # "who dispatched me" field, and it is what the gate reads back
+            # to resolve this child's parent after a gateway restart (the
+            # ``child_runs`` row is written by the host's subagent_start
+            # hook, which does not re-fire for a resumed child).
+            # ``inherited_from`` is kept for the existing readers.
+            "parent_session_id": parent_session_id,
             "purpose": purpose,
         }
         if title:
