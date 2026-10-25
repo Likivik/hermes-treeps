@@ -138,13 +138,25 @@ A reclamation that is **refused** (a live session is still pinned to the tree,
 or the tree is not a child at all) costs the reclamation, not the report: the
 parent still hears what happened, and the tree is left alone.
 
-**The child's binding is marked ended at the stop.** A session with no
-`session_ended_at` counts as *live*, and the in-use guard refuses to remove
-a live session's tree — so `subagent_stop` stamps the child's binding row as
-ended (the child is finished by contract at that point) before the
-reclamation runs. That stamp is what unlocks the immediate reclamation: without
-it every freshly-stopped child looks live, the reclaim is refused as in-use,
-and the tree silently stays on disk.
+**The child's binding is marked ended at the stop, and then the tree goes.**
+A session with no `session_ended_at` counts as *live*, and the in-use guard
+refuses to remove a live session's tree — so `subagent_stop` stamps the child's
+binding row as ended (the child is finished by contract at that point) and the
+reclamation runs immediately afterwards. That stamp is what unlocks the
+immediate reclamation: without it every freshly-stopped child looks live, the
+reclaim is refused as in-use, and the tree silently stays on disk.
+
+**The stop flow stamps ended and then reclaims — it does not refuse.** The
+order is fixed: the end stamp comes first, the reclamation second. So a child
+that stops is reclaimed, and the in-use guard is not what decides it.
+
+**Refusals live in the manual reclaim path.** A refusal — a live session is
+still pinned to the tree, the tree is not a child at all, it is the main jj
+workspace, or it is a git-only worktree — is what `hermes ws reclaim` (the CLI,
+run by a human) reports. That is the path where the in-use guard can actually
+fire, because the CLI does not stamp anything ended first. The immediate stop
+path never reaches it. To turn the immediate reclamation off entirely, use the
+kill-switch below.
 
 **The kill-switch.** Set `child_immediate_reclaim: false` and the stop hook
 reports but does **not** reclaim — the tree stays and the age-based sweep (or
@@ -196,7 +208,7 @@ heartbeat only matters when the stop event never arrived.
 `subagent_stop` never fires and no ended stamp is written. Such a child becomes
 reclaimable only when **both** hold:
 
-- its heartbeat is missing or older than **24 hours**, **and**
+- its heartbeat **exists and** is older than **24 hours**, **and**
 - its workspace is older than **24 hours**.
 
 One stale marker alone is never enough: a brand-new child that has not called a
@@ -204,6 +216,13 @@ gated tool has no heartbeat yet, and a child with a fresh heartbeat is alive.
 The in-use guard inside `reclaim_child_workspace` waives the ended-stamp
 requirement under exactly the same two-threshold rule — requiring the stamp
 would strand a hard-dead child forever.
+
+Note the asymmetry: a **missing** heartbeat is not a stale heartbeat. The
+hard-death backstop needs *positive evidence* that the child was alive and
+then stopped reporting, so it requires a heartbeat that exists and is old. The
+looser `child_heartbeat_stale()` helper answers the general liveness question
+and falls back to the workspace's own age when no heartbeat was ever written —
+but the reclamation's backstop does not use it.
 
 ## Automatic child collection (optional)
 

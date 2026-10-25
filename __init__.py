@@ -48,9 +48,11 @@ runs commands in a checkout - requires a workspace first:
   first - never clone on your own initiative.
 
 On the first turn, ask BOTH questions in a single line (never two messages, never
-a menu): the session TITLE (required - it becomes the workspace name), and which
-repo - or just chatting. Example: "Session title? (it names the workspace) - and
-which repo: {repos}, an external path, a new repo, or just chatting?"
+a menu): the session TITLE (required - it is metadata only; the workspace name
+is derived from the session id, never from the title, because titles get
+renamed), and which repo - or just chatting. Example: "Session title? (metadata
+only - the workspace name comes from the session id) - and which repo: {repos},
+an external path, a new repo, or just chatting?"
 
 If a chatting session drifts into repository work (a path under a configured repo
 root, a clone, a git/jj command, a PR), say one line: "this looks like repo work
@@ -102,7 +104,6 @@ def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
                     ),
                 },
             },
-            "required": ["slug"],
         },
     }
     chat_schema = {
@@ -1139,7 +1140,15 @@ def _on_pre_llm_call(**kw: Any) -> Any:
     filler line. A parent with no finished children pays nothing.
     """
     try:
-        sid = str(kw.get("session_id") or "")
+        # WHY ``_session_id(kw)`` and not ``kw.get("session_id")``: the host
+        # names the session differently depending on the hook - the literal
+        # ``session_id`` key is not the only one that carries it. The
+        # plugin's own helper already knows every spelling
+        # (``session_id``, ``session``, ``durable_session_key``, and the
+        # ``HERMES_SESSION_ID`` environment). Reading only the one literal
+        # key meant a payload keyed any other way silently delivered NO
+        # report: the parent never heard what happened to its child.
+        sid = _session_id(kw)
         if not sid:
             return None
         text = childreport.deliver_reports(sid)
@@ -1169,8 +1178,13 @@ def _reports_prompt_section(info: Any = None) -> str:
         # ``isinstance(info, dict)`` test is False for it, and the section
         # would silently render nothing on every real session - a feature
         # that looks shipped and is not.
+        #
+        # WHY ``_session_id(info)`` and not ``info.get("session_id")``: the
+        # same reason as the per-turn channel - the session id is not
+        # always under the literal ``session_id`` key. The helper knows
+        # every spelling the host uses.
         if isinstance(info, Mapping):
-            sid = str(info.get("session_id") or "")
+            sid = _session_id(info)
         if not sid:
             return ""
         return childreport.deliver_reports(sid)

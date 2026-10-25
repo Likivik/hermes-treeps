@@ -575,6 +575,51 @@ def test_a_live_session_pinned_workspace_is_refused(tmp_path, monkeypatch):
     assert ws.exists(), "a live session's workspace must survive"
 
 
+def test_the_manual_reclaim_reports_a_refused_workspace(tmp_path, monkeypatch):
+    """The MANUAL reclaim path is where a refusal is reachable.
+
+    Prevents: the in-use guard losing its coverage. The immediate stop
+    flow stamps the child's session ended BEFORE it reclaims, so the guard
+    never sees a live session there - the stop flow cannot refuse. The
+    manual path (``hermes ws reclaim``) stamps nothing, so the guard is
+    the thing that decides, and its refusal must be REPORTED as a refusal
+    and not as a reclamation.
+
+    WHY this matters for the summary too: a caller that buckets by
+    ``ok`` alone would file a refusal under "reclaimed" and claim a tree
+    was reclaimed while it is still on disk.
+    """
+    # The workspace lives under the plugin's root: the manual path looks
+    # it up BY SLUG, and that lookup refuses a path outside the root.
+    root = tmp_path / "repos" / ".workspaces" / "repo"
+    ws = root / "repo-child-live"
+    ws.mkdir(parents=True)
+    monkeypatch.setattr(STORE, "repo_dir", lambda: tmp_path / "repos")
+    monkeypatch.setattr(
+        STORE,
+        "settings",
+        lambda: {
+            "repo_dir": str(tmp_path / "repos"),
+            "workspace_root": str(tmp_path / "repos" / ".workspaces"),
+            "repo_roots": [str(tmp_path)],
+        },
+    )
+    monkeypatch.setattr(STORE, "find_repo", lambda name: tmp_path / "repo")
+    _record(ws, sessions=("child-live",))
+    # The session is LIVE: a binding row and no session_ended_at.
+    STORE.db.write_binding(
+        "child-live",
+        {"mode": "repo", "repo": "repo", "slug": ws.name, "path": str(ws)},
+    )
+
+    out = STORE.reclaim_children([ws.name])
+
+    assert out["reclaimed"] == [], out
+    assert len(out["skipped"]) == 1, out
+    assert out["skipped"][0]["reason"] == STORE.RECLAIM_REFUSED_IN_USE, out
+    assert ws.exists(), "a live session's workspace must survive"
+
+
 # ── the age-based sweep goes through the SAME primitive ──────────────────────
 
 

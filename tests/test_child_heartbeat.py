@@ -158,21 +158,35 @@ def test_heartbeat_write_failure_does_not_gate_block(tmp_path, monkeypatch):
 
 
 def test_two_rapid_calls_write_the_heartbeat_once(tmp_path, monkeypatch):
-    """The rate limit keeps rapid gated calls from churning the kv store."""
-    values: dict[str, str] = {}
+    """The rate limit keeps rapid gated calls from churning the kv store.
 
-    def fake_set(key, value):
-        values[key] = value
+    WHY the write seam moved: the heartbeat's read-then-write pair is
+    now ATOMIC - the read happens inside the write transaction, on the
+    same connection, so two threads cannot both decide the interval has
+    passed and both write. That means the read is ``db.get_kv_in(conn,
+    key)`` on the transaction's own connection, not a standalone
+    ``db.get_kv()`` on a connection of its own.
+    """
+    writes: list[tuple[str, str]] = []
 
-    def fake_get(key, default=None):
-        return values.get(key, default)
+    def fake_write_kv(conn, key, value):
+        writes.append((key, value))
 
-    monkeypatch.setattr(STORE.db, "set_kv", fake_set)
-    monkeypatch.setattr(STORE.db, "get_kv", fake_get)
+    def fake_get_kv_in(conn, key, default=None):
+        for k, v in reversed(writes):
+            if k == key:
+                return v
+        return default
+
+    monkeypatch.setattr(STORE.db, "_write_kv", fake_write_kv)
+    monkeypatch.setattr(STORE.db, "get_kv_in", fake_get_kv_in)
     now = time.time()
     assert STORE.record_child_heartbeat("child-rate", now=now) is True
     assert STORE.record_child_heartbeat("child-rate", now=now + 1) is False
-    assert list(values) == [STORE.child_heartbeat_key("child-rate")], values
+    # Only the heartbeat key is counted: the schema bootstrap writes its
+    # own kv row through the same helper.
+    key = STORE.child_heartbeat_key("child-rate")
+    assert [k for k, _ in writes if k == key] == [key], writes
 
 
 def test_gateway_restart_orphan_becomes_reclaimable_after_both_thresholds(
