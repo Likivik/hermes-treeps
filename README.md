@@ -114,6 +114,75 @@ questions):
 
     0 4 * * * hermes ws gc --children --apply >> ~/.hermes/ws-gc.log 2>&1
 
+## Immediate child reclamation
+
+A delegated child's workspace is throwaway, and once the child is **done**
+the tree is dead weight on disk. `hermes ws reclaim` takes it back at once -
+and the work is never lost.
+
+    hermes ws reclaim --slug <slug>          # reclaim one finished child
+    hermes ws reclaim --all-children         # reclaim every finished child
+    hermes ws reclaim --slug <slug> --dry-run  # report only, change nothing
+
+The output is a structured report:
+
+```json
+{
+  "reclaimed": [
+    {"slug": "app-child-a1b2c3", "snapshot_commit_id": "9f3c...", "was_dirty": true}
+  ],
+  "skipped": [
+    {"slug": "app-child-d4e5f6", "reason": "live_session_pinned"}
+  ]
+}
+```
+
+### How the work survives
+
+`jj workspace remove` (jj >= 0.46) does both halves in one step: it
+**snapshots the working copy - even the dirty one - into a commit in the
+shared store**, and then removes the workspace and its directory. The commit
+survives in the repo; the tree does not. A clean child has nothing to
+snapshot, so it is unregistered with `jj workspace forget` instead.
+
+The plugin records the snapshot's commit id in the `child_reclaims` table.
+**That table is the index**: jj never auto-gcs, so a snapshot commit stays in
+the store until something evicts it, and this row is what makes it findable:
+
+    hermes ws reclaim --slug app-child-a1b2c3   # → {"snapshot_commit_id": "9f3c..."}
+
+Recover the work with that id:
+
+    jj log -r 9f3c...
+    jj file show -r 9f3c... path/to/the/file
+
+### The one thing that can still evict it
+
+A manual `jj gc --expire` is the only thing that can remove an unpushed
+snapshot commit from the store. Until then the work is there, reachable
+through the recorded commit id.
+
+### What is refused, and why
+
+| Refusal | The failure it prevents |
+|---|---|
+| not a `child:` purpose | deleting a **user's** workspace |
+| primary (main) jj workspace | jj forgetting the main checkout with no warning (jj#5271) |
+| live session pinned to it | the tree vanishing under a running session |
+| git-only worktree | a dirty git worktree has no snapshot-safe removal - it is **skipped**, not lost |
+
+The command is idempotent: reclaiming an already-reclaimed child succeeds
+and keeps the **first** snapshot's commit id.
+
+### The age-based sweep still runs
+
+The 14-day TTL protects **unfinished** children - a child that is still
+working, or was never heard from, keeps its tree until the age says it was
+abandoned. A child past `subagent_stop` is finished by contract, so the
+immediate path is safe to reclaim at once. The age-based sweep
+(`hermes ws gc --children --apply`) keeps running for everything the
+immediate path did not reclaim.
+
 ## Configuration
 
 Every setting lives in one namespace: `plugins.entries.hermes-treeps.settings`.
