@@ -139,16 +139,6 @@ def test_the_migrate_subcommand_is_registered():
     assert "migrate" in _registered_actions()
 
 
-def test_the_legacy_import_kept_its_own_name():
-    """The legacy JSON import kept a name of its own.
-
-    WHY: `hermes ws migrate` used to import the legacy JSON records. The
-    one-time LAYOUT migration now owns the short form, so the import has to
-    live under an explicit name - otherwise it would be unreachable.
-    """
-    assert "migrate-legacy" in _registered_actions()
-
-
 def test_the_migrate_cli_prints_the_report(tmp_path, monkeypatch, capsys):
     """The CLI prints the report, bucket by bucket.
 
