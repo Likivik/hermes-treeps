@@ -153,6 +153,44 @@ def dirty(ws: Path) -> bool:
         return True  # assume dirty: refuse rather than lose work
 
 
+def dirty_state(ws: Path) -> str | None:
+    """``"dirty"`` / ``"clean"`` / None (cannot tell).
+
+    WHY this exists beside :func:`dirty`: ``dirty`` answers a yes/no for the
+    RETIRE guard, and a workspace that is not a checkout at all (retired
+    mid-run, deleted, never a repo) makes it answer "no" - because
+    ``git status --porcelain`` exits non-zero with empty stdout there, and
+    the empty output reads as "no changes".
+
+    That is the right answer for retiring (nothing to lose) and the WRONG
+    answer for reporting. A child-end report that says "clean" about a
+    directory nobody could inspect is a lie, and this feature exists to stop
+    lies. So the reporting path asks this function, which returns None when
+    the workspace is not usable.
+
+    WHY the check is explicit and not "the command failed": a jj workspace
+    whose repo was forgotten also fails its diff, and a git worktree whose
+    parent repo is gone fails its status. Both mean "nobody can say what is
+    in this tree".
+    """
+    try:
+        if not ws.exists():
+            return None
+        if detect(ws) == JJS:
+            out = _run_raw(["jj", "diff", "--summary"], cwd=ws, timeout=60)
+            if out.returncode != 0:
+                return None
+            lines = [ln for ln in (out.stdout or "").splitlines() if ".hermes/" not in ln]
+            return "dirty" if lines else "clean"
+        out = _run_raw(["git", "status", "--porcelain"], cwd=ws, timeout=60)
+        if out.returncode != 0:
+            return None
+        lines = [ln for ln in (out.stdout or "").splitlines() if ".hermes/" not in ln]
+        return "dirty" if lines else "clean"
+    except Exception:
+        return None
+
+
 def unpushed(ws: Path) -> bool | None:
     """True = commits not on the remote. None = cannot tell.
 
@@ -180,6 +218,48 @@ def unpushed(ws: Path) -> bool | None:
             return None  # no upstream configured
         out = _run_raw(["git", "log", "--oneline", "@{u}.."], cwd=ws, timeout=30)
         return bool(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def unpushed_count(ws: Path) -> int | None:
+    """How many commits are not on the remote. None = cannot tell.
+
+    WHY a separate function and not a change to ``unpushed()``: ``unpushed()``
+    answers a boolean for the retire guard, and short-circuits as soon as it
+    knows the answer is "yes". The child-end report needs the NUMBER, and
+    only asks for it when the boolean says there is something to count - so
+    the common clean case still costs one cheap call.
+
+    Same revset as ``unpushed()`` (``remote_bookmarks()..@``), because a
+    different revset would make the two disagree: the report must not say
+    "2 unpushed" where the guard would say "clean".
+    """
+    try:
+        if detect(ws) == JJS:
+            out = _run_raw(
+                ["jj", "log", "--no-graph", "-r", "remote_bookmarks()..@",
+                 "-T", 'if(empty, "", commit_id ++ "\\n")'],
+                cwd=ws, timeout=30,
+            )
+            if out.returncode == 0:
+                return len([ln for ln in (out.stdout or "").splitlines() if ln.strip()])
+            diff = _run_raw(["jj", "diff", "--summary", "-r", "remote_bookmarks()..@"], cwd=ws, timeout=30)
+            if diff.returncode != 0:
+                return None
+            # The fallback only knows WHETHER there is work, not how much:
+            # report "cannot count" rather than a made-up number.
+            return None
+        up = _run_raw(["git", "rev-parse", "--abbrev-ref", "@{u}"], cwd=ws, timeout=10)
+        if up.returncode != 0:
+            return None  # no upstream configured
+        out = _run_raw(["git", "rev-list", "--count", "@{u}.."], cwd=ws, timeout=30)
+        if out.returncode != 0:
+            return None
+        try:
+            return int((out.stdout or "").strip() or "0")
+        except ValueError:
+            return None
     except Exception:
         return None
 

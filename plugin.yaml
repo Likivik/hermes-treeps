@@ -33,6 +33,15 @@ provides_hooks:
   - on_session_start
   - on_session_reset
   - on_session_finalize
+  # The host's dedicated subagent lifecycle hooks. The child-end report is
+  # built from these: subagent_start maps the child to its parent, and
+  # subagent_stop hands the child's workspace state to the parent.
+  - subagent_start
+  - subagent_stop
+  # The per-turn channel that delivers a parent's pending child-end report on
+  # its next turn (plugin system-prompt sections are frozen per session, so
+  # they cannot carry a report about a child that finishes later).
+  - pre_llm_call
 # Every key the plugin reads is declared here, so the Desktop settings form
 # and the code cannot drift apart. The test suite asserts that this set is
 # exactly the set settings() reads.
