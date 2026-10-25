@@ -22,6 +22,7 @@ else's tree.
 | `vcs.py` | the jj/git adapter: one API, two backends |
 | `prepare.py` | workspace prepare step: copies ignored files (`.env`), optional setup command |
 | `childspace.py` | per-delegation child workspaces (one tree per child, never shared) |
+| `childreport.py` | child-end reporting: the child's end state for the parent, and the immediate reclamation that follows it |
 | `migrate_layout.py` | the one-time move from the old workspace root to the dot-dir layout |
 | `contract.py` | the delegation contract rendered into the system-prompt section |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
@@ -86,6 +87,46 @@ behind it. That background thread is handed the database path its caller
 named, so a report can never land in a different database than the one the
 session was using.
 
+**The tree is reclaimed right there.** On the *same* background thread, right
+after the report row is written, the child's workspace is reclaimed: the dirty
+working copy is snapshotted into a commit in the shared repo store, and the
+workspace and its directory are removed. A finished child's tree is dead
+weight on disk, and it is gone the moment the child ends.
+
+The order is the point. The report says whether the tree was dirty **at stop
+time**; the reclamation then snapshots that dirty tree and removes it. If the
+order were reversed, the report would describe a tree that no longer exists
+and would say "clean" about work that is sitting in a snapshot commit.
+
+The snapshot commit id is recorded in the `child_reclaims` table — the same
+table `hermes ws reclaim` writes. The report row and the reclaim row are
+linked by the workspace slug, so "where did the child's work go?" is one
+lookup:
+
+```sql
+SELECT r.snapshot_commit_id FROM child_reports r
+  JOIN child_reclaims c ON c.slug = r.workspace_slug
+ WHERE r.child_session_id = ?;
+```
+
+A reclamation that is **refused** (a live session is still pinned to the tree,
+or the tree is not a child at all) costs the reclamation, not the report: the
+parent still hears what happened, and the tree is left alone.
+
+**The kill-switch.** Set `child_immediate_reclaim: false` and the stop hook
+reports but does **not** reclaim — the tree stays and the age-based sweep (or
+`hermes ws reclaim`) takes it later. The switch exists for an operator who
+does not trust the snapshot path: the reporting is what tells a human what
+happened, and turning the switch off keeps it. Nothing else changes.
+
+```yaml
+plugins:
+  entries:
+    hermes-treeps:
+      settings:
+        child_immediate_reclaim: false   # report only, keep the tree
+```
+
 **One-time delivery.** A report is delivered once and then deleted. The next
 turn is silent. With nothing pending, the plugin adds nothing at all — no
 empty section, no filler.
@@ -95,9 +136,11 @@ mid-run, the remote is unreachable), the line says `state-unknown` or
 `unpushed unknown` — never a wrong "clean".
 
 **Hard-death caveat.** If the gateway restarts mid-child, `subagent_stop`
-never fires and no report is produced. The orphaned child workspace is still
-reclaimed by age: `hermes ws gc --children --apply` retires child workspaces
-once they are 14 days old, their session ended and their tree is clean.
+never fires and no report is produced — and, because the reclamation rides on
+that same hook, the tree is not reclaimed either. The orphaned child
+workspace is still reclaimed by age: `hermes ws gc --children --apply` retires
+child workspaces once they are 14 days old, their session ended and their
+tree is clean.
 
 ## Automatic child collection (optional)
 
@@ -117,12 +160,29 @@ questions):
 ## Immediate child reclamation
 
 A delegated child's workspace is throwaway, and once the child is **done**
-the tree is dead weight on disk. `hermes ws reclaim` takes it back at once -
-and the work is never lost.
+the tree is dead weight on disk. It is taken back at once - automatically, the
+moment the child stops - and the work is never lost.
 
     hermes ws reclaim --slug <slug>          # reclaim one finished child
     hermes ws reclaim --all-children         # reclaim every finished child
     hermes ws reclaim --slug <slug> --dry-run  # report only, change nothing
+
+### The automatic path
+
+When a delegated child stops, the plugin reclaims its workspace on the same
+background thread that writes the child's end report - **report first, reclaim
+second**, so the report still describes the tree as it was at stop time (see
+[Child-end reporting](#child-end-reporting)).
+
+The command above is the manual path, and it goes through the *same*
+primitive: the guards, the removal and the bookkeeping are one code path, so
+they cannot drift apart.
+
+Set `child_immediate_reclaim: false` to turn the automatic path off. The
+report still lands; the tree stays on disk and the age-based sweep (or
+`hermes ws reclaim`) takes it later. That switch is for an operator who does
+not trust the snapshot path - the reporting is what tells a human what
+happened, and it survives the switch.
 
 The output is a structured report:
 
@@ -151,6 +211,10 @@ the store until something evicts it, and this row is what makes it findable:
 
     hermes ws reclaim --slug app-child-a1b2c3   # → {"snapshot_commit_id": "9f3c..."}
 
+The automatic path writes the same row, so the child's work is findable the
+same way whether the tree was reclaimed at stop time or by hand. The report
+row and the reclaim row are linked by the workspace slug.
+
 Recover the work with that id:
 
     jj log -r 9f3c...
@@ -174,6 +238,9 @@ through the recorded commit id.
 The command is idempotent: reclaiming an already-reclaimed child succeeds
 and keeps the **first** snapshot's commit id.
 
+A refusal in the automatic path costs the reclamation, not the report: the
+parent still gets the child's end state, and the tree is left alone.
+
 ### The age-based sweep still runs
 
 The 14-day TTL protects **unfinished** children - a child that is still
@@ -181,7 +248,8 @@ working, or was never heard from, keeps its tree until the age says it was
 abandoned. A child past `subagent_stop` is finished by contract, so the
 immediate path is safe to reclaim at once. The age-based sweep
 (`hermes ws gc --children --apply`) keeps running for everything the
-immediate path did not reclaim.
+immediate path did not reclaim: a refused reclamation, a child whose gateway
+died mid-run, or every child when `child_immediate_reclaim` is off.
 
 ## Configuration
 
@@ -206,6 +274,7 @@ plugins:
         prepare_command: ""                    # shell command run inside the new workspace
         prepare_files: [".env"]                # repo-relative files copied into the workspace
         prepare_timeout_seconds: 300           # ceiling on the prepare command (1-3600)
+        child_immediate_reclaim: true           # reclaim a child's tree the moment it stops
 ```
 
 ### Deprecated settings

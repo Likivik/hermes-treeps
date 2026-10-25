@@ -118,3 +118,11 @@ config_schema:
     type: int
     default: 300
     description: Hard ceiling (1-3600 seconds) on the prepare command.
+  child_immediate_reclaim:
+    type: bool
+    default: true
+    description: >-
+      Reclaim a child's workspace the moment the child stops (the dirty
+      working copy is snapshotted into a commit, and the commit id is
+      recorded). Turn it off to keep the reporting but leave the tree on
+      disk - the tree is then reclaimed by the age-based sweep.

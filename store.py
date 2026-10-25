@@ -967,8 +967,14 @@ def reclaim_child_workspace(
     """Reclaim ONE child workspace, preserving its work.
 
     This is THE child-reclamation primitive: the immediate path (a finished
-    child) and the age-based sweep both call it, so the guards, the removal
-    and the bookkeeping can never drift apart.
+    child, reclaimed by the ``subagent_stop`` hook) and the age-based sweep
+    both call it, so the guards, the removal and the bookkeeping can never
+    drift apart.
+
+    WHY the immediate path calls THIS and not something of its own: a
+    second implementation would be a second set of guards, and the guards
+    are the whole point - they are what keeps a user workspace, the main
+    checkout and a live session's tree from being deleted.
 
     Returns a dict::
 

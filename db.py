@@ -413,11 +413,49 @@ def plugin_data_dir() -> Path:
 
 
 def db_path() -> Path:
-    """The database file. ``HERMES_TREEPS_DB_PATH`` overrides it (tests)."""
+    """The database file. ``HERMES_TREEPS_DB_PATH`` overrides it (tests).
+
+    WHY a thread-local PIN comes first: a background thread (the child
+    report thread) can outlive the code that scheduled it, and the
+    environment it resolves when it gets there may no longer be the one its
+    caller meant. :func:`pinned_path` lets the caller hand the thread the
+    database it wants, for as long as the thread needs it - without a
+    process-wide environment variable that another thread would race on.
+    """
+    pinned = getattr(_THREAD_LOCAL, "pinned_path", None)
+    if pinned:
+        return Path(pinned)
     override = os.environ.get("HERMES_TREEPS_DB_PATH")
     if override:
         return Path(override)
     return plugin_data_dir() / DB_FILENAME
+
+
+@contextlib.contextmanager
+def pinned_path(path: str | Path) -> Iterator[Path]:
+    """Pin the database file for the CURRENT THREAD only.
+
+    WHY this exists: the child report thread writes its report row into a
+    database file its caller named, and then reclaims the child's workspace
+    - which also touches the database (reading the workspace record,
+    writing the reclaim row). Without a pin, that second half would resolve
+    ``db_path()`` on its own and could land in a DIFFERENT database than the
+    report - the exact leak the pinned-path write was invented to stop.
+
+    WHY thread-local and not an environment variable: an env var is
+    process-wide, so two threads reporting at the same time would fight
+    over it and one would write into the other's database.
+
+    WHY it is a context manager and not a plain setter: the pin must be
+    released even when the body raises, or the thread would keep writing
+    into a database nobody chose for it afterwards.
+    """
+    previous = getattr(_THREAD_LOCAL, "pinned_path", None)
+    _THREAD_LOCAL.pinned_path = str(path)
+    try:
+        yield Path(path)
+    finally:
+        _THREAD_LOCAL.pinned_path = previous
 
 
 def _env_override_active() -> bool:
@@ -1409,6 +1447,54 @@ def read_child_reclaim_by_slug(slug: str) -> dict[str, Any] | None:
         "SELECT * FROM child_reclaims WHERE slug=? ORDER BY reclaimed_at DESC LIMIT 1",
         (slug,),
     ).fetchone()
+    if row is None:
+        return None
+    return {
+        "repo": row["repo"],
+        "slug": row["slug"],
+        "session_id": row["session_id"],
+        "workspace_path": row["workspace_path"],
+        "snapshot_commit_id": row["snapshot_commit_id"],
+        "was_dirty": bool(row["was_dirty"]),
+        "reclaimed_at": row["reclaimed_at"],
+    }
+
+
+def read_child_reclaim_for_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    """The reclamation row that belongs to a CHILD REPORT row, or None.
+
+    WHY this exists: a report says "this child left a dirty tree here", and
+    the reclamation says "that tree became THIS commit". Linking the two is
+    what lets a caller answer "where did the child's work go?" with one
+    lookup instead of guessing a slug.
+
+    WHY no schema change: the report row already carries ``workspace_slug``
+    and ``workspace_repo``, which are exactly the primary key of
+    ``child_reclaims``. So the join needs no new column and no migration -
+    the linkage is a QUERY, not a second copy of the commit id that could
+    drift away from the reclamation that produced it.
+
+    WHY the repo is tried first and the slug alone second: the workspace
+    row (which held the repo) is deleted by the reclamation, and a report
+    row written before the plugin knew the repo name can carry an empty
+    one. The slug alone is unique within a root, so it is a safe fallback.
+    """
+    slug = str(report.get("workspace_slug") or "")
+    if not slug:
+        return None
+    repo = str(report.get("workspace_repo") or "")
+    conn = connect()
+    row = None
+    if repo:
+        row = conn.execute(
+            "SELECT * FROM child_reclaims WHERE repo=? AND slug=?",
+            (repo, slug),
+        ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT * FROM child_reclaims WHERE slug=? ORDER BY reclaimed_at DESC LIMIT 1",
+            (slug,),
+        ).fetchone()
     if row is None:
         return None
     return {

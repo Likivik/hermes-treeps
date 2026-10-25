@@ -41,6 +41,14 @@ dispatch is logged and swallowed, but a hook that raises while holding the
 plugin's write lock can leave a transaction open. Worse, a reporting feature
 is never worth failing a delegation over. Every call degrades to "unknown"
 instead of propagating.
+
+WHY the stop side also RECLAIMS the child's workspace: a finished child's
+tree is dead weight on disk, and there is no reason to keep it for two
+weeks. The reclamation happens on the SAME background thread as the report,
+right AFTER the report row is written - the report describes the tree at
+stop time, the reclamation then snapshots that dirty tree into a commit and
+removes it. The setting ``child_immediate_reclaim`` turns the reclamation
+off without turning the reporting off.
 """
 
 from __future__ import annotations
@@ -180,6 +188,79 @@ def _dirty_state(workspace: Path) -> str:
     return STATE_UNKNOWN
 
 
+def _reclaim_child_workspace(
+    db_file: str,
+    workspace: dict[str, str],
+) -> dict[str, Any]:
+    """Reclaim the child's workspace right now, on this thread.
+
+    WHY this is HERE and not in the host's hook: the reclamation is a
+    subprocess (``jj workspace remove``), and the host runs ``subagent_stop``
+    on the CALLER's thread - the parent's own thread. Doing it there would
+    block the parent's thread pool and every delegation queued behind it.
+    So it happens on the SAME background thread that writes the report.
+
+    WHY the report is written FIRST: the report says whether the tree was
+    dirty or clean AT STOP TIME. The reclamation then snapshots that dirty
+    tree into a commit and removes it. If the order were reversed, the
+    report would describe a tree that no longer exists - and it would say
+    "clean" about a tree whose work is sitting in a snapshot commit. The
+    order is the whole point: the report is a description of the child's
+    end state, the reclamation is what happens to the tree afterwards.
+
+    WHY the kill-switch: an operator who does not trust the snapshot path
+    must be able to turn the reclamation off WITHOUT losing the reporting.
+    The reporting is what tells a human what happened; the reclamation is
+    what acts on it. With the switch off, the tree stays and the age-based
+    sweep (or ``hermes ws reclaim``) takes it later.
+
+    WHY the database is PINNED for the duration: the reclamation reads the
+    workspace record and writes the reclaim row, and it must do that in
+    the SAME database the report went into. Without the pin this thread
+    would resolve ``db_path()`` on its own and could write into a
+    different database than the one its caller named - the exact leak the
+    pinned-path report write exists to prevent.
+
+    Never raises: a failed reclamation must not cost the parent its report.
+    """
+    path = str(workspace.get("path") or "")
+    if not path:
+        # No workspace means nothing to reclaim. The report already says
+        # "no workspace", and there is nothing to act on.
+        return {"ok": False, "reason": "no_workspace", "detail": "the child has no workspace"}
+    try:
+        enabled = bool(store.settings().get("child_immediate_reclaim", True))
+    except Exception:
+        # A broken settings read must not silently DISABLE the
+        # reclamation - the default is ON, and a configuration error must
+        # not change what happens to a child's tree.
+        logger.warning(
+            "child report: could not read the reclamation setting; reclaiming anyway",
+            exc_info=True,
+        )
+        enabled = True
+    if not enabled:
+        # The operator turned it off: report only, the tree stays.
+        return {
+            "ok": False,
+            "reason": "disabled",
+            "detail": "settings.child_immediate_reclaim is false - report only",
+        }
+    try:
+        with store.db.pinned_path(db_file):
+            return store.reclaim_child_workspace(path)
+    except Exception:
+        # The report is already written and delivered; a reclamation that
+        # blew up (jj missing, the tree locked, the store unhappy) must
+        # not turn the child's end into a failure the parent sees. The
+        # tree stays, and the age-based sweep picks it up later.
+        logger.warning(
+            "child report: could not reclaim %s; the tree stays for the sweep", path,
+            exc_info=True,
+        )
+        return {"ok": False, "reason": "reclaim_failed", "detail": str(path)}
+
+
 def _write_report(
     db_file: str,
     parent_session_id: str,
@@ -199,6 +280,11 @@ def _write_report(
     so the thread would land in the LIVE database. That is not theoretical:
     it is exactly how a row once ended up in the live database. The caller
     captures the path while its environment still says what it means.
+
+    WHY the reclamation happens HERE, after the row is written: see
+    :func:`_reclaim_child_workspace`. Report first, reclaim second - the
+    report describes the tree at stop time, the reclamation then snapshots
+    and removes it.
     """
     path = str(workspace.get("path") or "")
     dirty_state = STATE_UNKNOWN
@@ -222,6 +308,9 @@ def _write_report(
         )
     except Exception:
         logger.warning("child report: could not write the report row", exc_info=True)
+
+    # The report is written; NOW the tree can go.
+    _reclaim_child_workspace(db_file, workspace)
 
 
 def record_child_stop(
