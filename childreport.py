@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -188,6 +189,76 @@ def _dirty_state(workspace: Path) -> str:
     return STATE_UNKNOWN
 
 
+def _mark_child_session_ended(db_file: str, child_session_id: str) -> bool:
+    """Stamp the child's binding as ENDED. True when a stamp was written.
+
+    WHY this exists HERE, and why it has to exist at all: a session with
+    NO ``session_ended_at`` is LIVE as far as ``jjlayout.live_session_paths``
+    is concerned, and guard (c) of ``store.reclaim_child_workspace`` refuses
+    to remove the workspace of a live session. The child's binding row was
+    created by ``childspace`` with no end stamp, and nothing in the stop
+    flow ever wrote one - so EVERY freshly-stopped child looked live, the
+    reclamation was refused as ``live_session_pinned``, and the
+    never-raising report thread swallowed the refusal. The tree stayed on
+    disk forever and the parent never learned that the reclamation had
+    failed. That is the live bug this stamps out.
+
+    WHY the stamp belongs to ``subagent_stop``: the child IS finished by
+    contract at this point - the stop hook is the host's own signal that
+    the delegation is over. A session that has been stopped is not using
+    its tree any more, so saying so in the row is not a guess, it is the
+    truth the row was missing.
+
+    WHY the stamp comes BEFORE the reclamation: the guard reads the row.
+    A stamp written after the reclaim would be too late - the reclaim has
+    already been refused.
+
+    WHY ``db_file`` is a PARAMETER: the stamp must land in the SAME
+    database the report went into and the reclaim reads from. A thread
+    that resolved the path on its own could write the stamp into a
+    different database - and then the guard would still see the child as
+    live, and the stamp would leak into the live install. See
+    :func:`store.db.pinned_path`.
+
+    Guard hygiene - the stamp is only written when it is both MEANINGFUL
+    and NEEDED:
+
+    * the session must have a binding row (no row, nothing to stamp - the
+      plugin may have been enabled mid-child);
+    * the row must not ALREADY carry an end stamp. The first end wins: a
+      later stop (a re-dispatch of the same session id) must not rewrite
+      the stamp, because the first one is the truth about when the session
+      actually ended.
+
+    Never raises: a failure to stamp costs the reclamation, not the report.
+    """
+    try:
+        sid = str(child_session_id or "")
+        if not sid:
+            return False
+        with store.db.pinned_path(db_file):
+            state = store.read_state(sid)
+            if not state:
+                # No binding row: the plugin was enabled mid-child, or the
+                # row was never written. There is nothing to stamp.
+                return False
+            if state.get("session_ended_at"):
+                # The first end wins - never rewrite the stamp.
+                return False
+            state["session_ended_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+            store.write_state(sid, state)
+        return True
+    except Exception:
+        # The report is already written and delivered. A broken stamp must
+        # not turn the child's end into a failure the parent sees - it only
+        # means the reclamation may be refused as in-use, and the tree
+        # stays for the age-based sweep.
+        logger.warning(
+            "child report: could not mark the child session ended", exc_info=True
+        )
+        return False
+
+
 def _reclaim_child_workspace(
     db_file: str,
     workspace: dict[str, str],
@@ -310,6 +381,15 @@ def _write_report(
         logger.warning("child report: could not write the report row", exc_info=True)
 
     # The report is written; NOW the tree can go.
+    #
+    # WHY the child's session is marked ENDED first: the reclamation's
+    # in-use guard reads the bindings table, and a session with no
+    # ``session_ended_at`` counts as LIVE. The child's binding never
+    # carried one, so without this stamp the guard refused EVERY freshly
+    # stopped child as ``live_session_pinned`` and the reclamation silently
+    # never fired - the live bug. The child is finished by contract at
+    # ``subagent_stop``, so the row says so before the guard runs.
+    _mark_child_session_ended(db_file, child_session_id)
     _reclaim_child_workspace(db_file, workspace)
 
 

@@ -113,6 +113,14 @@ A reclamation that is **refused** (a live session is still pinned to the tree,
 or the tree is not a child at all) costs the reclamation, not the report: the
 parent still hears what happened, and the tree is left alone.
 
+**The child's binding is marked ended at the stop.** A session with no
+`session_ended_at` counts as *live*, and the in-use guard refuses to remove
+a live session's tree — so `subagent_stop` stamps the child's binding row as
+ended (the child is finished by contract at that point) before the
+reclamation runs. That stamp is what unlocks the immediate reclamation: without
+it every freshly-stopped child looks live, the reclaim is refused as in-use,
+and the tree silently stays on disk.
+
 **The kill-switch.** Set `child_immediate_reclaim: false` and the stop hook
 reports but does **not** reclaim — the tree stays and the age-based sweep (or
 `hermes ws reclaim`) takes it later. The switch exists for an operator who
