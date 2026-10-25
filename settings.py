@@ -56,6 +56,7 @@ SETTINGS_KEYS: tuple[str, ...] = (
     "prepare_command",
     "prepare_files",
     "prepare_timeout_seconds",
+    "child_immediate_reclaim",
 )
 
 # Keys whose schema entry is a SECRET: they live in .env, never in config.yaml.
@@ -102,6 +103,21 @@ DEFAULTS: dict[str, Any] = {
     "prepare_files": [".env"],
     # Hard ceiling on the prepare command.
     "prepare_timeout_seconds": 300,
+    # Reclaim a child's workspace the moment the child stops.
+    #
+    # WHY the default is True: a finished child's tree is dead weight on
+    # disk, and the reclamation preserves the work (jj snapshots the dirty
+    # working copy into a commit and the plugin records the commit id). The
+    # alternative - leaving the tree until the 14-day sweep - means every
+    # finished child occupies disk for two weeks.
+    #
+    # WHY the switch exists at all: an operator who does not trust the
+    # snapshot path (an unusual jj build, a repo where the snapshot lands
+    # somewhere unexpected) must be able to turn the reclamation OFF
+    # without losing the REPORTING. The reporting is the part that tells
+    # a human what happened; the reclamation is the part that acts on it.
+    # Turning this off leaves every other behaviour intact.
+    "child_immediate_reclaim": True,
     # The verification command: run in the CHILD's workspace to find out
 }
 
@@ -328,7 +344,17 @@ def _validate(values: dict[str, Any]) -> dict[str, Any]:
     if not 1 <= timeout <= 3600:
         raise SettingsError(
             "hermes-treeps settings.prepare_timeout_seconds: must be between 1 and 3600, "
-            f"got {timeout}"
+            f"got {timeout!r}"
+        )
+
+    # ── the immediate child reclamation kill-switch ─────────────────────
+    # WHY it is validated as a bool and not coerced: a config value of
+    # "false" (the STRING) is truthy in Python, so coercing it would turn
+    # the kill-switch the other way round - an operator who typed
+    # ``child_immediate_reclaim: "false"`` would get the reclamation ON.
+    if not isinstance(out.get("child_immediate_reclaim"), bool):
+        raise SettingsError(
+            "hermes-treeps settings.child_immediate_reclaim: must be true or false"
         )
 
     return out

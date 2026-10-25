@@ -995,6 +995,13 @@ def _on_subagent_stop(**kw: Any) -> None:
     ``subagent_start`` never fired for it and there is no mapping row. The
     child's own binding still names its workspace, and the stop payload still
     names the parent - so the report is still possible.
+
+    WHY the child's workspace is RECLAIMED from here: the child is done by
+    contract, so its tree is dead weight, and the reclamation preserves the
+    work (jj snapshots the dirty working copy into a commit). It happens on
+    the report thread, after the report row is written, so the report still
+    describes the tree as it was at stop time. The setting
+    ``child_immediate_reclaim`` turns it off; the reporting is unaffected.
     """
     try:
         parent_sid = str(kw.get("parent_session_id") or "")
