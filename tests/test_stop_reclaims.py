@@ -279,21 +279,96 @@ def test_the_kill_switch_keeps_the_report_and_leaves_the_tree(
     )
 
 
-# ── (c) a refusal does not break the report flow ────────────────────────────
+# ── (c) the stop flow stamps ended and then RECLAIMS ────────────────────────
+#
+# WHY this section says what it says: the stop flow CANNOT refuse. The
+# end stamp is written BEFORE the reclamation, so by the time the in-use
+# guard runs the child's session is no longer live. A test that asserted
+# "the stop flow refuses a live tree" was asserting a branch the stop
+# flow cannot reach - it passed only because of a timing race (the
+# reclamation read the binding before the stamp landed). The real contract
+# is: the stop flow stamps ended and then reclaims. The refusal branch is
+# covered where it IS reachable: the manual reclaim path (the CLI).
 
 
 @needs_workspace_remove
-def test_a_refused_reclamation_still_leaves_the_report(child_workspace, monkeypatch):
-    """A refusal (the tree is in use) costs the reclamation, not the report.
+def test_the_stop_flow_reclaims_a_tree_whose_session_was_live(child_workspace):
+    """The stop flow stamps ended and then reclaims - it does not refuse.
 
-    Prevents: the parent's next turn learning NOTHING because the
-    reclamation was refused - the refusal is a fact about the tree, and the
-    report is how the parent learns it.
+    Prevents: the wrong contract being pinned by a test. The stop flow
+    writes the end stamp first, so the tree IS reclaimed even though the
+    child's session was live (no ``session_ended_at``) a moment earlier.
+    The reclamation is a SUCCESS, the reclaim row exists, and the tree is
+    gone.
+
+    WHY this test exists at all: the old test in this slot asserted the
+    opposite - that the reclamation would be refused because the session
+    was live. That assertion was unreachable: the stamp is written before
+    the reclamation, so the guard never saw a live session. The old test
+    passed only while the reclamation happened to win the race against the
+    stamp; add a sleep and it failed. A test that pins a race is not a
+    test, it is a coin flip.
     """
     child = child_workspace["child"]
     (child / "work.txt").write_text("work\n")
-    # The child's session is LIVE again: it is pinned to the tree, so the
-    # reclamation refuses it.
+    # The child's session is LIVE: no session_ended_at. The stop flow
+    # stamps it ended and reclaims anyway - that is the contract.
+    #
+    # WHY the state is written here and not left to the fixture: the
+    # fixture ships an ALREADY-ENDED child (its own comment says the
+    # reclamation is allowed to touch it). This test is about the
+    # transition - a LIVE child that the stop flow stamps and then
+    # reclaims - so the live state has to be set up explicitly.
+    STORE.write_state(
+        CHILD,
+        {
+            "mode": "repo",
+            "repo": "repo",
+            "slug": child.name,
+            "path": str(child),
+        },
+    )
+    state = STORE.read_state(CHILD) or {}
+    assert not state.get("session_ended_at"), state
+
+    _stop()
+
+    rows = _wait_for_report()
+    assert len(rows) == 1, "the report did not land"
+    assert rows[0]["child_status"] == "completed", rows[0]
+    reclaim = _wait_for_reclaim(child.name)
+    assert reclaim is not None, "the reclamation did not run"
+    assert not child.exists(), "the tree should be gone after the reclamation"
+    # And the end stamp landed - that is what unlocked the reclamation.
+    stamped = STORE.read_state(CHILD) or {}
+    assert stamped.get("session_ended_at"), stamped
+
+
+def test_an_interrupted_child_keeps_its_tree(child_workspace, monkeypatch):
+    """A child that did NOT finish cleanly keeps its tree.
+
+    Prevents: the immediate reclamation running for a child that was cut
+    short. An ``interrupted`` child may still have a tool call in flight,
+    and its tree may hold the state that call was about to write.
+    Reclaiming it removes the tree the in-flight call is writing into -
+    the very loss the live-session guard exists to prevent, reached by
+    stamping the session ended first.
+
+    The end stamp is still written (the child IS over), and the report
+    still lands - only the tree stays, for the age-based sweep.
+
+    WHY the reclamation is STUBBED: on a jj older than 0.46 the removal
+    command does not exist, so the real reclamation fails and the tree
+    stays for that reason - the test would pass on the buggy code for
+    the wrong reason. The stub makes the reclamation ALWAYS succeed, so
+    the tree staying can only mean the reclamation was never called.
+    """
+    child = child_workspace["child"]
+    (child / "work.txt").write_text("work\n")
+
+    # The fixture ships an ALREADY-ENDED child. This test is about the
+    # interrupted path, so the live state is set up explicitly - the end
+    # stamp at the end has to be the one the stop flow wrote.
     STORE.write_state(
         CHILD,
         {
@@ -304,13 +379,37 @@ def test_a_refused_reclamation_still_leaves_the_report(child_workspace, monkeypa
         },
     )
 
-    _stop()
+    calls: list[str] = []
+
+    def _recording_reclaim(path, **kwargs):
+        calls.append(str(path))
+        return {"ok": True, "slug": child.name, "path": str(path), "detail": "reclaimed"}
+
+    monkeypatch.setattr(STORE, "reclaim_child_workspace", _recording_reclaim)
+
+    PLUGIN._on_subagent_stop(
+        parent_session_id=PARENT, child_session_id=CHILD, child_status="interrupted"
+    )
 
     rows = _wait_for_report()
-    assert len(rows) == 1, "the refusal swallowed the report"
-    assert rows[0]["child_status"] == "completed", rows[0]
-    assert child.exists(), "a live tree must survive the refusal"
-    assert STORE.db.read_child_reclaim_by_slug(child.name) is None
+    assert len(rows) == 1, "the report did not land"
+    assert rows[0]["child_status"] == "interrupted", rows[0]
+    # The tree stays: nothing reclaimed it.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if calls:
+            break
+        time.sleep(0.05)
+    assert not calls, (
+        f"the tree of an interrupted child was reclaimed: {calls}"
+    )
+    assert child.exists(), "an interrupted child's tree must not be reclaimed"
+    assert STORE.db.read_child_reclaim_by_slug(child.name) is None, (
+        "the tree of an interrupted child was reclaimed"
+    )
+    # The end stamp IS written: the child is over, only the tree stays.
+    stamped = STORE.read_state(CHILD) or {}
+    assert stamped.get("session_ended_at"), stamped
 
 
 def test_a_broken_reclamation_never_breaks_the_report(child_workspace, monkeypatch):

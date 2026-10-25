@@ -907,6 +907,21 @@ def set_kv(key: str, value: str) -> None:
         _write_kv(conn, key, value)
 
 
+def get_kv_in(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    """The kv value, read on an EXISTING connection.
+
+    WHY this exists: a read-then-write pair must be atomic, and the
+    read has to happen on the SAME connection (and inside the same
+    transaction) as the write. Reading through :func:`get_kv` opens its
+    own connection, so the value it returned could already be stale by
+    the time the write landed.
+    """
+    row = conn.execute("SELECT value FROM kv WHERE key=?", (key,)).fetchone()
+    if row is None:
+        return default
+    return str(row[0])
+
+
 def _write_kv(conn: sqlite3.Connection, key: str, value: str) -> None:
     """The kv upsert, on a given connection.
 

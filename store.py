@@ -810,6 +810,24 @@ def record_child_heartbeat(session_id: str, *, now: float | None = None) -> bool
     heartbeat only needs minute-level resolution for a 24-hour staleness
     threshold.
 
+    WHY the read happens UNDER the write lock: the read-then-write pair is
+    only atomic if nothing else writes the same key in between. Two
+    threads heartbeating for the same child (a re-dispatch, or a parent
+    and a child sharing an id) could both read the old stamp, both decide
+    the interval has passed, and both write - the rate limit would then be
+    bypassed.
+
+    WHY the clock-step guard: the stamp is a WALL-CLOCK time, and wall
+    clocks step backwards (NTP correction, a manual change, a resume from
+    a suspended VM). A backwards step made ``stamp - previous`` NEGATIVE,
+    and a negative difference is below the one-minute interval, so EVERY
+    subsequent heartbeat was rate-limited away: the child's heartbeat
+    froze at the pre-step value and the child looked stale to the sweep
+    while it was very much alive. The comparison therefore uses
+    ``abs()``: a backwards step is treated as "the interval passed" and
+    the new (lower) stamp is written, so the heartbeat recovers at once
+    instead of freezing for 24 hours.
+
     WHY this must never raise: the heartbeat is liveness evidence, not a
     gate. A broken database write must not block the child's tool call or
     turn a bookkeeping failure into a workspace-access failure.
@@ -819,14 +837,21 @@ def record_child_heartbeat(session_id: str, *, now: float | None = None) -> bool
     stamp = time.time() if now is None else float(now)
     key = child_heartbeat_key(session_id)
     try:
-        previous = db.get_kv(key)
-        if previous:
-            try:
-                if stamp - float(previous) < CHILD_HEARTBEAT_MIN_INTERVAL_S:
-                    return False
-            except (TypeError, ValueError):
-                pass
-        db.set_kv(key, f"{stamp:.6f}")
+        with db.transaction() as conn:
+            # WHY the read is on THIS connection: the read-then-write pair
+            # is only atomic if the read sees the same database state the
+            # write will land on. ``db.get_kv()`` opens its own
+            # connection, so its answer could already be stale.
+            previous = db.get_kv_in(conn, key)
+            if previous:
+                try:
+                    # WHY abs(): a backwards clock step must not freeze the
+                    # heartbeat for the next 24 hours (see the docstring).
+                    if abs(stamp - float(previous)) < CHILD_HEARTBEAT_MIN_INTERVAL_S:
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            db._write_kv(conn, key, f"{stamp:.6f}")
         return True
     except Exception as exc:
         # A failed heartbeat must not gate-block the child: liveness evidence
@@ -1155,7 +1180,14 @@ def reclaim_child_workspace(
             "repo": str,
             "snapshot_commit_id": str,   # "" when there was nothing to snapshot
             "was_dirty": bool,
-            "reason": str,              # "" on success, else the refusal reason
+            "reason": str,              # "" on a plain success; else the refusal
+                                        # reason, or a non-fatal outcome label
+                                        # (e.g. "skipped_git_worktree", or
+                                        # "no_workspace_record" on an
+                                        # already-gone workspace) - a SUCCESS
+                                        # can carry a reason, so callers must
+                                        # not read "reason is set" as
+                                        # "the reclamation failed"
             "detail": str,              # human-readable explanation
             "already_gone": bool,       # idempotent no-op
             "dry_run": bool,
@@ -1559,7 +1591,15 @@ def reclaim_children(
             skipped.append({"slug": slug, "reason": "no_path", "detail": "the workspace record names no path"})
             continue
         result = reclaim_child_workspace(path, snapshot=snapshot, dry_run=dry_run)
-        if result.get("ok"):
+        # WHY the bucket is decided by ok AND reason, and not by ok alone:
+        # a SKIPPED git worktree is reported with ``ok=True`` (the call
+        # did what it was asked to do - it left the tree alone) and
+        # ``reason="skipped_git_worktree"``. Bucketing on ``ok`` alone put
+        # it under "reclaimed": the summary then claimed a tree was
+        # reclaimed when it is still on disk, with its work untouched. A
+        # skip is a skip, whatever the call's own ok flag says.
+        skipped_reason = str(result.get("reason") or "")
+        if result.get("ok") and not skipped_reason:
             reclaimed.append(
                 {
                     "slug": result.get("slug") or slug,
@@ -1575,7 +1615,7 @@ def reclaim_children(
             skipped.append(
                 {
                     "slug": result.get("slug") or slug,
-                    "reason": result.get("reason") or "refused",
+                    "reason": skipped_reason or "refused",
                     "detail": result.get("detail") or "",
                     "path": result.get("path") or path,
                 }
@@ -1777,7 +1817,19 @@ def gc_apply() -> list[str]:
         try:
             done.append(retire(item["slug"], allow_unpushed=False))
         except WorkspaceError as e:
+            # A REFUSAL: the guard said no. Log it and move on.
             logger.warning("gc skipped %s: %s", item["slug"], e)
+        except Exception as e:
+            # A BROKEN retirement: a sqlite error in the row deletion, an
+            # OSError writing the archive, anything that is not a refusal.
+            #
+            # WHY this is caught and not allowed to escape: this loop is
+            # the sweep. An exception here ended the sweep on the FIRST
+            # bad workspace, and every workspace after it was never
+            # retired - so the sweep silently did less and less over
+            # time, and the stale trees it exists to remove stayed. One
+            # broken workspace must not stop the other retirements.
+            logger.warning("gc could not retire %s: %s", item["slug"], e)
     return done
 
 

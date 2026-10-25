@@ -69,6 +69,12 @@ STATE_CLEAN = "clean"
 STATE_DIRTY = "dirty"
 STATE_UNKNOWN = "state-unknown"
 
+#: The one child status that authoritatively means "the child ran to its
+#: end". Every other status (``interrupted``, ``failed``, ``error``, or an
+#: empty status) means the child was cut short, and its tree is kept for the
+#: age-based sweep instead of being reclaimed on the spot.
+CHILD_STATUS_COMPLETED = "completed"
+
 
 # ── the start side ───────────────────────────────────────────────────────────
 
@@ -389,8 +395,34 @@ def _write_report(
     # stopped child as ``live_session_pinned`` and the reclamation silently
     # never fired - the live bug. The child is finished by contract at
     # ``subagent_stop``, so the row says so before the guard runs.
+    #
+    # WHY the stamp is NOT enough on its own: the stamp is what makes the
+    # reclamation POSSIBLE, but the reclamation is only SAFE when the child
+    # really is finished. A stop event carries a ``child_status``:
+    # ``completed`` is the authoritative terminal state (the child ran to
+    # its end and the host says so). ``interrupted``, ``failed`` and
+    # ``error`` mean the child was cut short - a tool call may still be in
+    # flight, and the tree may hold the state that call was about to
+    # write. Reclaiming such a tree DEFEATS the very guard the stamp
+    # exists to satisfy: the stamp says "ended", the reclamation then
+    # removes the tree, and the live-session guard never gets a chance to
+    # refuse. So the immediate reclamation is restricted to
+    # ``child_status == "completed"``; every other status keeps its tree
+    # and the age-based sweep (or an explicit ``hermes ws reclaim``) takes
+    # it later.
     _mark_child_session_ended(db_file, child_session_id)
-    _reclaim_child_workspace(db_file, workspace)
+    if child_status == CHILD_STATUS_COMPLETED:
+        _reclaim_child_workspace(db_file, workspace)
+    else:
+        # Not a clean finish: the tree stays. The report still lands, and
+        # the end stamp still says the child is over - so the age-based
+        # sweep (heartbeat stale AND workspace old) can take the tree
+        # once it is provably abandoned.
+        logger.debug(
+            "child report: child %s ended with status %r - the tree stays for the sweep",
+            child_session_id,
+            child_status,
+        )
 
 
 def record_child_stop(

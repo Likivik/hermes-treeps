@@ -419,9 +419,10 @@ def settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if "repo_roots" in explicit:
         deprecation_hint(
             "repo_roots",
-            "settings.repo_roots is deprecated; repo discovery now follows "
-            f"settings.repo_dir ({values['repo_dir']!r}). The list is still "
-            "read for this release, but set repo_dir instead.",
+            "settings.repo_roots is deprecated; repo discovery still follows "
+            f"settings.repo_roots ({values['repo_roots']!r}). repo_dir only "
+            "decides where workspaces live. The list is still read for this "
+            "release, but set repo_dir instead.",
         )
 
     return _validate(values)

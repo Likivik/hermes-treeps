@@ -163,8 +163,12 @@ def migrate_workspaces(dry_run: bool = False) -> dict[str, Any]:
 
     roots = legacy_roots()
     new_base = store.workspaces_base()
-    in_use = _live_session_paths()
-
+    # WHY the live-session set is NOT snapshotted here: the migration loop
+    # can run for minutes (a dirty-tree check is a subprocess per
+    # workspace). A session that binds to one of the trees WHILE the loop
+    # runs is not in a snapshot taken before it started, so its tree would
+    # be renamed away underneath it. The authoritative check is done again
+    # at rename time, immediately before the move.
     for record in db.all_workspaces():
         old_path = str(record.get("path") or "")
         if not old_path:
@@ -201,7 +205,14 @@ def migrate_workspaces(dry_run: bool = False) -> dict[str, Any]:
             continue
 
         # (b) a workspace a live session is using is never moved
-        if os.path.normpath(str(old)) in in_use:
+        #
+        # WHY the check is repeated immediately before the rename: the
+        # dirty-tree check above is a subprocess and can take seconds, and
+        # the whole loop runs over every workspace. A session that binds to
+        # this tree AFTER the first pass would have its tree renamed away
+        # underneath it. The live-session set is re-read here, at the last
+        # possible moment before the tree moves.
+        if os.path.normpath(str(old)) in _live_session_paths():
             report["in_use"].append(
                 {"path": str(old), "reason": "bound to or pinned by a live session"}
             )

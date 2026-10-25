@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from plugin_loader import PLUGIN
+from plugin_loader import PLUGIN, STORE
 
 PREPARE = importlib.import_module("hermes_treeps.prepare")
 
@@ -34,10 +34,17 @@ def _settings(**over):
 
 
 @pytest.fixture()
-def repo(tmp_path: Path) -> Path:
+def repo(tmp_path: Path, monkeypatch) -> Path:
     r = tmp_path / "repo"
     r.mkdir()
     (r / ".env").write_text("TOKEN=secret\n")
+    # The plugin's repo dir is the boundary the prepare guard checks: a
+    # workspace outside it is not the plugin's workspace. Point it at the
+    # tmp root so the fixture's geometry is inside the boundary - the
+    # real layout is ``<repo_dir>/<repo>`` for the checkout and
+    # ``<repo_dir>/.workspaces/<repo>/<slug>`` for the workspace, both
+    # under the same repo dir.
+    monkeypatch.setattr(STORE, "repo_dir", lambda: tmp_path)
     return r
 
 
@@ -236,7 +243,7 @@ def test_a_file_git_does_not_ignore_is_never_copied(repo, workspace):
     assert any("not gitignored" in s for s in out["skipped"]), out
 
 
-def test_prepare_copies_into_a_jj_workspace(tmp_path):
+def test_prepare_copies_into_a_jj_workspace(tmp_path, monkeypatch):
     """prepare must resolve ignore rules through the colocated repo's .git.
 
     Prevents the P1 the second audit found: a jj workspace has no .git, so
@@ -245,6 +252,8 @@ def test_prepare_copies_into_a_jj_workspace(tmp_path):
     """
     repo = tmp_path / "repo"
     repo.mkdir()
+    # The plugin's repo dir is the boundary the prepare guard checks.
+    monkeypatch.setattr(STORE, "repo_dir", lambda: tmp_path)
     # .gitignore BEFORE init: the workspace's checkout is a snapshot of @, so
     # the ignore rule has to be in the initial working-copy commit.
     (repo / ".gitignore").write_text(".env\n")

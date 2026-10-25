@@ -265,9 +265,36 @@ def run_prepare(
 
         resolved_repo = repo_root.resolve()
         resolved_ws = workspace.resolve()
-        if not _within(resolved_ws, resolved_ws):
+        # WHY the guard is not a self-comparison: ``_within(resolved_ws,
+        # resolved_ws)`` is always True, so the guard could never fire and
+        # a workspace from a DIFFERENT repo dir was prepared as if it
+        # belonged to this one - with this repo's ``.env`` copied into it
+        # and this repo's prepare command run in it.
+        #
+        # WHY the boundary is the REPO DIR and not the repo root: a
+        # workspace is a SIBLING of its repo, not a child of it. The
+        # layout is ``<repo_dir>/<repo>`` for the checkout and
+        # ``<repo_dir>/.workspaces/<repo>/<slug>`` for the workspace, so
+        # comparing the workspace against the repo root would refuse
+        # every legitimate workspace. The repo dir is the boundary the
+        # plugin owns: everything the plugin creates lives under it, and
+        # a workspace outside it is not this plugin's workspace.
+        #
+        # The repo dir is resolved through the plugin's own settings, and
+        # a settings failure falls back to the repo's own parent - so the
+        # guard is always decidable, and never silently off.
+        try:
+            from . import store as _store
+
+            resolved_root = _store.repo_dir().resolve()
+        except Exception:
+            resolved_root = resolved_repo.parent
+        if not _within(resolved_ws, resolved_root):
             result["ok"] = False
-            result["error"] = f"the workspace path {workspace} does not resolve to a directory"
+            result["error"] = (
+                f"the workspace path {workspace} is outside the plugin's repo dir "
+                f"{resolved_root}"
+            )
             return _finish()
 
         copied, skipped, errors = _copy_files(resolved_repo, resolved_ws, files)
