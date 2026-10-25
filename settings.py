@@ -75,8 +75,10 @@ DEFAULTS: dict[str, Any] = {
     # not break the plugin, and a one-time hint names repo_dir as the
     # replacement - but the value below is only the pre-dot-dir default.
     "workspace_root": "/Git/hermes/workspaces",
-    # DEPRECATED: repo discovery reads repo_roots; the dot-dir layout does
-    # not change discovery in this release. A one-time hint names repo_dir.
+    # DEPRECATED: repo discovery no longer reads repo_roots - it walks
+    # repo_dir and nothing else. The key is still PARSED (an old config
+    # must not crash the plugin) and still validated, and a one-time hint
+    # names repo_dir.
     # WHY no operator-specific path in this list: a default that names one
     # person's home directory ships that person's identity to every install
     # that never overrides it. The generic roots are enough - a host that
@@ -419,10 +421,11 @@ def settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if "repo_roots" in explicit:
         deprecation_hint(
             "repo_roots",
-            "settings.repo_roots is deprecated; repo discovery still follows "
-            f"settings.repo_roots ({values['repo_roots']!r}). repo_dir only "
-            "decides where workspaces live. The list is still read for this "
-            "release, but set repo_dir instead.",
+            "settings.repo_roots is deprecated and IGNORED: repo discovery now "
+            f"follows settings.repo_dir ({values['repo_dir']!r}), not "
+            f"settings.repo_roots ({values['repo_roots']!r}). Move the repos you "
+            "want listed under repo_dir, or point repo_dir at the directory that "
+            "already holds them.",
         )
 
     return _validate(values)

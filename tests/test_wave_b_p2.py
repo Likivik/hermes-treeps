@@ -503,13 +503,20 @@ def test_the_injected_prompt_does_not_say_the_title_names_the_workspace():
 def test_the_repo_roots_deprecation_hint_does_not_claim_discovery_follows_repo_dir(
     tmp_path, monkeypatch,
 ):
-    """The hint says discovery follows ``repo_roots``, not ``repo_dir``.
+    """The hint says discovery follows ``repo_dir``, not ``repo_roots``.
 
     Prevents: an operator following the hint into a broken setup. The
-    hint claimed "repo discovery now follows settings.repo_dir", which is
-    false: ``repo_dir`` decides where workspaces LIVE, and discovery
-    still walks ``repo_roots``. An operator who read the hint would set
-    ``repo_dir``, expect discovery to follow it, and find no repos.
+    hint used to claim "repo discovery still follows settings.repo_roots",
+    which is now false: discovery walks ``repo_dir`` and ignores
+    ``repo_roots`` entirely (the key is still PARSED, so an old config
+    does not crash the plugin, but nothing reads it). An operator who
+    read the old hint would put their repos under ``repo_roots``, expect
+    them to be listed, and find nothing.
+
+    WHY this test changed shape: the discovery change (issue #37) made
+    ``repo_dir`` the only root discovery walks, so the hint had to
+    change with it. A hint that lies in the other direction is just as
+    broken - hence the assertions on the new wording.
     """
     monkeypatch.setenv("HERMES_TREEPS_REPO_DIR", str(tmp_path / "repos"))
     hints: list[str] = []
@@ -528,8 +535,10 @@ def test_the_repo_roots_deprecation_hint_does_not_claim_discovery_follows_repo_d
 
     joined = " ".join(hints)
     assert joined, "no deprecation hint was raised for repo_roots"
-    assert "discovery still follows" in joined, joined
-    assert "repo_dir only" in joined, joined
+    assert "discovery now follows settings.repo_dir" in joined, joined
+    assert "IGNORED" in joined, joined
+    # The old wording claimed the opposite - it must be gone.
+    assert "discovery still follows" not in joined, joined
 
 
 # ── F12: a skipped git worktree is not reported as reclaimed ────────────────
