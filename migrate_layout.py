@@ -30,15 +30,12 @@ verification checks, and what a broken pointer must be caught by.
 
 from __future__ import annotations
 
-import logging
 import os
 import subprocess
 from pathlib import Path
 from typing import Any
 
 from . import db, store
-
-logger = logging.getLogger(__name__)
 
 # The old layout's default root. Kept as a constant because the migration
 # must recognise the OLD path even after the setting changed: the setting
