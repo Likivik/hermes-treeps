@@ -66,11 +66,42 @@ def _most_recent_chat() -> tuple[Any, Any] | None:
     return chats[key].get("coords")
 
 
-def _allowlist() -> list[int]:
-    """User ids allowed to tap the picker. Empty/unset means open (legacy)."""
+def _clone_root_label() -> str:
+    """Where a new repo is created, as text.
+
+    WHY this exists: the picker message used to hardcode "/Git", which is one
+    operator's layout and not the plugin's - on a host with a different
+    clone_root the message pointed at a directory that does not exist there.
+    """
     from . import settings as _settings
 
-    return list(_settings.settings()["allowed_user_ids"])
+    try:
+        return str(_settings.settings()["clone_root"])
+    except Exception:
+        return "the configured clone root"
+
+
+def _allowlist() -> list[int]:
+    """User ids allowed to tap the picker. Empty/unset means open (legacy).
+
+    SINGLE SOURCE OF TRUTH: the ids are read straight from the settings dict
+    here. The plugin used to have a second reader (``settings.allowed_user_ids``)
+    that did exactly this - two functions returning the same list is two
+    places to forget to update, and the settings module's copy was the one
+    nobody called.
+    """
+    from . import settings as _settings
+
+    raw = _settings.settings().get("allowed_user_ids") or []
+    out: list[int] = []
+    for value in raw:
+        try:
+            out.append(int(value))
+        except (TypeError, ValueError):
+            # A malformed id must not open the picker to everybody and must
+            # not crash the tap handler: skip it, the rest of the list stands.
+            logger.warning("allowed_user_ids: skipping a non-numeric entry %r", value)
+    return out
 
 
 def _tapper_allowed(user_id: Any) -> bool:
@@ -361,7 +392,7 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
             try:
                 await q.edit_message_text(
                     "Tell the agent the name for the new repo and it will create it "
-                    "under /Git and give this session a workspace in it."
+                    f"under {_clone_root_label()} and give this session a workspace in it."
                 )
             except Exception:
                 pass

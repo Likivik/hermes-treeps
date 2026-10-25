@@ -77,7 +77,11 @@ DEFAULTS: dict[str, Any] = {
     "workspace_root": "/Git/hermes/workspaces",
     # DEPRECATED: repo discovery reads repo_roots; the dot-dir layout does
     # not change discovery in this release. A one-time hint names repo_dir.
-    "repo_roots": ["/Git", "/Git/hermes", "/Git/likivik", "/Git/repos"],
+    # WHY no operator-specific path in this list: a default that names one
+    # person's home directory ships that person's identity to every install
+    # that never overrides it. The generic roots are enough - a host that
+    # needs more sets repo_roots in its own config.
+    "repo_roots": ["/Git", "/Git/hermes", "/Git/repos"],
     "clone_root": "/Git/hermes",
     "repo_sources": ["local", "github", "forgejo"],
     "vcs": "auto",
@@ -448,8 +452,3 @@ def forgejo_token() -> str:
     except Exception:
         logger.debug("agent.secret_scope is unavailable; falling back to the environment", exc_info=True)
     return os.environ.get(FORGEJO_TOKEN_ENV) or os.environ.get(FORGEJO_TOKEN_ENV_LEGACY, "")
-
-
-def allowed_user_ids(config: Mapping[str, Any] | None = None) -> list[int]:
-    """User ids allowed to tap the Telegram picker (empty = open)."""
-    return list(settings(config)["allowed_user_ids"])

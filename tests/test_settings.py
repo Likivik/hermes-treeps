@@ -37,7 +37,7 @@ def test_defaults_reproduce_the_original_constants():
     cfg = settings_module.settings()
     assert cfg["repo_dir"] == "/Git/hermes"
     assert cfg["workspace_root"] == "/Git/hermes/.workspaces"
-    assert cfg["repo_roots"] == ["/Git", "/Git/hermes", "/Git/likivik", "/Git/repos"]
+    assert cfg["repo_roots"] == ["/Git", "/Git/hermes", "/Git/repos"]
     assert cfg["clone_root"] == "/Git/hermes"
     assert cfg["repo_sources"] == ["local", "github", "forgejo"]
     assert cfg["vcs"] == "auto"
