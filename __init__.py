@@ -698,6 +698,16 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         sid = session_id or _session_id(kw)
         bound = store.resolve(sid)
         if bound:
+            # A resumed child keeps its workspace and keeps proving life: the
+            # heartbeat is written on EVERY gated call, not only on the first
+            # one, so a long-running child is never mistaken for an orphan.
+            try:
+                state = store.read_state(sid) or {}
+                if str(state.get("purpose") or "").startswith(store.CHILD_PURPOSE_PREFIX):
+                    store.record_child_heartbeat(sid)
+            except Exception:
+                # Broken heartbeat bookkeeping must not gate-block the child.
+                pass
             # Resumed after a gateway restart: the runtime pin is gone and
             # on_session_start does not re-fire for a resumed session, so the
             # shell silently falls back to the gateway directory. Re-arm the
@@ -754,6 +764,17 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 _pin_session_cwd(
                     str(made.get("path") or ""), sid=sid, task_id=str(kw.get("task_id") or "")
                 )
+                try:
+                    state = store.read_state(sid) or {}
+                    purpose = str(state.get("purpose") or "")
+                    if not purpose:
+                        record = store.read_record(Path(str(made.get("path") or ""))) or {}
+                        purpose = str(record.get("purpose") or "")
+                    if purpose.startswith(store.CHILD_PURPOSE_PREFIX):
+                        store.record_child_heartbeat(sid)
+                except Exception:
+                    # Broken heartbeat bookkeeping must not gate-block the child.
+                    pass
                 logger.info(
                     "gate: delegated child %s got its own workspace %s", sid, made.get("slug")
                 )
