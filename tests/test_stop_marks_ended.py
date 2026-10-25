@@ -32,12 +32,19 @@ What is asserted here:
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
 from plugin_loader import PLUGIN, STORE
+
+#: The plugin's own layout module. It is a SUBMODULE of the plugin package
+#: (the package directory is not a valid identifier, so it cannot be
+#: imported by name) - the loader registers it under this name.
+JJLAYOUT = sys.modules["hermes_treeps.jjlayout"]
 
 CHILD_PREFIX = STORE.CHILD_PURPOSE_PREFIX
 
@@ -185,6 +192,62 @@ def _stop(**kw):
 
 
 # ── (a) the end-to-end stop flow reclaims the tree ─────────────────────────
+
+
+def test_the_stop_frees_the_childs_tree_from_the_live_session_guard(
+    live_child_workspace,
+):
+    """After the stop, the child's tree is NO LONGER a live session's tree.
+
+    WHY this is the sharpest form of the live bug, and why it does not
+    need a recent jj: the bug was never about ``jj workspace remove``
+    working. It was that guard (c) of ``reclaim_child_workspace`` REFUSED
+    the tree, because ``jjlayout.live_session_paths()`` said the child was
+    still LIVE. The refusal is what kept the tree on disk, and the
+    never-raising report thread swallowed it.
+
+    So the thing that has to change is the guard's VERDICT, and the
+    verdict is observable without removing anything: before the stop the
+    child's tree is in ``live_session_paths()``, after the stop it is not.
+    That is the difference between "the reclamation fires" and "the
+    reclamation is refused", and it is the difference the live run felt.
+
+    WHY this test and not only the removal tests: the removal tests need
+    jj >= 0.46 for ``jj workspace remove``, so on an older jj they SKIP -
+    and that is exactly the environment in which the live bug shipped
+    unnoticed. The guard itself does not need a recent jj, so this test
+    runs everywhere and keeps the bug from returning behind a green
+    suite.
+    """
+    child = live_child_workspace["child"]
+    normalised = str(child.resolve()) if child.exists() else str(child)
+
+    # BEFORE the stop: the child's binding has no ``session_ended_at``, so
+    # the guard sees its tree as live. This is the live shape.
+    live_before = JJLAYOUT.live_session_paths(STORE.db)
+    assert any(
+        os.path.normpath(p) == os.path.normpath(normalised) for p in live_before
+    ), f"the fixture does not reproduce the live shape: {live_before}"
+
+    _stop()
+
+    deadline = time.time() + 15.0
+    live_after: set[str] = set()
+    while time.time() < deadline:
+        live_after = JJLAYOUT.live_session_paths(STORE.db)
+        if not any(
+            os.path.normpath(p) == os.path.normpath(normalised) for p in live_after
+        ):
+            break
+        time.sleep(0.01)
+
+    assert not any(
+        os.path.normpath(p) == os.path.normpath(normalised) for p in live_after
+    ), (
+        "the child's tree is STILL a live session's tree after the stop: "
+        "the in-use guard will refuse the reclamation, so the tree stays "
+        "on disk and the parent never learns that it failed"
+    )
 
 
 @needs_workspace_remove
