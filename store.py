@@ -572,16 +572,22 @@ def _source_repo(record: dict[str, Any], ws: Path) -> Path | None:
         return None
 
 
-def retire(slug: str, force: bool = False, ultraforce: bool = False) -> str:
+def retire(
+    slug: str, force: bool = False, ultraforce: bool = False, allow_unpushed: bool = False
+) -> str:
     """ultraforce: bypass even the hard blockers (open PRs, dirty tree).
 
     It still archives the record first - nothing about the *bookkeeping* is
     skipped, only the safety refusals. For "I know exactly what I am deleting".
+
+    ``allow_unpushed``: skip the pushed-state refusal. Only for CHILD
+    workspaces (gc_apply passes it): their commits survive retirement in the
+    shared store, so "not pushed" is not "lost".
     """
     ws = find_workspace(slug)
     record = read_record(ws) or {}
     if not ultraforce:
-        return _retire_checked(ws, slug, record, force)
+        return _retire_checked(ws, slug, record, force, allow_unpushed=allow_unpushed)
 
     prs, _gh_ok = open_prs(ws)
     live = [p for p in prs if p.get("state") == "OPEN"]
@@ -596,7 +602,8 @@ def retire(slug: str, force: bool = False, ultraforce: bool = False) -> str:
 
 
 def _retire_checked(
-    ws: Path, slug: str, record: dict[str, Any], force: bool, skip_hard: bool = False
+    ws: Path, slug: str, record: dict[str, Any], force: bool, skip_hard: bool = False,
+    allow_unpushed: bool = False,
 ) -> str:
     prs, gh_ok = open_prs(ws)
     mine = _workspace_branches(ws)
@@ -627,7 +634,7 @@ def _retire_checked(
     if not gh_ok:
         unknown.append("could not check open PRs (gh missing, unauthenticated or slow)")
     pushed = unpushed_commits(ws)
-    if pushed is True:
+    if pushed is True and not allow_unpushed:
         raise WorkspaceError(
             "refusing to retire: commits not pushed to the remote "
             "(push or repeat with --force to retire anyway)"
@@ -715,11 +722,14 @@ def session_for_chat(chat_id: Any, thread_id: Any = None) -> dict[str, Any] | No
 # ── gc ────────────────────────────────────────────────────────────────────────
 
 
-# A child workspace is throwaway by design: its commit is the handoff artifact,
-# so it is rarely pushed, and `gc` would otherwise keep every delegation's
-# checkout forever ("unpushed commits", tier2). After this many days it is
-# reclaimable once its session ended and its tree is clean.
-CHILD_TTL_DAYS = 7
+# A child workspace is throwaway by design. Retiring it does NOT lose committed
+# work: `jj workspace forget` / `git worktree remove` delete the working copy
+# and metadata, but the commits live in the SHARED repo store and the child's
+# branch bookmark keeps pointing at them. Only uncommitted changes are lost,
+# and the dirty check blocks those. So after this many days a clean, ended
+# child is reclaimable regardless of push state - a never-applied handoff
+# commit stays recoverable as a dangling commit until the repo's own gc.
+CHILD_TTL_DAYS = 14
 
 # Written into a workspace record's `purpose` by childspace when a delegated
 # child gets its own tree. One definition, imported by childspace, so gc and
@@ -771,15 +781,8 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
                 tiers["tier2"].append({**item, "why": "child workspace with uncommitted changes"})
                 continue
             age_days = _workspace_age_days(record, path)
-            if unpushed_commits(path):
-                # The agreed rule: a workspace whose commit is neither applied
-                # nor pushed is never deleted - a child's handoff commit is
-                # exactly that until the parent lands it. tier2 keeps it
-                # visible instead of silently skipping at retire time.
-                tiers["tier2"].append(
-                    {**item, "why": "child workspace, handoff commit not applied/pushed"}
-                )
-                continue
+            # NOTE: no pushed check here - see CHILD_TTL_DAYS above. A child's
+            # handoff commit survives retirement in the shared store.
             if age_days >= CHILD_TTL_DAYS:
                 tiers["tier1"].append(
                     {**item, "why": f"child workspace, clean, {age_days:.0f}d old"}
@@ -812,10 +815,31 @@ def gc_apply() -> list[str]:
     """Retire exactly the tier1 set, through the same guarded retire()."""
     done: list[str] = []
     for item in gc_tiers()["tier1"]:
+        record = item.get("record") or {}
+        is_child = str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX)
         try:
-            done.append(retire(item["slug"]))
+            done.append(retire(item["slug"], allow_unpushed=is_child))
         except WorkspaceError as e:
             logger.warning("gc skipped %s: %s", item["slug"], e)
+    return done
+
+
+def gc_children_apply() -> list[str]:
+    """Retire ONLY expired CHILD workspaces (tier1 with the child purpose).
+
+    Used by the plugin's daily housekeeping sweep. User workspaces are never
+    touched here: their tier1 rules require pushed commits and no open PRs,
+    and an automatic sweep must not decide those.
+    """
+    done: list[str] = []
+    for item in gc_tiers()["tier1"]:
+        record = item.get("record") or {}
+        if not str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX):
+            continue
+        try:
+            done.append(retire(item["slug"], allow_unpushed=True))
+        except WorkspaceError as e:
+            logger.warning("child gc skipped %s: %s", item["slug"], e)
     return done
 
 

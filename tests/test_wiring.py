@@ -72,3 +72,5 @@ def test_the_prompt_section_carries_the_delegation_contract(monkeypatch):
     text = registered.get("workspace-discipline", "")
     assert PLUGIN.contract.SECTION_TITLE in text, text[:200]
     assert "ws_new" in text
+
+
