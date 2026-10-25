@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 PLUGIN_NAME = "hermes-treeps"
 DB_FILENAME = "data.db"
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # One lock for every multi-statement write. It is NEVER held across a
 # subprocess call: those can take seconds, and a lock held that long would
@@ -181,6 +181,133 @@ CREATE TABLE IF NOT EXISTS child_reports (
     created_at       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
+
+-- ── child reclamation (v4) ───────────────────────────────────────────────────
+--
+-- WHY this table exists: when a delegated child's workspace is reclaimed
+-- IMMEDIATELY (the child finished, so its tree is free), the work is not
+-- thrown away - `jj workspace remove` snapshots the working copy into a
+-- commit in the SHARED store, and that commit id is recorded HERE. This
+-- table IS the index: jj never auto-gcs, so the commit stays reachable
+-- through this row until a manual `jj gc --expire` evicts it.
+--
+-- WHY a table and not a column on `workspaces`: the workspace row is DELETED
+-- on reclamation (the tree is gone), so the record of what its work turned
+-- into has to live somewhere else. The primary key is (repo, slug): one
+-- reclamation per child workspace, and a second reclamation of the same slug
+-- is an idempotent no-op that does not overwrite the first snapshot.
+CREATE TABLE IF NOT EXISTS child_reclaims (
+    repo              TEXT NOT NULL,
+    slug              TEXT NOT NULL,
+    session_id        TEXT NOT NULL DEFAULT '',
+    workspace_path    TEXT NOT NULL DEFAULT '',
+    snapshot_commit_id TEXT NOT NULL DEFAULT '',
+    was_dirty         INTEGER NOT NULL DEFAULT 0,
+    reclaimed_at      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo, slug)
+);
+CREATE INDEX IF NOT EXISTS child_reclaims_snapshot_idx
+    ON child_reclaims(snapshot_commit_id);
+""""""
+CREATE TABLE IF NOT EXISTS workspaces (
+    repo        TEXT NOT NULL,
+    slug        TEXT NOT NULL,
+    path        TEXT NOT NULL DEFAULT '',
+    vcs         TEXT NOT NULL DEFAULT 'jj',
+    purpose     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT '',
+    last_synced TEXT,
+    extra       TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (repo, slug)
+);
+CREATE INDEX IF NOT EXISTS workspaces_path_idx ON workspaces(path);
+CREATE INDEX IF NOT EXISTS workspaces_slug_idx ON workspaces(slug);
+
+CREATE TABLE IF NOT EXISTS bindings (
+    session_id       TEXT PRIMARY KEY,
+    mode             TEXT,
+    repo             TEXT,
+    slug             TEXT,
+    path             TEXT,
+    title            TEXT,
+    inherited_from   TEXT,
+    inherited_at     TEXT,
+    session_ended_at TEXT,
+    updated_at       TEXT,
+    extra            TEXT NOT NULL DEFAULT '{}',
+    payload          TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS bindings_path_idx ON bindings(path);
+
+CREATE TABLE IF NOT EXISTS workspace_sessions (
+    repo       TEXT NOT NULL,
+    slug       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    PRIMARY KEY (repo, slug, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS kv (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL DEFAULT '',
+    updated_at TEXT
+);
+
+-- ── child lifecycle (v3) ────────────────────────────────────────────────────
+--
+-- WHY these tables exist: the plugin must tell the PARENT session, on its next
+-- turn, which workspace a finished child used, whether that workspace is
+-- clean, and how many unpushed commits it left. The host's subagent_start /
+-- subagent_stop hooks give us the child's identity and the parent's, but
+-- neither tells us which workspace the child was bound to - that lookup is
+-- what these two tables make cheap and explicit.
+--
+-- child_runs: one row per child, written at subagent_start. It is the map
+--   from a child session to its parent, so subagent_stop never has to guess
+--   which parent a report belongs to (a reverse lookup over bindings is
+--   ambiguous when a session id is reused).
+--
+-- child_reports: one row per child, written at subagent_stop and read once by
+--   the parent's next prompt. The row is DELETED after it is delivered
+--   (one-time delivery), so a stale report can never be shown twice.
+
+CREATE TABLE IF NOT EXISTS child_runs (
+    child_session_id TEXT PRIMARY KEY,
+    child_subagent_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    parent_turn_id   TEXT NOT NULL DEFAULT '',
+    parent_subagent_id TEXT NOT NULL DEFAULT '',
+    child_role       TEXT NOT NULL DEFAULT '',
+    child_goal       TEXT NOT NULL DEFAULT '',
+    started_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_runs_parent_idx ON child_runs(parent_session_id);
+
+CREATE TABLE IF NOT EXISTS child_reports (
+    child_session_id TEXT PRIMARY KEY,
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    child_role       TEXT NOT NULL DEFAULT '',
+    child_status     TEXT NOT NULL DEFAULT '',
+    workspace_path   TEXT NOT NULL DEFAULT '',
+    workspace_slug   TEXT NOT NULL DEFAULT '',
+    workspace_repo   TEXT NOT NULL DEFAULT '',
+    dirty            TEXT NOT NULL DEFAULT 'unknown',
+    unpushed         INTEGER,
+    created_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
+
+CREATE TABLE IF NOT EXISTS child_reclaims (
+    repo              TEXT NOT NULL,
+    slug              TEXT NOT NULL,
+    session_id        TEXT NOT NULL DEFAULT '',
+    workspace_path    TEXT NOT NULL DEFAULT '',
+    snapshot_commit_id TEXT NOT NULL DEFAULT '',
+    was_dirty         INTEGER NOT NULL DEFAULT 0,
+    reclaimed_at      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo, slug)
+);
+CREATE INDEX IF NOT EXISTS child_reclaims_snapshot_idx
+    ON child_reclaims(snapshot_commit_id);
 """
 
 # Tables added after v2. The schema script above creates them for a FRESH
@@ -191,7 +318,16 @@ CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_sess
 # already idempotent (every statement is CREATE ... IF NOT EXISTS), but
 # running it wholesale on every open would take the DDL lock on every
 # connection. Listing the additions keeps the open path cheap and makes the
-# migration auditable: this tuple IS the v3 migration.
+# migration auditable: this tuple IS the migration.
+#
+# WHY the statements are IF NOT EXISTS and the migration runs them
+# UNCONDITIONALLY: two branches that both bumped the schema version would
+# otherwise race for it - whichever landed second saw a version row that
+# already said 3, skipped its own migration, and never created its table.
+# The child-report branch and the child-reclamation branch both did exactly
+# that. Running the CREATEs unconditionally makes the tables independent of
+# the version row; only the SCHEMA_VERSION constant itself is a merge
+# decision.
 V3_TABLES = """
 CREATE TABLE IF NOT EXISTS child_runs (
     child_session_id TEXT PRIMARY KEY,
@@ -218,6 +354,19 @@ CREATE TABLE IF NOT EXISTS child_reports (
     created_at       TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
+
+CREATE TABLE IF NOT EXISTS child_reclaims (
+    repo              TEXT NOT NULL,
+    slug              TEXT NOT NULL,
+    session_id        TEXT NOT NULL DEFAULT '',
+    workspace_path    TEXT NOT NULL DEFAULT '',
+    snapshot_commit_id TEXT NOT NULL DEFAULT '',
+    was_dirty         INTEGER NOT NULL DEFAULT 0,
+    reclaimed_at      TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo, slug)
+);
+CREATE INDEX IF NOT EXISTS child_reclaims_snapshot_idx
+    ON child_reclaims(snapshot_commit_id);
 """
 
 # The keys of a session record that get their own column. Everything else a
@@ -360,35 +509,36 @@ def _host_connection(path: str) -> sqlite3.Connection | None:
 def _migrate_to_current(conn: sqlite3.Connection) -> None:
     """Bring an EXISTING database up to ``SCHEMA_VERSION``, additively.
 
-    WHY this exists: the schema script only ran for a FRESH database (the
-    ``bindings`` table had to be absent). The live install's database already
-    has it, so the tables added in v3 would never be created there and every
-    child report would fail with "no such table".
+    WHY this exists: the schema script only runs for a FRESH database (the
+    ``bindings`` table has to be absent). The live install's database already
+    has it, so the tables added after v2 would never be created there and
+    every child report or immediate reclamation would fail with "no such
+    table".
 
     WHY it is safe to run on every open: every step only CREATEs a missing
     table or index. Nothing is dropped, retyped or rewritten, so opening an
-    old database can never lose a live session's binding. The version row
-    is read but not trusted as the sole gate - a database whose version row
-    says 3 but which is missing the tables (a half-finished upgrade) is still
-    repaired, because the CREATEs are idempotent.
+    old database can never lose a live session's binding.
+
+    WHY the CREATEs run UNCONDITIONALLY and not behind a version check: the
+    statements are ``IF NOT EXISTS``, so running them is free and idempotent
+    - and it makes the migration independent of the version row. Two
+    branches that both bumped the schema version would otherwise race for
+    it: whichever landed second saw a version row that already said 3,
+    skipped its own migration, and never created its table. The child-report
+    branch and the child-reclamation branch both did exactly that. Running
+    the CREATEs unconditionally removes the coupling: every table is there
+    after any open, whatever the version row says.
 
     WHY the failure is swallowed: a database that cannot be migrated (a
     read-only file, a locked disk) must not make every plugin call fail. The
-    child-report code degrades to "no report" instead.
+    report code degrades to "no report" and the reclamation code to "could
+    not record the snapshot" instead.
     """
     try:
-        row = conn.execute("SELECT value FROM kv WHERE key='schema_version'").fetchone()
-        version = 0
-        if row is not None:
-            try:
-                version = int(str(row[0]))
-            except (TypeError, ValueError):
-                version = 0
-        if version < 3:
-            conn.executescript(V3_TABLES)
-            conn.commit()
+        conn.executescript(V3_TABLES)
+        conn.commit()
     except Exception:
-        logger.warning("plugin db migration to v3 failed; continuing on the old schema", exc_info=True)
+        logger.warning("plugin db migration failed; continuing on the old schema", exc_info=True)
 
 
 def _open_connection(path: str) -> sqlite3.Connection:
@@ -432,7 +582,7 @@ def _open_connection(path: str) -> sqlite3.Connection:
             else:
                 # An EXISTING database (the live install, or one a test made
                 # before this release): bring it forward ADDITIVELY. The
-                # migration only ever CREATEs missing tables - it never
+                # migration only ever CREATEs a missing table - it never
                 # drops, rewrites or retypes a row - so opening an old
                 # database can never lose a live session's binding.
                 _migrate_to_current(conn)
@@ -1178,6 +1328,128 @@ def delete_workspace(repo: str, slug: str) -> None:
     with transaction() as conn:
         conn.execute("DELETE FROM workspace_sessions WHERE repo=? AND slug=?", (repo, slug))
         conn.execute("DELETE FROM workspaces WHERE repo=? AND slug=?", (repo, slug))
+
+
+# ── child reclamation index ───────────────────────────────────────────────────
+
+
+def record_child_reclaim(
+    repo: str,
+    slug: str,
+    *,
+    session_id: str = "",
+    workspace_path: str = "",
+    snapshot_commit_id: str = "",
+    was_dirty: bool = False,
+    reclaimed_at: str = "",
+) -> None:
+    """Record that a child workspace was reclaimed, and what its work became.
+
+    WHY this table is the index: jj NEVER auto-gcs. A snapshot commit created
+    by ``jj workspace remove`` stays in the shared store until a manual
+    ``jj gc --expire`` evicts it, so the commit id is enough to find the work
+    later - but only if something records it. This row IS that index.
+
+    WHY the row is written and NOT upserted over an existing one: a second
+    reclamation of the same slug is an idempotent no-op, and overwriting the
+    first snapshot id would lose the pointer to the FIRST snapshot - which
+    is the one holding the child's work.
+    """
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO child_reclaims"
+            " (repo, slug, session_id, workspace_path, snapshot_commit_id, was_dirty, reclaimed_at)"
+            " VALUES(?,?,?,?,?,?,?)"
+            " ON CONFLICT(repo, slug) DO NOTHING",
+            (
+                repo,
+                slug,
+                str(session_id or ""),
+                str(workspace_path or ""),
+                str(snapshot_commit_id or ""),
+                1 if was_dirty else 0,
+                str(reclaimed_at or ""),
+            ),
+        )
+
+
+def read_child_reclaim(repo: str, slug: str) -> dict[str, Any] | None:
+    """The reclamation row for a child workspace, or None."""
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM child_reclaims WHERE repo=? AND slug=?", (repo, slug)
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "repo": row["repo"],
+        "slug": row["slug"],
+        "session_id": row["session_id"],
+        "workspace_path": row["workspace_path"],
+        "snapshot_commit_id": row["snapshot_commit_id"],
+        "was_dirty": bool(row["was_dirty"]),
+        "reclaimed_at": row["reclaimed_at"],
+    }
+
+
+def read_child_reclaim_by_slug(slug: str) -> dict[str, Any] | None:
+    """The reclamation row for a slug in ANY repo, or None.
+
+    WHY the repo is not required: the idempotent second call happens after
+    the workspace row was deleted, and that row was the only thing that
+    said which repo the workspace belonged to. Slugs name a workspace tree
+    and are unique within a root, so the slug alone identifies the row.
+
+    WHY the newest row wins: two repos can hold the same slug (a repo
+    named "app" in two roots). The reclamation that happened LAST is the
+    one a caller asking "what happened to this slug?" wants.
+    """
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM child_reclaims WHERE slug=? ORDER BY reclaimed_at DESC LIMIT 1",
+        (slug,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "repo": row["repo"],
+        "slug": row["slug"],
+        "session_id": row["session_id"],
+        "workspace_path": row["workspace_path"],
+        "snapshot_commit_id": row["snapshot_commit_id"],
+        "was_dirty": bool(row["was_dirty"]),
+        "reclaimed_at": row["reclaimed_at"],
+    }
+
+
+def list_child_reclaims(repo: str = "", slug: str = "") -> list[dict[str, Any]]:
+    """Every reclamation row, newest first. Optionally filtered."""
+    conn = connect()
+    if repo and slug:
+        rows = conn.execute(
+            "SELECT * FROM child_reclaims WHERE repo=? AND slug=? ORDER BY reclaimed_at DESC",
+            (repo, slug),
+        ).fetchall()
+    elif repo:
+        rows = conn.execute(
+            "SELECT * FROM child_reclaims WHERE repo=? ORDER BY reclaimed_at DESC", (repo,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM child_reclaims ORDER BY reclaimed_at DESC"
+        ).fetchall()
+    return [
+        {
+            "repo": row["repo"],
+            "slug": row["slug"],
+            "session_id": row["session_id"],
+            "workspace_path": row["workspace_path"],
+            "snapshot_commit_id": row["snapshot_commit_id"],
+            "was_dirty": bool(row["was_dirty"]),
+            "reclaimed_at": row["reclaimed_at"],
+        }
+        for row in rows
+    ]
 
 
 def legacy_state_dir() -> Path:

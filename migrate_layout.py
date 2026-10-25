@@ -36,6 +36,10 @@ from pathlib import Path
 from typing import Any
 
 from . import db, store
+from .jjlayout import is_git_worktree as _is_git_worktree
+from .jjlayout import live_session_paths as _live_session_paths
+from .jjlayout import main_checkout as _main_checkout
+from .jjlayout import resolve_jj_store as _resolve_jj_store
 
 # The old layout's default root. Kept as a constant because the migration
 # must recognise the OLD path even after the setting changed: the setting
@@ -76,123 +80,13 @@ def _under(path: Path, root: Path) -> bool:
     return True
 
 
-def _resolve_jj_store(workspace: Path) -> Path | None:
-    """The jj store a workspace points at, or None when it has no pointer.
-
-    A child jj workspace carries ``.jj/repo`` as a FILE holding a RELATIVE
-    path to the main workspace's repo dir. A colocated main workspace has
-    ``.jj/repo`` as a DIRECTORY. Both are resolved here, and the answer is
-    what the pre-move and post-move checks compare: the same store means the
-    pointer survived the move.
-    """
-    repo_link = workspace / ".jj" / "repo"
-    if not repo_link.exists():
-        return None
-    try:
-        if repo_link.is_dir():
-            return repo_link.resolve()
-        target = Path(repo_link.read_text().strip())
-        return (workspace / ".jj" / target).resolve()
-    except Exception:
-        return None
-
-
-def _is_git_worktree(workspace: Path) -> bool:
-    """True when the workspace is a git WORKTREE of some checkout.
-
-    WHY the distinction: a plain jj workspace has NO ``.git`` at all - it
-    reaches the shared repo through its ``.jj/repo`` pointer, not through a
-    git worktree entry. ``git worktree repair`` only makes sense for the
-    former, and running it on a jj-only workspace fails with "unable to
-    locate repository", which would be reported as a repair failure for
-    something that never needed repairing.
-    """
-    git_marker = workspace / ".git"
-    return git_marker.is_file()
-
-
-def _main_checkout(workspace: Path) -> Path | None:
-    """The MAIN checkout of a workspace, or None when it cannot be found.
-
-    Two shapes, because a workspace can be either kind of checkout:
-
-    * a jj workspace: ``.jj/repo`` points at ``<main>/.jj/repo``, so the main
-      checkout is two levels up from the resolved repo dir.
-    * a git worktree: its ``.git`` is a FILE saying
-      ``gitdir: <main>/.git/worktrees/<name>``, so the main checkout is two
-      levels up from the resolved gitdir.
-
-    ``git worktree repair`` has to run in the MAIN checkout, with the moved
-    workspace as its argument - git repairs the main repo's worktree list,
-    and a repair run from the workspace itself would have no list to repair.
-    """
-    store_dir = _resolve_jj_store(workspace)
-    if store_dir is not None:
-        # <main>/.jj/repo -> <main>
-        main = store_dir.parent.parent
-        if main.is_dir():
-            return main
-    git_marker = workspace / ".git"
-    if git_marker.is_file():
-        try:
-            raw = git_marker.read_text().strip()
-        except Exception:
-            return None
-        if not raw.startswith("gitdir:"):
-            return None
-        gitdir = Path(raw.split(":", 1)[1].strip())
-        if not gitdir.is_absolute():
-            gitdir = (workspace / gitdir).resolve()
-        else:
-            gitdir = gitdir.resolve()
-        # <main>/.git/worktrees/<name> -> <main>
-        main = gitdir.parent.parent
-        return main if main.is_dir() else None
-    return None
-
-
-def _live_session_paths() -> set[str]:
-    """The paths that a LIVE session is bound to or has pinned as its cwd.
-
-    Two sources, because a session can be using a tree in two ways: the
-    binding row (the plugin's own record) and the pinned cwd (where the
-    terminal actually runs). A session whose row says the workspace but whose
-    cwd was pinned elsewhere is still using the tree.
-
-    A session is LIVE when it has no ``session_ended_at`` - the same rule
-    the gc tiers use to decide "in use".
-    """
-    out: set[str] = set()
-    for row in db.all_bindings():
-        sid = str(row.get("session_id") or "")
-        if not sid:
-            continue
-        if row.get("session_ended_at"):
-            continue  # the session is over: its tree is free to move
-        path = str(row.get("path") or "")
-        if path:
-            out.add(os.path.normpath(path))
-    pinned = _pinned_cwd()
-    if pinned:
-        out.add(os.path.normpath(pinned))
-    return out
-
-
-def _pinned_cwd() -> str:
-    """The cwd pinned for THIS session, or "" when there is none.
-
-    Narrow on purpose: the plugin's own ``_pinned_workspace`` only counts a
-    path that lives under the workspace root, and the root has just moved.
-    The migration wants the raw pinned path - it is asking "is somebody
-    standing in this directory right now", and the directory can be under
-    the OLD root.
-    """
-    try:
-        from agent.runtime_cwd import scoped_session_cwd
-
-        return str(scoped_session_cwd() or "")
-    except Exception:
-        return ""
+# WHY these are imported rather than defined here: the workspace GEOMETRY
+# ("is this the main checkout?", "is a live session standing in it?") is
+# needed by the immediate child reclamation too, and it cannot live in
+# ``store`` - this module already imports ``store``, so the other way round
+# would be a circular import. ``jjlayout`` holds the one implementation and
+# both modules use it. The old private names stay bound here so the
+# migration's own callers (and its tests) are unaffected.
 
 
 def _rewrite_records(old_path: str, new_path: str, repo: str, slug: str) -> None:

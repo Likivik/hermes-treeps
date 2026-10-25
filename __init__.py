@@ -1093,6 +1093,33 @@ def _register_cli(subparser) -> None:
     p_gc.add_argument("--apply", action="store_true", help="retire the tier1 set (ended + clean + pushed + no open PRs)")
     p_gc.add_argument("--children", action="store_true", help="only child workspaces (delegated children); with --apply, safe for an unattended cron - never decides for user workspaces")
 
+    # The IMMEDIATE reclamation path: a child that is done has its tree
+    # reclaimed at once, and the work is preserved as a jj snapshot commit.
+    p_reclaim = sub.add_parser(
+        "reclaim",
+        help="reclaim a finished child's workspace now (the work is preserved as a jj snapshot commit)",
+    )
+    p_reclaim.add_argument(
+        "--slug",
+        default="",
+        help="the child workspace to reclaim (by slug)",
+    )
+    p_reclaim.add_argument(
+        "--all-children",
+        action="store_true",
+        help="reclaim every child workspace whose sessions have all ended",
+    )
+    p_reclaim.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be reclaimed, reclaim nothing",
+    )
+    p_reclaim.add_argument(
+        "--no-snapshot",
+        action="store_true",
+        help="do not snapshot a dirty tree into a commit (a dirty child's work would be LOST - for a tree you already know is worthless)",
+    )
+
     p_chat = sub.add_parser("chatting", help="mark a session as talk-only")
     p_chat.add_argument("--session", default="")
 
@@ -1207,6 +1234,27 @@ def _cli(args) -> int:
                     "hermes ws gc --apply"
                 )
             return 0
+        if action == "reclaim":
+            slug = str(getattr(args, "slug", "") or "")
+            all_children = bool(getattr(args, "all_children", False))
+            if not slug and not all_children:
+                print("nothing to reclaim: pass --slug <slug> or --all-children")
+                return 2
+            if slug and all_children:
+                print("pass either --slug or --all-children, not both")
+                return 2
+            out = store.reclaim_children(
+                [slug] if slug else None,
+                all_children=all_children,
+                snapshot=not bool(getattr(args, "no_snapshot", False)),
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
+            # The structured report: what was reclaimed (and where its work
+            # ended up) and what was skipped (and why).
+            print(json.dumps(out, indent=2, default=str))
+            if getattr(args, "dry_run", False):
+                print("\ndry run: nothing was reclaimed")
+            return 0
         if action == "chatting":
             store.mark_chatting(args.session or "cli")
             print("session marked as chatting")
@@ -1254,7 +1302,7 @@ def register(ctx) -> None:
 
     ctx.register_cli_command(
         name="ws",
-        help="Workspaces: one per session (new/list/status/retire/chatting)",
+        help="Workspaces: one per session (new/list/status/retire/reclaim/chatting)",
         setup_fn=_register_cli,
         handler_fn=_cli,
         description=(
