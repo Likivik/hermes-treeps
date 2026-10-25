@@ -5,14 +5,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import CLI, STORE
 
 CHILD_PREFIX = STORE.CHILD_PURPOSE_PREFIX
 
 
 def _cli(action="forget", **kwargs):
     args = argparse.Namespace(ws_action=action, **kwargs)
-    return PLUGIN._cli(args)
+    return CLI._cli(args)
 
 
 def _record(path: Path, *, slug: str, repo: str = "demo", purpose: str = "", sessions=()):

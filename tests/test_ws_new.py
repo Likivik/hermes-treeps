@@ -10,11 +10,11 @@ import json
 from pathlib import Path
 
 import pytest
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import STORE, TOOLS
 
 
 def _ws_new(args, sid):
-    return json.loads(PLUGIN._tool_new(args, session_id=sid))
+    return json.loads(TOOLS._tool_new(args, session_id=sid))
 
 
 @pytest.fixture
@@ -294,7 +294,7 @@ def test_ws_doctor_says_where_a_repo_could_come_from(state_home, monkeypatch):
     _fake_remote(monkeypatch, [{
         "name": "achiyon", "owner": "likivik", "url": "https://gh/o/achiyon", "source": "github",
     }])
-    out = json.loads(PLUGIN._tool_doctor({}, session_id="sid-doctor-1"))
+    out = json.loads(TOOLS._tool_doctor({}, session_id="sid-doctor-1"))
     assert "local_candidates" in out, out
     assert "remote_candidates" in out, out
     assert out["repo_roots"], out
@@ -314,7 +314,7 @@ def test_ws_doctor_reports_a_dead_catalogue(state_home, monkeypatch):
         raise RuntimeError("network is down")
 
     monkeypatch.setattr(STORE, "remote_repos", _boom)
-    out = json.loads(PLUGIN._tool_doctor({}, session_id="sid-doctor-2"))
+    out = json.loads(TOOLS._tool_doctor({}, session_id="sid-doctor-2"))
     assert out["remote_candidates"] == [], out
     assert out["remote_error"], out
 
@@ -327,6 +327,6 @@ def test_a_user_purpose_cannot_use_the_reserved_child_prefix(monkeypatch, state_
     throwaway child and get collected on age alone.
     """
     args = {"repo": "repo", "slug": "user-purpose", "purpose": "child: release prep"}
-    out = json.loads(PLUGIN._tool_new(args, session_id="sid-reserved"))
+    out = json.loads(TOOLS._tool_new(args, session_id="sid-reserved"))
     assert out["ok"] is False, out
     assert "reserved" in out["error"], out

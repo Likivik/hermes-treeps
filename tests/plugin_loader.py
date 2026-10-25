@@ -35,3 +35,8 @@ PLUGIN = _load_plugin()
 STORE = PLUGIN.store
 SETTINGS = STORE._settings
 VCS = STORE._vcs
+# The plugin is split into modules; the tests reach the private helpers
+# through the module that now owns them.
+GATE = importlib.import_module("hermes_treeps.gate")
+TOOLS = importlib.import_module("hermes_treeps.tools")
+CLI = importlib.import_module("hermes_treeps.cli")

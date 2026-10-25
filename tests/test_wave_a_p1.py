@@ -11,7 +11,7 @@ import sys
 import types
 
 import pytest
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import GATE, PLUGIN, STORE
 
 
 def _fake_child_context(monkeypatch, value: bool = True):
@@ -203,7 +203,7 @@ def test_a_child_finds_its_parent_in_its_own_binding_row(state_home, tmp_path, m
         "mode": "repo", "repo": "repo", "slug": "ca", "path": str(repo),
         "parent_session_id": "parent-A", "inherited_from": "parent-A"})
 
-    assert PLUGIN._resolve_child_parent("child-A") == "parent-A"
+    assert GATE._resolve_child_parent("child-A") == "parent-A"
 
 
 def test_the_child_run_row_wins_over_the_binding_row(state_home):
@@ -218,7 +218,7 @@ def test_the_child_run_row_wins_over_the_binding_row(state_home):
         "parent_session_id": "parent-OLD", "inherited_from": "parent-OLD"})
     STORE.db.write_child_run("child-A", "parent-NEW")
 
-    assert PLUGIN._resolve_child_parent("child-A") == "parent-NEW"
+    assert GATE._resolve_child_parent("child-A") == "parent-NEW"
 
 
 # ── P1-2: the report lost on re-dispatch ───────────────────────────────────

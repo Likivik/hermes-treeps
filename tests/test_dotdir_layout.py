@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib
 
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import CLI, STORE
 
 MIGRATE = importlib.import_module("hermes_treeps.migrate_layout")
 
@@ -115,13 +115,13 @@ def test_the_prepare_step_accepts_a_workspace_in_the_new_layout(tmp_path, monkey
 def _cli(action="migrate", **kwargs):
     """Run the plugin's CLI handler with a parsed-args stand-in."""
     args = argparse.Namespace(ws_action=action, **kwargs)
-    return PLUGIN._cli(args)
+    return CLI._cli(args)
 
 
 def _registered_actions():
     """The action names the `hermes ws` CLI registers."""
     parser = argparse.ArgumentParser()
-    PLUGIN._register_cli(parser)
+    CLI._register_cli(parser)
     # argparse stores the subparsers action; its choices are the commands.
     for action in parser._actions:
         if isinstance(action, argparse._SubParsersAction):
