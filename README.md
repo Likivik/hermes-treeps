@@ -33,6 +33,15 @@ else's tree.
 - **Picker on `/new`** — the gateway's `on_session_reset` hook fires a keyboard
   with your most recently pushed GitHub/Forgejo repos plus `just chatting` and
   `new repo…`. One tap binds the session; the keyboard retires itself.
+  A repo that is **not on disk** takes one extra tap: the first tap replaces
+  the keyboard with `clone <repo> from <forge>?`, and only the confirm tap
+  clones. Cloning writes to your disk, so it is never a side effect of
+  choosing a repo.
+- **Clone URLs are allowlisted** — only `https://` and `ssh://` are cloned.
+  git and jj both support "transport helper" URLs (`ext::sh -c …`), which make
+  a clone *run a command*; a remote catalogue answer therefore cannot become
+  command execution. A URL with any other scheme is refused with an error
+  naming the scheme.
 - **Tool gate** — `terminal`, `write_file`, etc. are refused with a message that
   names the candidate repos until the session resolves. Fresh sessions are
   asked; delegate_task children inherit their parent's binding (see below).
@@ -65,6 +74,15 @@ Children are detected exactly, by `is_delegated_child_context()` (single-path;
 no recency fallback - the upstream #96483 workaround layer is gone because the
 upstream bug is fixed).
 
+**Which parent, per child.** A child's parent is resolved from channels keyed
+by the *child's own* session id — the `child_runs` row the host's
+`subagent_start` hook writes, and the child's own binding row
+(`parent_session_id`). There is no module global any more: a global can name
+only ONE parent, so two delegations in flight made the second child inherit the
+first child's parent and build its workspace in the wrong repository. A child
+whose parent cannot be resolved is **blocked**, never pointed at a stranger's
+workspace.
+
 ## Child-end reporting
 
 When a delegated child finishes, the **parent** session learns what the child
@@ -87,6 +105,12 @@ parent's own thread and a `jj status` there would stall every delegation
 behind it. That background thread is handed the database path its caller
 named, so a report can never land in a different database than the one the
 session was using.
+
+**Delivery is versioned.** The report row is keyed by the child session id and
+is rewritten in place when the child is re-dispatched, so the delivery names
+the exact version it read (a per-row `report_seq`): a report that arrives
+between the read and the clear is *not* deleted, and the parent still gets it
+on its next turn.
 
 **The tree is reclaimed right there.** On the *same* background thread, right
 after the report row is written, the child's workspace is reclaimed: the dirty

@@ -469,13 +469,24 @@ def take_pending_reports(session_id: str) -> list[dict[str, Any]]:
 
 
 def clear_delivered_reports(reports: list[dict[str, Any]]) -> int:
-    """Delete the reports that were actually rendered. Returns the row count."""
-    ids = [str(r.get("child_session_id") or "") for r in reports]
-    ids = [i for i in ids if i]
-    if not ids:
+    """Delete the reports that were actually rendered. Returns the row count.
+
+    WHY the version-scoped delete and not "delete by child id" (P1-2): the
+    report row is keyed by the child session id and is REWRITTEN IN PLACE
+    when the child is re-dispatched. The parent reads the pending rows,
+    renders them, and only then clears - so a report that the child's
+    report thread wrote BETWEEN the read and the clear shares the child id
+    and was destroyed by an id-only delete, WITHOUT EVER BEING DELIVERED.
+    The parent silently lost the child's end state.
+
+    The delete therefore names the exact version it read (report_seq). A
+    rewrite bumps the sequence, the delete no longer matches, and the newer
+    report survives to the parent's next turn.
+    """
+    if not reports:
         return 0
     try:
-        return store.db.delete_child_reports(ids)
+        return store.db.delete_delivered_reports(reports)
     except Exception:
         logger.warning("child report: could not clear delivered reports", exc_info=True)
         return 0

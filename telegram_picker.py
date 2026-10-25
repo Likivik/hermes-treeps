@@ -325,6 +325,73 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
 # ── taps ──────────────────────────────────────────────────────────────────────
 
 
+def _repo_is_local(name: str) -> bool:
+    """True when the repo already has a checkout under the repo roots.
+
+    WHY this decides whether the picker asks for a clone confirmation: a
+    repo that is ALREADY on disk needs no clone, so the tap binds a
+    workspace in it directly. A repo that is NOT on disk needs a clone, and a
+    clone writes to the user's disk - so it needs the user's approval
+    (P1-3). The old code cloned silently from the tap.
+    """
+    try:
+        store.find_repo(str(name))
+    except Exception:
+        return False
+    return True
+
+
+async def _ask_to_clone(q: Any, entry: dict[str, Any], session_id: str) -> None:
+    """Replace the repo keyboard with an explicit clone confirmation.
+
+    WHY this exists (P1-3): tapping a repo that is not on disk used to
+    CLONE it - silently, as a side effect, with the raw ``clone_url`` from
+    the remote catalogue. Two things were wrong with that:
+
+    * cloning writes to the user's disk and was never approved;
+    * the URL was unchecked, so a hostile forge response could name a git
+      transport helper (``ext::sh -c ...``) and make the clone RUN A
+      COMMAND on this host.
+
+    The scheme allowlist in ``store.ensure_local`` closes the second hole.
+    This closes the first: the clone only happens on an explicit second tap
+    on a button that says what it will do.
+    """
+    repo = str(entry.get("name") or "")
+    source = str(entry.get("source") or "") or "the remote"
+    owner = str(entry.get("owner") or "")
+    label = f"{owner}/{repo}" if owner else repo
+    try:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    except Exception:
+        logger.warning("telegram is not importable; cannot ask for a clone confirmation")
+        return
+    # A token of its own, marked as a clone approval: the picker's "pick"
+    # token cannot be replayed as a clone approval, and the approval expires
+    # with it.
+    token = store.new_token([entry], session_id=session_id, kind="clone")
+    try:
+        await q.answer(
+            f"{repo} is not on disk. Confirm to clone it from {source}.",
+            show_alert=True,
+        )
+    except Exception:
+        pass
+    try:
+        await q.edit_message_text(
+            f"Clone {label} from {source} into {_clone_root_label()}?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"clone {repo} from {source}?",
+                    callback_data=f"ws:{token}:clone",
+                )],
+                [InlineKeyboardButton("cancel", callback_data=f"ws:{token}:cancel")],
+            ]),
+        )
+    except Exception:
+        logger.debug("could not edit the choice message for the clone confirmation", exc_info=True)
+
+
 async def _on_choice_callback(update: Any, context: Any) -> None:
     """A repo/chatting button was tapped: record the choice, retire the keyboard."""
     q = getattr(update, "callback_query", None)
@@ -345,6 +412,8 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
     if not record:
         await q.answer("This prompt expired - send /wsbtn for a fresh one.", show_alert=True)
         return
+
+    token_kind = str(record.get("kind") or "pick")
 
     # Resolve the session NOW, at tap time. Order matters:
     # 1. the session the token was minted for - IF it is still alive (a /new
@@ -375,7 +444,11 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
     note_session_id(session_id)
 
     already = store.read_state(session_id)
-    if choice not in {"other", "newrepo"} and already and already.get("mode") == "repo":
+    if (
+        choice not in {"other", "newrepo", "clone", "cancel"}
+        and already
+        and already.get("mode") == "repo"
+    ):
         await q.answer(
             f"This session is already bound to {already.get('repo')}/{already.get('slug')} - "
             "tell the agent to rebind if you meant to switch.",
@@ -397,6 +470,62 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
             except Exception:
                 pass
             return
+        elif choice == "cancel":
+            await q.answer("Cancelled - nothing was cloned.")
+            try:
+                await q.edit_message_text("Cancelled - nothing was cloned.")
+            except Exception:
+                pass
+            return
+        elif choice == "clone":
+            # The CONFIRM tap. This is the only path that clones from the
+            # picker, and it only runs for a token that was minted as a
+            # clone confirmation (see below).
+            if token_kind != "clone":
+                await q.answer(
+                    "This button does not approve a clone - send /wsbtn for a fresh one.",
+                    show_alert=True,
+                )
+                return
+            repos = record.get("repos") or []
+            if not repos:
+                await q.answer("Nothing to clone - send /wsbtn for a fresh one.", show_alert=True)
+                return
+            entry = repos[0] if isinstance(repos[0], dict) else {"name": str(repos[0])}
+            repo = str(entry.get("name") or "")
+            url = str(entry.get("url") or "")
+            if not repo:
+                await q.answer("Nothing to clone - send /wsbtn for a fresh one.", show_alert=True)
+                return
+            slug = f"{repo}-{session_id[-6:]}" if session_id else repo
+            import asyncio
+
+            def _clone_and_bind() -> dict:
+                # The scheme allowlist lives in ensure_local: a URL like
+                # ext::sh -c ... would make the clone RUN a command, and the
+                # URL comes from a remote catalogue response.
+                if url:
+                    store.ensure_local(repo, url)
+                # WHY the record is returned and used: create() SANITISES the
+                # slug, so the slug we passed in is not necessarily the slug
+                # on disk. Binding our own copy pointed at a non-existent
+                # path: the session stayed unbound and the workspace leaked.
+                return store.create(repo, slug, purpose="")
+
+            await q.answer(f"cloning {repo}…")
+            # A clone can take a minute; run it in a thread or every Telegram
+            # update in the process stalls behind it.
+            # WHY the name is not ``record``: that is the TOKEN record, and
+            # overwriting it would hide which token authorised this clone.
+            workspace = await asyncio.to_thread(_clone_and_bind)
+            bound_slug = str(workspace.get("slug") or slug)
+            bound_path = str(workspace.get("path") or store.workspace_path(repo, bound_slug))
+            store.bind_session(Path(bound_path), session_id)
+            store.write_state(
+                session_id,
+                {"mode": "repo", "repo": repo, "slug": bound_slug, "path": bound_path},
+            )
+            label = f"{repo}/{bound_slug}"
         else:
             repos = record.get("repos") or []
             idx = int(choice)
@@ -404,12 +533,22 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
                 raise store.WorkspaceError(f"unknown choice {choice!r}")
             entry = repos[idx]
             repo = entry["name"] if isinstance(entry, dict) else entry
+            url = str(entry.get("url") or "") if isinstance(entry, dict) else ""
+            # P1-3: a repo that is NOT on disk must not be cloned by this tap.
+            # The old code called ensure_local() here, which cloned as a side
+            # effect - with the RAW clone_url from the remote catalogue, so a
+            # hostile forge response could run a command (ext::sh -c ...).
+            # Cloning writes to the user's disk, so it needs the user's
+            # approval: show a confirm button and clone only on that tap.
+            if url and not _repo_is_local(repo):
+                await _ask_to_clone(q, entry, session_id)
+                return
             slug = f"{repo}-{session_id[-6:]}" if session_id else repo
             import asyncio
 
             def _bind_local() -> dict:
-                if isinstance(entry, dict) and entry.get("url"):
-                    store.ensure_local(repo, entry["url"])
+                if url:
+                    store.ensure_local(repo, url)
                 # WHY the record is returned and used: create() SANITISES the
                 # slug, so the slug we passed in is not necessarily the slug on
                 # disk. Binding our own copy pointed at a non-existent path:
