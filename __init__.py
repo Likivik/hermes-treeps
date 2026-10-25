@@ -22,9 +22,9 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
-from . import childspace, contract, migrate_layout, prepare, store
+from . import childreport, childspace, contract, migrate_layout, prepare, store
 from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
@@ -933,6 +933,144 @@ def _on_session_finalize(session_id: str = "", **kw: Any) -> None:
         logger.debug("could not stamp session end", exc_info=True)
 
 
+# ── child-end reporting (subagent_start / subagent_stop) ────────────────────
+#
+# WHY these two hooks and not ``on_session_end``: the host's subagent hooks
+# are the ONLY ones that know a child ENDED and which parent it belonged to.
+# ``on_session_end`` fires when a session is finalized, which is a different
+# moment, and it carries no parent/child relationship.
+#
+# WHY the parent learns about it on its NEXT TURN: the host freezes plugin
+# system-prompt sections for the life of a session (they are rendered once
+# and cached), so a section registered at start() cannot change mid-session.
+# The per-turn channel is ``pre_llm_call``, whose context rides the user
+# message of that turn. So the reports go there, and the registered section
+# carries them too for the sessions whose prompt is built after the child
+# stopped.
+
+
+def _on_subagent_start(**kw: Any) -> None:
+    """Record the child->parent mapping before the child starts working.
+
+    WHY this row exists: ``subagent_stop``'s payload names the child and the
+    parent but not the child's WORKSPACE, and the workspace lives in the
+    child's binding. Writing the mapping here means the stop side never has
+    to reverse-lookup a binding - which is ambiguous when a session id is
+    re-dispatched or a child inherited its parent's binding.
+
+    Never raises: the host treats a raising observer as a plugin bug, and a
+    missing row is survivable (the stop side falls back to the bindings
+    table).
+    """
+    try:
+        parent_sid = str(kw.get("parent_session_id") or "")
+        child_sid = str(kw.get("child_session_id") or "")
+        childreport.record_child_start(
+            parent_sid,
+            child_sid,
+            child_subagent_id=str(kw.get("child_subagent_id") or ""),
+            parent_turn_id=str(kw.get("parent_turn_id") or ""),
+            parent_subagent_id=str(kw.get("parent_subagent_id") or ""),
+            child_role=str(kw.get("child_role") or ""),
+            child_goal=str(kw.get("child_goal") or ""),
+        )
+    except Exception:
+        # A broken reporter must never break the delegation it is watching:
+        # the child is about to run, and observers cannot veto work.
+        logger.warning("child report: start hook failed", exc_info=True)
+
+
+def _on_subagent_stop(**kw: Any) -> None:
+    """Hand the child's end state to a background thread, then return.
+
+    WHY a background thread: the host runs ``subagent_stop`` on the CALLER
+    thread - the parent's own thread, inside the delegation finalization.
+    The dirty and unpushed checks are subprocess calls (``jj status``,
+    ``git log``), and blocking there stalls the parent's thread pool and
+    every delegation queued behind it. The callback therefore returns
+    immediately and the report row is written by the daemon thread.
+
+    WHY the fallback to the bindings table: the plugin may have been
+    installed (or enabled) while a child was already running, so
+    ``subagent_start`` never fired for it and there is no mapping row. The
+    child's own binding still names its workspace, and the stop payload still
+    names the parent - so the report is still possible.
+    """
+    try:
+        parent_sid = str(kw.get("parent_session_id") or "")
+        child_sid = str(kw.get("child_session_id") or "")
+        if not parent_sid:
+            # The parent id is the one thing we cannot reconstruct from the
+            # bindings table without guessing: a session can be bound to a
+            # workspace but that binding does not say who spawned it.
+            # Without it there is no session to deliver a report to.
+            logger.debug("child report: stop hook without a parent session id")
+            return
+        childreport.record_child_stop(
+            parent_sid,
+            child_sid,
+            child_status=str(kw.get("child_status") or ""),
+            child_role=str(kw.get("child_role") or ""),
+        )
+    except Exception:
+        # The report is a nicety; the delegation's result is not. A failure
+        # here must never surface as a failed child.
+        logger.warning("child report: stop hook failed", exc_info=True)
+
+
+def _on_pre_llm_call(**kw: Any) -> Any:
+    """Deliver the parent's pending child-end reports, once, on this turn.
+
+    WHY ``pre_llm_call`` and not the system prompt: the host freezes plugin
+    system-prompt sections for the life of a session, so a section rendered
+    when the session started cannot carry a report about a child that has not
+    finished yet. The per-turn channel is this hook: its context rides the
+    user message of the turn it fires on.
+
+    SILENT when there is nothing pending: no context, no empty section, no
+    filler line. A parent with no finished children pays nothing.
+    """
+    try:
+        sid = str(kw.get("session_id") or "")
+        if not sid:
+            return None
+        text = childreport.deliver_reports(sid)
+        if not text:
+            return None
+        return {"context": text}
+    except Exception:
+        # Injection is best-effort: a failed report must not break the turn.
+        logger.warning("child report: could not inject the pending reports", exc_info=True)
+        return None
+
+
+def _reports_prompt_section(info: Any = None) -> str:
+    """The child-end reports section for the system prompt.
+
+    Rendered ONCE per session, like every other plugin section. A session
+    whose prompt is built after a child finished gets the reports here; the
+    per-turn delivery (``pre_llm_call``) covers the rest.
+
+    Returns the empty string when there is nothing to say, and the host
+    skips an empty section entirely.
+    """
+    try:
+        sid = ""
+        # WHY the Mapping check and not a dict check: the host passes a
+        # read-only ``types.MappingProxyType``, which is NOT a dict. An
+        # ``isinstance(info, dict)`` test is False for it, and the section
+        # would silently render nothing on every real session - a feature
+        # that looks shipped and is not.
+        if isinstance(info, Mapping):
+            sid = str(info.get("session_id") or "")
+        if not sid:
+            return ""
+        return childreport.deliver_reports(sid)
+    except Exception:
+        logger.warning("child report: could not render the prompt section", exc_info=True)
+        return ""
+
+
 def _register_cli(subparser) -> None:
     sub = subparser.add_subparsers(dest="ws_action")
 
@@ -1135,8 +1273,27 @@ def register(ctx) -> None:
         position="after_memory",
     )
 
+    # The child-end reports section. It is a CALLABLE, so it renders with
+    # the session's own id and stays silent when the session has no pending
+    # reports - the host skips an empty section entirely.
+    ctx.register_system_prompt_section(
+        "child-end-reports",
+        _reports_prompt_section,
+        position="after_memory",
+    )
+
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("on_session_start", _on_session_start)
     ctx.register_hook("on_session_finalize", _on_session_finalize)
+    # The host's dedicated subagent lifecycle hooks. NOT on_session_end: that
+    # one fires when a session is finalized and carries no parent/child
+    # relationship, so it cannot tell the parent which workspace its child
+    # used.
+    ctx.register_hook("subagent_start", _on_subagent_start)
+    ctx.register_hook("subagent_stop", _on_subagent_stop)
+    # The per-turn delivery channel for the parent's next turn. The host
+    # freezes plugin system-prompt sections per session, so a section cannot
+    # carry a report about a child that finishes later.
+    ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     picker.register(ctx)
     prepare.register(ctx)

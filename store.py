@@ -580,6 +580,17 @@ def unpushed_commits(workspace: Path) -> bool | None:
     return _vcs.unpushed(workspace)
 
 
+def count_unpushed_commits(workspace: Path) -> int | None:
+    """How many commits are not on the remote. None = cannot tell.
+
+    WHY this is separate from :func:`unpushed_commits`: that one answers a
+    boolean for the retire guard and short-circuits. The child-end report
+    needs the NUMBER, and only asks for it when the boolean says there is
+    something to count.
+    """
+    return _vcs.unpushed_count(workspace)
+
+
 def dirty(workspace: Path) -> bool:
     """True when the workspace has changes that retiring would lose.
 
@@ -587,6 +598,18 @@ def dirty(workspace: Path) -> bool:
     would make every workspace permanently unretireable.
     """
     return _vcs.dirty(workspace)
+
+
+def dirty_state(workspace: Path) -> str | None:
+    """``"dirty"`` / ``"clean"`` / None (cannot tell).
+
+    WHY this is not :func:`dirty`: that one answers a yes/no for the retire
+    guard, and a directory that is not a checkout at all makes it answer
+    "no" - nothing to lose there. A REPORT that says "clean" about a
+    directory nobody could inspect is a lie, so the reporting path asks
+    this one, which says "cannot tell" instead.
+    """
+    return _vcs.dirty_state(workspace)
 
 
 # ── retire ────────────────────────────────────────────────────────────────────

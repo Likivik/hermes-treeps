@@ -62,6 +62,43 @@ else's tree.
 Children are detected exactly, by `is_delegated_child_context()` (single-path;
 no recency fallback - the upstream #96483 workaround layer is gone because the
 upstream bug is fixed).
+
+## Child-end reporting
+
+When a delegated child finishes, the **parent** session learns what the child
+left behind — on its next turn, as one line per child:
+
+```
+child parent-tree-child-abcdef: dirty, 2 unpushed commits - /Git/hermes/.workspaces/repo/parent-tree-child-abcdef (worker completed)
+```
+
+The line carries the four things the parent cannot otherwise know: the
+workspace (slug and path), clean-or-dirty, how many unpushed commits the child
+left, and the child's own status word (`completed`, `failed`, `interrupted`).
+
+**How it works.** The plugin registers the host's dedicated subagent
+lifecycle hooks — `subagent_start` (records which child belongs to which
+parent) and `subagent_stop` (the child's end state) — plus `pre_llm_call`,
+which is the per-turn channel the report rides. The dirty and unpushed checks
+run on a background thread, because the host runs `subagent_stop` on the
+parent's own thread and a `jj status` there would stall every delegation
+behind it. That background thread is handed the database path its caller
+named, so a report can never land in a different database than the one the
+session was using.
+
+**One-time delivery.** A report is delivered once and then deleted. The next
+turn is silent. With nothing pending, the plugin adds nothing at all — no
+empty section, no filler.
+
+**Honest answers.** When a check cannot run (the workspace was retired
+mid-run, the remote is unreachable), the line says `state-unknown` or
+`unpushed unknown` — never a wrong "clean".
+
+**Hard-death caveat.** If the gateway restarts mid-child, `subagent_stop`
+never fires and no report is produced. The orphaned child workspace is still
+reclaimed by age: `hermes ws gc --children --apply` retires child workspaces
+once they are 14 days old, their session ended and their tree is clean.
+
 ## Automatic child collection (optional)
 
 Child workspaces (delegated children) are reclaimable once they are 14 days
@@ -291,7 +328,8 @@ in-tree copies after writing a tarball backup of them.
 ## Requirements
 
 - Hermes Agent with the plugin hook set used here (`on_session_reset`,
-  `on_session_finalize`, `pre_tool_call`, `on_session_start`),
+  `on_session_finalize`, `pre_tool_call`, `on_session_start`,
+  `subagent_start`, `subagent_stop`, `pre_llm_call`),
   `register_telegram_handler` for the picker.
 - `jj` (workspaces are jj-first; git worktrees work for non-jj repos).
 - Developed against Hermes 0.21.x on NixOS; no third-party pip deps (stdlib

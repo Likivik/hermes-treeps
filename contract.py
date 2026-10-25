@@ -27,6 +27,8 @@ state.
 
 from __future__ import annotations
 
+from typing import Any
+
 SECTION_TITLE = "Delegation contract"
 
 #: Imperative rules, one per line. ``{ws_new}``-style placeholders are
@@ -72,3 +74,74 @@ def render() -> str:
 def as_prompt_section() -> str:
     """Return the rendered rules as a markdown section, ready to append."""
     return f"## {SECTION_TITLE}\n\n{render()}"
+
+
+# ── child-end reports ────────────────────────────────────────────────────────
+#
+# The delegation contract above says "verify yourself" and "report defects as
+# a numbered list". Neither survives a child that ends without a word: the
+# parent has no idea which tree the child touched, whether the work is still
+# there, or whether it was ever pushed. These helpers turn the child's end
+# state into ONE line the parent reads on its next turn.
+#
+# WHY the rendering lives here and not in the hook module: the prompt text is
+# prompt text, and this module is where prompt text lives. The hook module
+# owns the DATA; this module owns the WORDS.
+
+#: Title of the injected section. A parent that has finished children sees
+#: this heading; a parent with none sees nothing at all.
+REPORTS_SECTION_TITLE = "Child-end reports"
+
+
+def render_reports(reports: list[dict[str, Any]]) -> str:
+    """Render pending child reports as prompt text.
+
+    Returns the EMPTY STRING when there is nothing pending. Silent is the
+    requirement: a session with no finished children must not carry an empty
+    section in its prompt.
+
+    One line per child, carrying the four facts the parent cannot otherwise
+    know: the workspace (slug and path), clean-or-dirty, the number of
+    unpushed commits, and the child's own status word.
+    """
+    if not reports:
+        return ""
+    lines: list[str] = []
+    for report in reports:
+        lines.append(_report_line(report))
+    if not lines:
+        return ""
+    return f"## {REPORTS_SECTION_TITLE}\n\n" + "\n".join(lines)
+
+
+def _report_line(report: dict[str, Any]) -> str:
+    """One child, one line.
+
+    The line reads:
+
+        child <slug>: <clean|dirty|state-unknown>, <N unpushed commits> -
+        <workspace path> (<status>)
+
+    ``state-unknown`` and ``unpushed unknown`` are the honest answers when a
+    check failed. A report that says "clean" for a workspace we could not
+    inspect is a lie, and this feature exists to stop lies.
+    """
+    slug = str(report.get("workspace_slug") or "").strip()
+    if not slug:
+        slug = "(no workspace)"
+    path = str(report.get("workspace_path") or "").strip()
+    state = str(report.get("dirty") or "").strip() or "state-unknown"
+    unpushed = report.get("unpushed")
+    if unpushed is None:
+        commits = "unpushed unknown"
+    else:
+        try:
+            n = int(unpushed)
+        except (TypeError, ValueError):
+            n = 0
+        commits = "0 unpushed commits" if n == 0 else f"{n} unpushed commit{'s' if n != 1 else ''}"
+    status = str(report.get("child_status") or "").strip() or "unknown"
+    role = str(report.get("child_role") or "").strip()
+    role_part = f"{role} " if role else ""
+    where = f" - {path}" if path else ""
+    return f"child {slug}: {state}, {commits}{where} ({role_part}{status})"

@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 PLUGIN_NAME = "hermes-treeps"
 DB_FILENAME = "data.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # One lock for every multi-statement write. It is NEVER held across a
 # subprocess call: those can take seconds, and a lock held that long would
@@ -137,6 +137,87 @@ CREATE TABLE IF NOT EXISTS kv (
     value      TEXT NOT NULL DEFAULT '',
     updated_at TEXT
 );
+
+-- ── child lifecycle (v3) ────────────────────────────────────────────────────
+--
+-- WHY these tables exist: the plugin must tell the PARENT session, on its next
+-- turn, which workspace a finished child used, whether that workspace is
+-- clean, and how many unpushed commits it left. The host's subagent_start /
+-- subagent_stop hooks give us the child's identity and the parent's, but
+-- neither tells us which workspace the child was bound to - that lookup is
+-- what these two tables make cheap and explicit.
+--
+-- child_runs: one row per child, written at subagent_start. It is the map
+--   from a child session to its parent, so subagent_stop never has to guess
+--   which parent a report belongs to (a reverse lookup over bindings is
+--   ambiguous when a session id is reused).
+--
+-- child_reports: one row per child, written at subagent_stop and read once by
+--   the parent's next prompt. The row is DELETED after it is delivered
+--   (one-time delivery), so a stale report can never be shown twice.
+
+CREATE TABLE IF NOT EXISTS child_runs (
+    child_session_id TEXT PRIMARY KEY,
+    child_subagent_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    parent_turn_id   TEXT NOT NULL DEFAULT '',
+    parent_subagent_id TEXT NOT NULL DEFAULT '',
+    child_role       TEXT NOT NULL DEFAULT '',
+    child_goal       TEXT NOT NULL DEFAULT '',
+    started_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_runs_parent_idx ON child_runs(parent_session_id);
+
+CREATE TABLE IF NOT EXISTS child_reports (
+    child_session_id TEXT PRIMARY KEY,
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    child_role       TEXT NOT NULL DEFAULT '',
+    child_status     TEXT NOT NULL DEFAULT '',
+    workspace_path   TEXT NOT NULL DEFAULT '',
+    workspace_slug   TEXT NOT NULL DEFAULT '',
+    workspace_repo   TEXT NOT NULL DEFAULT '',
+    dirty            TEXT NOT NULL DEFAULT 'unknown',
+    unpushed         INTEGER,
+    created_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
+"""
+
+# Tables added after v2. The schema script above creates them for a FRESH
+# database; an EXISTING live database needs them created too, and it must
+# happen WITHOUT rewriting the rows it already has.
+#
+# WHY an explicit list and not "run the whole SCHEMA again": the script is
+# already idempotent (every statement is CREATE ... IF NOT EXISTS), but
+# running it wholesale on every open would take the DDL lock on every
+# connection. Listing the additions keeps the open path cheap and makes the
+# migration auditable: this tuple IS the v3 migration.
+V3_TABLES = """
+CREATE TABLE IF NOT EXISTS child_runs (
+    child_session_id TEXT PRIMARY KEY,
+    child_subagent_id TEXT NOT NULL DEFAULT '',
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    parent_turn_id   TEXT NOT NULL DEFAULT '',
+    parent_subagent_id TEXT NOT NULL DEFAULT '',
+    child_role       TEXT NOT NULL DEFAULT '',
+    child_goal       TEXT NOT NULL DEFAULT '',
+    started_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_runs_parent_idx ON child_runs(parent_session_id);
+
+CREATE TABLE IF NOT EXISTS child_reports (
+    child_session_id TEXT PRIMARY KEY,
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    child_role       TEXT NOT NULL DEFAULT '',
+    child_status     TEXT NOT NULL DEFAULT '',
+    workspace_path   TEXT NOT NULL DEFAULT '',
+    workspace_slug   TEXT NOT NULL DEFAULT '',
+    workspace_repo   TEXT NOT NULL DEFAULT '',
+    dirty            TEXT NOT NULL DEFAULT 'unknown',
+    unpushed         INTEGER,
+    created_at       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_reports_parent_idx ON child_reports(parent_session_id);
 """
 
 # The keys of a session record that get their own column. Everything else a
@@ -276,6 +357,40 @@ def _host_connection(path: str) -> sqlite3.Connection | None:
     return None
 
 
+def _migrate_to_current(conn: sqlite3.Connection) -> None:
+    """Bring an EXISTING database up to ``SCHEMA_VERSION``, additively.
+
+    WHY this exists: the schema script only ran for a FRESH database (the
+    ``bindings`` table had to be absent). The live install's database already
+    has it, so the tables added in v3 would never be created there and every
+    child report would fail with "no such table".
+
+    WHY it is safe to run on every open: every step only CREATEs a missing
+    table or index. Nothing is dropped, retyped or rewritten, so opening an
+    old database can never lose a live session's binding. The version row
+    is read but not trusted as the sole gate - a database whose version row
+    says 3 but which is missing the tables (a half-finished upgrade) is still
+    repaired, because the CREATEs are idempotent.
+
+    WHY the failure is swallowed: a database that cannot be migrated (a
+    read-only file, a locked disk) must not make every plugin call fail. The
+    child-report code degrades to "no report" instead.
+    """
+    try:
+        row = conn.execute("SELECT value FROM kv WHERE key='schema_version'").fetchone()
+        version = 0
+        if row is not None:
+            try:
+                version = int(str(row[0]))
+            except (TypeError, ValueError):
+                version = 0
+        if version < 3:
+            conn.executescript(V3_TABLES)
+            conn.commit()
+    except Exception:
+        logger.warning("plugin db migration to v3 failed; continuing on the old schema", exc_info=True)
+
+
 def _open_connection(path: str) -> sqlite3.Connection:
     """Open a fresh connection to ``path`` with the schema in place.
 
@@ -314,6 +429,13 @@ def _open_connection(path: str) -> sqlite3.Connection:
             if have is None:
                 conn.executescript(SCHEMA)
                 conn.commit()
+            else:
+                # An EXISTING database (the live install, or one a test made
+                # before this release): bring it forward ADDITIVELY. The
+                # migration only ever CREATEs missing tables - it never
+                # drops, rewrites or retypes a row - so opening an old
+                # database can never lose a live session's binding.
+                _migrate_to_current(conn)
             # Record the version on the SAME connection, for fresh AND existing
             # databases alike: a future migration reads this row to decide what
             # to do, and an upgraded install must not look like a v1 database.
@@ -329,6 +451,56 @@ def _open_connection(path: str) -> sqlite3.Connection:
             logger.debug("could not close a failed connection", exc_info=True)
         raise
     return conn
+
+
+def connect_to(path: str | Path) -> sqlite3.Connection:
+    """Open a connection to a SPECIFIC database file, bypassing ``db_path()``.
+
+    WHY this exists: ``connect()`` resolves the path when it is called, so a
+    background thread that outlives the code that scheduled it can resolve a
+    DIFFERENT database than the one its caller meant. That is not
+    hypothetical: the plugin's own tests point the database at a tmp dir with
+    an environment override, and the override is undone when the test ends -
+    so a report thread still running after that point resolved the LIVE
+    database and wrote a row into it.
+
+    So: the caller captures the path ONCE, while its environment is still
+    what it meant, and the background thread is handed that path.
+
+    The connection is NOT cached in thread-local storage and NOT registered
+    for ``reset()``: it belongs to one caller, is closed by that caller, and
+    must not be closed by anybody else (closing another thread's connection
+    is exactly what segfaulted this process once).
+    """
+    return _open_connection(str(path))
+
+
+@contextlib.contextmanager
+def transaction_at(path: str | Path, commit: bool = True) -> Iterator[sqlite3.Connection]:
+    """One write transaction against a SPECIFIC database file.
+
+    The same contract as :func:`transaction`, but on a connection this
+    caller owns. Use it from a background thread that must not re-resolve
+    the database path.
+    """
+    conn = connect_to(path)
+    try:
+        with _WRITE_LOCK:
+            try:
+                yield conn
+            except BaseException:
+                try:
+                    conn.rollback()
+                except Exception:
+                    logger.debug("rollback failed", exc_info=True)
+                raise
+            else:
+                if commit:
+                    conn.commit()
+                else:
+                    conn.rollback()
+    finally:
+        _close_quietly(conn)
 
 
 def connect() -> sqlite3.Connection:
@@ -589,6 +761,202 @@ def workspace_key(record: dict[str, Any]) -> tuple[str, str]:
     repo = str(record.get("repo") or "")
     slug = str(record.get("slug") or "")
     return repo, slug
+
+
+# ── child lifecycle rows (v3) ───────────────────────────────────────────────
+#
+# WHY a dedicated row per child rather than a kv blob: the stop side has to
+# look the child up by its session id, and a kv blob would mean reading and
+# rewriting one JSON document per child - the exact read-modify-write race
+# this module's own docstring says cost four of eight concurrent binds.
+
+
+def write_child_run(
+    child_session_id: str,
+    parent_session_id: str,
+    *,
+    child_subagent_id: str = "",
+    parent_turn_id: str = "",
+    parent_subagent_id: str = "",
+    child_role: str = "",
+    child_goal: str = "",
+) -> None:
+    """Record a child run: which child, which parent.
+
+    Idempotent on ``child_session_id``: a re-dispatched child overwrites its
+    own row instead of accumulating duplicates.
+    """
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO child_runs(child_session_id, child_subagent_id, parent_session_id,"
+            " parent_turn_id, parent_subagent_id, child_role, child_goal, started_at)"
+            " VALUES(?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(child_session_id) DO UPDATE SET child_subagent_id=excluded.child_subagent_id,"
+            " parent_session_id=excluded.parent_session_id, parent_turn_id=excluded.parent_turn_id,"
+            " parent_subagent_id=excluded.parent_subagent_id, child_role=excluded.child_role,"
+            " child_goal=excluded.child_goal, started_at=excluded.started_at",
+            (
+                child_session_id,
+                child_subagent_id,
+                parent_session_id,
+                parent_turn_id,
+                parent_subagent_id,
+                child_role,
+                child_goal,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            ),
+        )
+
+
+def read_child_run(child_session_id: str) -> dict[str, Any] | None:
+    """The child's run row, or None when the start side never ran."""
+    if not child_session_id:
+        return None
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM child_runs WHERE child_session_id=?", (child_session_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {k: row[k] for k in row.keys()}
+
+
+def delete_child_run(child_session_id: str) -> bool:
+    """Drop a child's run row. True when one existed."""
+    if not child_session_id:
+        return False
+    with transaction() as conn:
+        cur = conn.execute("DELETE FROM child_runs WHERE child_session_id=?", (child_session_id,))
+        return cur.rowcount > 0
+
+
+def write_child_report(
+    child_session_id: str,
+    parent_session_id: str,
+    *,
+    child_role: str = "",
+    child_status: str = "",
+    workspace_path: str = "",
+    workspace_slug: str = "",
+    workspace_repo: str = "",
+    dirty: str = "unknown",
+    unpushed: int | None = None,
+) -> None:
+    """Record the child's end state, keyed by the child.
+
+    LAST STATE WINS: the row is keyed by ``child_session_id``, so a child that
+    stops twice (or is re-dispatched under the same session id) overwrites
+    its own earlier report instead of showing the parent two lines about the
+    same child.
+    """
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO child_reports(child_session_id, parent_session_id, child_role,"
+            " child_status, workspace_path, workspace_slug, workspace_repo, dirty, unpushed,"
+            " created_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(child_session_id) DO UPDATE SET parent_session_id=excluded.parent_session_id,"
+            " child_role=excluded.child_role, child_status=excluded.child_status,"
+            " workspace_path=excluded.workspace_path, workspace_slug=excluded.workspace_slug,"
+            " workspace_repo=excluded.workspace_repo, dirty=excluded.dirty,"
+            " unpushed=excluded.unpushed, created_at=excluded.created_at",
+            (
+                child_session_id,
+                parent_session_id,
+                child_role,
+                child_status,
+                workspace_path,
+                workspace_slug,
+                workspace_repo,
+                dirty,
+                unpushed,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            ),
+        )
+
+
+def write_child_report_at(
+    path: str | Path,
+    child_session_id: str,
+    parent_session_id: str,
+    *,
+    child_role: str = "",
+    child_status: str = "",
+    workspace_path: str = "",
+    workspace_slug: str = "",
+    workspace_repo: str = "",
+    dirty: str = "unknown",
+    unpushed: int | None = None,
+) -> None:
+    """Record the child's end state in a SPECIFIC database file.
+
+    The pinned-path twin of :func:`write_child_report`, for the report
+    thread. See :func:`connect_to` for why the path must be captured by the
+    caller instead of resolved here: a background thread that resolves the
+    path itself can end up in the LIVE database.
+    """
+    with transaction_at(path) as conn:
+        conn.execute(
+            "INSERT INTO child_reports(child_session_id, parent_session_id, child_role,"
+            " child_status, workspace_path, workspace_slug, workspace_repo, dirty, unpushed,"
+            " created_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(child_session_id) DO UPDATE SET parent_session_id=excluded.parent_session_id,"
+            " child_role=excluded.child_role, child_status=excluded.child_status,"
+            " workspace_path=excluded.workspace_path, workspace_slug=excluded.workspace_slug,"
+            " workspace_repo=excluded.workspace_repo, dirty=excluded.dirty,"
+            " unpushed=excluded.unpushed, created_at=excluded.created_at",
+            (
+                child_session_id,
+                parent_session_id,
+                child_role,
+                child_status,
+                workspace_path,
+                workspace_slug,
+                workspace_repo,
+                dirty,
+                unpushed,
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            ),
+        )
+
+
+def read_child_reports(parent_session_id: str) -> list[dict[str, Any]]:
+    """Every pending report for a parent session, oldest first.
+
+    Reading does NOT delete: the caller deletes what it delivered, so a
+    failed render leaves the report pending rather than losing it.
+    """
+    if not parent_session_id:
+        return []
+    conn = connect()
+    rows = conn.execute(
+        "SELECT * FROM child_reports WHERE parent_session_id=? ORDER BY created_at ASC, rowid ASC",
+        (parent_session_id,),
+    ).fetchall()
+    return [{k: row[k] for k in row.keys()} for row in rows]
+
+
+def delete_child_reports(child_session_ids: list[str]) -> int:
+    """Delete the reports that were delivered. Returns the row count."""
+    ids = [str(x) for x in child_session_ids if x]
+    if not ids:
+        return 0
+    with transaction() as conn:
+        marks = ",".join("?" for _ in ids)
+        cur = conn.execute(
+            f"DELETE FROM child_reports WHERE child_session_id IN ({marks})", tuple(ids)
+        )
+        return int(cur.rowcount or 0)
+
+
+def delete_child_reports_for_parent(parent_session_id: str) -> int:
+    """Delete every report belonging to a parent. Returns the row count."""
+    if not parent_session_id:
+        return 0
+    with transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM child_reports WHERE parent_session_id=?", (parent_session_id,)
+        )
+        return int(cur.rowcount or 0)
 
 
 def read_workspace(path: str | Path) -> dict[str, Any] | None:
