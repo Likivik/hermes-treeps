@@ -19,16 +19,21 @@ CHILDSPACE = importlib.import_module("hermes_treeps.childspace")
 
 @pytest.fixture
 def fake_repo(tmp_path, monkeypatch):
-    """A source repo the child workspace can be created from."""
-    root = tmp_path / "workspaces"
-    (root / "repo").mkdir(parents=True)
+    """A source repo the child workspace can be created from.
+
+    WHY ``repo_dir``: the workspace base is derived from it now
+    (``<repo_dir>/.workspaces``), so the input is patched and the derivation
+    is exercised for real.
+    """
+    repo_dir = tmp_path / "repos"
+    (repo_dir / "repo").mkdir(parents=True)
     source = tmp_path / "source-repo"
     (source / ".jj").mkdir(parents=True)
-    monkeypatch.setattr(STORE, "root_dir", lambda: root)
+    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
     monkeypatch.setattr(STORE, "find_repo", lambda name: source)
     monkeypatch.setattr(STORE, "is_jj", lambda repo: True)
     monkeypatch.setattr(STORE, "run", lambda cmd, **kw: None)
-    return root
+    return STORE.workspaces_base()
 
 
 PARENT_STATE = {

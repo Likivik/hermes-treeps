@@ -3,7 +3,7 @@
 One jj workspace per Hermes session, enforced.
 
 A session is either bound to a repo (its own workspace under
-`/Git/hermes/workspaces/<repo>/<slug>`) or explicitly "just chatting"
+`<repo_dir>/.workspaces/<repo>/<slug>`) or explicitly "just chatting"
 (HERMES_HOME as cwd, full capabilities). Repo-touching tools are blocked until
 the session resolves one of the two — so a workspace can never be created
 without a session record, and a session can never quietly work in someone
@@ -22,6 +22,7 @@ else's tree.
 | `vcs.py` | the jj/git adapter: one API, two backends |
 | `prepare.py` | workspace prepare step: copies ignored files (`.env`), optional setup command |
 | `childspace.py` | per-delegation child workspaces (one tree per child, never shared) |
+| `migrate_layout.py` | the one-time move from the old workspace root to the dot-dir layout |
 | `contract.py` | the delegation contract rendered into the system-prompt section |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
 
@@ -87,8 +88,7 @@ plugins:
   entries:
     hermes-treeps:
       settings:
-        workspace_root: /Git/hermes/workspaces   # where <repo>/<slug> lives
-        repo_roots: [/Git, /Git/hermes, /Git/likivik, /Git/repos]
+        repo_dir: /Git/hermes                     # the repo dir; workspaces live in its .workspaces/
         clone_root: /Git/hermes                 # where a new repo is created
         repo_sources: [local, github, forgejo]  # which catalogues the picker reads
         vcs: auto                               # auto | jj | git
@@ -101,6 +101,18 @@ plugins:
         prepare_files: [".env"]                # repo-relative files copied into the workspace
         prepare_timeout_seconds: 300           # ceiling on the prepare command (1-3600)
 ```
+
+### Deprecated settings
+
+| key | status | replacement |
+| --- | --- | --- |
+| `workspace_root` | **deprecated** — still parsed, no longer decides where a workspace goes | `repo_dir` (the root is derived: `<repo_dir>/.workspaces`) |
+| `repo_roots` | **deprecated** — still read for this release | `repo_dir` (repo discovery follows it) |
+
+Both keys are still accepted so an old config does not break the plugin, and
+an explicit value that differs from the new behaviour produces a **one-time**
+warning naming the replacement. The warning is logged once per process — not
+on every session start — because `settings()` is read on every gate check.
 
 `forgejo_token` is a secret: it is declared in the manifest with
 `type: secret` and `env: FORGEJO_TOKEN`, and is stored in `.env`, never in
@@ -120,10 +132,65 @@ form — one namespace, one source of truth. A relative path, an unknown
 `repo_sources` entry or an unknown `vcs` is refused with an error that names
 the key.
 
-Environment overrides exist for the same keys (`HERMES_TREEPS_WORKSPACE_ROOT`,
-`HERMES_TREEPS_FORGEJO_URL`, `FORGEJO_URL`, …) and win over `config.yaml`.
-`forgejo_token` is not one of them: it is a secret, and it is read from `.env`,
-not from the settings namespace.
+Environment overrides exist for the same keys (`HERMES_TREEPS_REPO_DIR`,
+`HERMES_WS_REPO_DIR`, `HERMES_TREEPS_FORGEJO_URL`, `FORGEJO_URL`, …) and win
+over `config.yaml`. `forgejo_token` is not one of them: it is a secret, and
+it is read from `.env`, not from the settings namespace.
+
+## Workspace layout
+
+Session workspaces live in a dot-dir **next to the repos they belong to**:
+
+```
+<repo_dir>/.workspaces/<repo>/<slug>       # e.g. /Git/hermes/.workspaces/hermes-treeps/hermes-treeps-ee445923
+```
+
+The old layout was `<workspace_root>/<repo>/<slug>`
+(`/Git/hermes/workspaces/hermes-treeps/…`).
+
+**Why a dot-dir.** A plain `ls /Git/hermes` shows the repos and nothing else —
+the workspaces are visible only to someone who asks for them, so a workspace
+can never be mistaken for a repo, and the repo scanner never walks into one.
+
+**Why the depth is the same.** `workspaces/<repo>/<slug>` and
+`.workspaces/<repo>/<slug>` are the same number of levels below the repo dir.
+That is what lets a moved jj workspace keep its **relative** `.jj/repo`
+pointer valid: the pointer climbs out of the workspace root and back down
+into the repo dir, and both roots sit at the same depth. The migration
+verifies this after every move and reports `verify_failed` if it does not
+hold.
+
+The slug format is unchanged: `<repo>-<last 6 of the session id>` for a
+session workspace, `<repo>-<sid6>-child-<hex>` for a delegated child.
+
+### `hermes ws migrate` — the one-time move
+
+Existing workspaces are **not** moved automatically. Run it once, by hand:
+
+```
+hermes ws migrate --dry-run    # report the plan, move nothing
+hermes ws migrate              # do it
+```
+
+The migration walks the database, and for every workspace whose recorded path
+is under the old root it applies these rules **in this order**:
+
+| rule | result | why |
+| --- | --- | --- |
+| the tree has uncommitted changes | `skipped_dirty` — **not moved** | silently relocating uncommitted work leaves it in a tree nobody is looking at; the files are still there, but the session that owned them finds a path that is gone |
+| a live session is bound to it (or has it pinned as its cwd) | `in_use` — **not moved** | moving a tree out from under a running session breaks it mid-task |
+| otherwise | `moved` | the directory is renamed, and the workspace record *and* every session binding that named the old path are rewritten |
+| it is a git worktree | `git -C <main checkout> worktree repair <new path>` | the main checkout's worktree list still names the old path, so git marks the entry `prunable` |
+| the `.jj/repo` pointer no longer resolves to the same store | `verify_failed` — **not rolled back** | a rollback is a second move, and a second move can fail in a new place; the workspace stays moved and the failure is named |
+| the worktree repair failed | `repair_failed` — **not fatal** | the move itself succeeded and the records are correct; run the repair by hand |
+
+The command prints the five buckets and their counts. The same data is
+available as a dict (`moved`, `skipped_dirty`, `in_use`, `verify_failed`,
+`repair_failed`) for anything that wants to read it.
+
+> `hermes ws migrate` used to import the legacy JSON records. That import
+> still exists under the explicit name **`hermes ws migrate-legacy`**
+> (`--purge` deletes the in-tree copies after writing a tarball backup).
 
 ## Prepare
 
@@ -164,7 +231,7 @@ The result is returned under a `prepare` key in the `ws_new` response:
 ```json
 {
   "ok": true,
-  "path": "/Git/hermes/workspaces/hermes-pylon/fix-the-widget",
+  "path": "/Git/hermes/.workspaces/hermes-pylon/fix-the-widget",
   "vcs": "jj",
   "prepare": {
     "ok": true,
@@ -217,9 +284,9 @@ lost half of eight concurrent bindings.
 The plugin install directory holds no state, so `hermes plugins update` can
 replace it without touching anything. Legacy JSON records (the old
 `state/*.json` files and the in-tree `<workspace>/.hermes/session.json` files)
-are imported into the database by an explicit `hermes ws migrate` — nothing
-imports them on open. `hermes ws migrate --purge` deletes the in-tree copies
-after writing a tarball backup of them.
+are imported into the database by an explicit `hermes ws migrate-legacy` —
+nothing imports them on open. `hermes ws migrate-legacy --purge` deletes the
+in-tree copies after writing a tarball backup of them.
 
 ## Requirements
 

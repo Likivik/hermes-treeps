@@ -21,11 +21,18 @@ WorkspaceError = STORE.WorkspaceError
 
 
 def _fake_root(tmp_path, monkeypatch, repo="repo", slug="ws1", sessions=("sid-a",)):
-    """A workspace root under tmp_path, with one real workspace in it."""
-    root = tmp_path / "workspaces"
+    """A workspace root under tmp_path, with one real workspace in it.
+
+    WHY ``repo_dir``: the workspace base is DERIVED from it now
+    (``<repo_dir>/.workspaces``). The input is patched and the derivation is
+    exercised, so a bug in the derivation cannot hide behind the fixture.
+    """
+    repo_dir = tmp_path / "repos"
+    repo_dir.mkdir(exist_ok=True)
+    root = repo_dir / ".workspaces"
     ws = root / repo / slug
     ws.mkdir(parents=True)
-    monkeypatch.setattr(STORE, "root_dir", lambda: root)
+    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
     STORE.write_record(ws, {
         "repo": repo,
         "slug": slug,
@@ -327,12 +334,21 @@ def test_a_clean_child_workspace_becomes_retirable_after_the_ttl(tmp_path, monke
     child's commit is the handoff artifact and is usually not pushed, so the
     pushed-state test kept them in tier2 permanently.
     """
-    ws = tmp_path / "repo" / "parent-child-abc123"
+    ws = tmp_path / "repos" / ".workspaces" / "repo" / "parent-child-abc123"
     ws.mkdir(parents=True)
     monkeypatch.setattr(
         STORE,
+        "repo_dir",
+        lambda: tmp_path / "repos",
+    )
+    monkeypatch.setattr(
+        STORE,
         "settings",
-        lambda: {"workspace_root": str(tmp_path), "repo_roots": [str(tmp_path)]},
+        lambda: {
+            "repo_dir": str(tmp_path / "repos"),
+            "workspace_root": str(tmp_path / "repos" / ".workspaces"),
+            "repo_roots": [str(tmp_path)],
+        },
     )
     STORE.write_record(
         ws,

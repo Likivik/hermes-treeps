@@ -136,9 +136,42 @@ def db_path() -> Path:
     return db.db_path()
 
 
+def repo_dir() -> Path:
+    """The repo directory: everything the plugin owns lives under it."""
+    return Path(settings()["repo_dir"])
+
+
+def workspaces_base() -> Path:
+    """Where session workspaces live: ``<repo_dir>/.workspaces``.
+
+    WHY a dot-dir next to the repos: a plain ``ls /Git/hermes`` shows the
+    repos and nothing else - the workspaces are visible only to someone who
+    asks for them, so a workspace can never be mistaken for a repo (and the
+    repo scanner cannot walk into one).
+    """
+    return repo_dir() / ".workspaces"
+
+
+def ws_path(repo_name: str, slug: str) -> Path:
+    """The canonical path of one workspace: ``<base>/<repo>/<slug>``.
+
+    EVERY workspace path goes through here. The old layout was
+    ``<workspace_root>/<repo>/<slug>`` and the new one is
+    ``<repo_dir>/.workspaces/<repo>/<slug>`` - the depth below the base is
+    the SAME (one repo level, one slug level), which is what lets a moved
+    workspace keep its relative ``.jj/repo`` pointer valid.
+    """
+    return workspaces_base() / repo_name / slug
+
+
 def root_dir() -> Path:
-    """Workspace root: the configured one (``settings.workspace_root``)."""
-    return Path(settings()["workspace_root"])
+    """Workspace root: the derived one (``<repo_dir>/.workspaces``).
+
+    Kept as the historical name - the readers in the gate, the gc tiers and
+    the CLI all mean "the directory the workspaces live under", and that
+    directory is now DERIVED from repo_dir rather than configured.
+    """
+    return workspaces_base()
 
 
 # ── per-session state ─────────────────────────────────────────────────────────
@@ -253,7 +286,8 @@ def run(cmd: list[str], cwd: Path | None = None) -> str:
 
 
 def workspace_path(repo_name: str, slug: str) -> Path:
-    return root_dir() / repo_name / slug
+    """The canonical path of a workspace (the one and only derivation)."""
+    return ws_path(repo_name, slug)
 
 
 def sanitize_slug(slug: str) -> str:

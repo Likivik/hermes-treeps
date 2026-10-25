@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import childspace, contract, prepare, store
+from . import childspace, contract, migrate_layout, prepare, store
 from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ _PROMPT_TEMPLATE = """\
 This session starts unresolved. Repository work - anything that reads, writes or
 runs commands in a checkout - requires a workspace first:
 
-- `ws_new(repo, slug)` creates `/Git/hermes/workspaces/<repo>/<slug>` and binds
+- `ws_new(repo, slug)` creates `<repo_dir>/.workspaces/<repo>/<slug>` and binds
   this session to it. Use for any real work: code, docs, config, git. Omit slug
   and it defaults to `<repo>-<last 6 of the session id>` - the path is derived
   from the id, never from the session title, because titles get renamed.
@@ -622,6 +622,7 @@ def _tool_doctor(args: dict[str, Any], **kw: Any) -> str:
             "remote_error": remote_error,
             "tools": {"jj": shutil.which("jj"), "gh": shutil.which("gh")},
             "db_path": str(store.db_path()),
+            "repo_dir": str(store.repo_dir()),
             "workspace_root": str(store.root_dir()),
         }
         if args.get("forget"):
@@ -959,14 +960,28 @@ def _register_cli(subparser) -> None:
 
     p_mig = sub.add_parser(
         "migrate",
-        help="import the legacy JSON records into the plugin database (idempotent)",
+        help="move workspaces from the old <workspace_root>/<repo>/<slug> layout "
+             "to the new <repo_dir>/.workspaces/<repo>/<slug> layout (one-time)",
     )
     p_mig.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would move, move nothing",
+    )
+
+    # The legacy JSON-record import used to be `hermes ws migrate`. It keeps
+    # working under an explicit name, because the one-time LAYOUT migration
+    # now owns the short form.
+    p_legacy = sub.add_parser(
+        "migrate-legacy",
+        help="import the legacy JSON records into the plugin database (idempotent)",
+    )
+    p_legacy.add_argument(
         "--purge",
         action="store_true",
         help="after importing, delete the in-tree .hermes/session.json files (backed up first)",
     )
-    p_mig.add_argument(
+    p_legacy.add_argument(
         "--dry-run",
         action="store_true",
         help="with --purge: list the files that would be deleted and delete none",
@@ -1059,6 +1074,23 @@ def _cli(args) -> int:
             print("session marked as chatting")
             return 0
         if action == "migrate":
+            # The one-time LAYOUT migration: move the workspaces that live
+            # under the old root into the dot-dir layout. It never runs
+            # implicitly - the operator asks for it once.
+            out = migrate_layout.migrate_workspaces(dry_run=bool(getattr(args, "dry_run", False)))
+            print(migrate_layout.report_text(out))
+            if getattr(args, "dry_run", False):
+                print("\ndry run: nothing was moved")
+            else:
+                print(
+                    f"\nmoved {len(out.get('moved') or [])}, "
+                    f"skipped {len(out.get('skipped_dirty') or [])} dirty, "
+                    f"in use {len(out.get('in_use') or [])}, "
+                    f"verify failed {len(out.get('verify_failed') or [])}, "
+                    f"repair failed {len(out.get('repair_failed') or [])}"
+                )
+            return 0
+        if action == "migrate-legacy":
             out = store.migrate_legacy(dry_run=bool(getattr(args, "dry_run", False)))
             print(json.dumps(out, indent=2, default=str))
             if not getattr(args, "purge", False):
@@ -1088,7 +1120,7 @@ def register(ctx) -> None:
         setup_fn=_register_cli,
         handler_fn=_cli,
         description=(
-            "Session-owned workspaces under /Git/hermes/workspaces/<repo>/<slug>. "
+            "Session-owned workspaces under <repo_dir>/.workspaces/<repo>/<slug>. "
             "Creates the jj workspace and its record in the plugin database together."
         ),
     )

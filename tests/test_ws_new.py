@@ -19,16 +19,22 @@ def _ws_new(args, sid):
 
 @pytest.fixture
 def fake_repo(tmp_path, monkeypatch):
-    """A source repo create() can pretend to work against."""
-    root = tmp_path / "workspaces"
-    (root / "repo").mkdir(parents=True)
+    """A source repo create() can pretend to work against.
+
+    WHY ``repo_dir`` and not ``root_dir``: the workspace base is DERIVED
+    from repo_dir now (``<repo_dir>/.workspaces``), so patching the derived
+    base alone would leave the derivation untested. Patching the input keeps
+    the real derivation in the path under test.
+    """
+    repo_dir = tmp_path / "repos"
+    (repo_dir / "repo").mkdir(parents=True)
     source = tmp_path / "source-repo"
     source.mkdir()
-    monkeypatch.setattr(STORE, "root_dir", lambda: root)
+    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
     monkeypatch.setattr(STORE, "find_repo", lambda name: source)
     monkeypatch.setattr(STORE, "is_jj", lambda repo: False)
     monkeypatch.setattr(STORE, "run", lambda cmd, **kw: None)
-    return root
+    return STORE.workspaces_base()
 
 
 def test_ws_new_binds_the_CANONICAL_slug(fake_repo, state_home):
@@ -154,9 +160,12 @@ def test_ws_new_default_slug_follows_the_session_id(fake_repo, state_home):
 @pytest.fixture
 def empty_workspace_root(tmp_path, monkeypatch):
     """A workspace root with nothing in it, and a repo that is not on disk."""
-    root = tmp_path / "workspaces"
-    root.mkdir()
-    monkeypatch.setattr(STORE, "root_dir", lambda: root)
+    repo_dir = tmp_path / "repos"
+    repo_dir.mkdir()
+    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
+    # The derived base exists but is EMPTY: "nothing was created" has to be
+    # observable, and a missing directory cannot be listed.
+    STORE.workspaces_base().mkdir(parents=True, exist_ok=True)
 
     def _missing(name):
         raise STORE.WorkspaceError(f"no repo {name!r} under /Git - existing: ")
@@ -165,7 +174,7 @@ def empty_workspace_root(tmp_path, monkeypatch):
     monkeypatch.setattr(STORE, "clone_repo", lambda name, url: pytest.fail(
         "nothing may be cloned without the user's approval"
     ))
-    return root
+    return STORE.workspaces_base()
 
 
 def _fake_remote(monkeypatch, entries):
