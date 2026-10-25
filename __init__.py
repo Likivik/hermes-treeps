@@ -326,17 +326,94 @@ def _pinned_workspace() -> str:
     return str(candidate) if candidate.is_dir() else ""
 
 
+def _caller_is_delegated_child() -> bool:
+    """Is the CALLING session a delegated child?
+
+    The same resolution the gate uses: ``is_delegated_child_context()`` is a
+    task-local ContextVar set by the host's ``_run_single_child`` and
+    inherited by the child's tool dispatch. It is False for every fresh
+    session.
+
+    WHY there is no module global here: a global can only ever name ONE
+    delegation, so two children in flight would read each other's answer.
+    Wave A removed ``_LAST_DELEGATION`` for exactly that reason and it must
+    not come back in another shape.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return bool(is_delegated_child_context())
+    except Exception:
+        # No delegation context module (a plain session, or a test): the
+        # caller is NOT a child. Failing open here would be wrong - it would
+        # let an unclassifiable caller mint a user workspace.
+        return False
+
+
+def _forced_child_shape(sid: str) -> tuple[str, str]:
+    """The (purpose, slug) a delegated child's workspace MUST carry.
+
+    WHY this exists: on 2026-10-25 a builder child called
+    ``ws_new(repo='hermes-treeps', purpose='feat: picker UI - flat tagged
+    list, two-step clone, background bind')`` - it passed its own goal text
+    as the purpose, and the handler stamped that goal text into the record.
+    The workspace then classified as a USER workspace: immediate reclaim
+    refused it, ``ws gc --children`` skipped it, and ``gc_apply`` never
+    retired it while the session binding existed. The tree and its record
+    leaked until a human ran ``jj workspace forget`` and ``rm`` by hand.
+
+    WHY the shape is FORCED rather than merely validated: an agent-run child
+    cannot be trusted to label its own workspaces, and an unlabelled one is
+    unreclaimable BY CONSTRUCTION - every reclaim path keys on the child
+    prefix. So the caller's purpose AND slug are both ignored and the
+    child shape is derived from the same sources the gate uses.
+
+    Returns ``("", "")`` when the caller is not a delegated child, or when
+    the child's parent cannot be resolved (the gate blocks such a child
+    anyway; minting a user workspace here would be the leak again).
+    """
+    if not _caller_is_delegated_child():
+        return "", ""
+    parent_session_id = _resolve_child_parent(sid)
+    if not parent_session_id:
+        return "", ""
+    purpose = f"{store.CHILD_PURPOSE_PREFIX}{parent_session_id}"
+    # The slug shape matches childspace.ensure_child_workspace exactly:
+    # "<parent slug>-child-<last 6 of the child session id>", sanitised.
+    parent_slug = ""
+    try:
+        parent_state = store.read_state(parent_session_id) or {}
+        parent_slug = str(parent_state.get("slug") or "")
+    except Exception:
+        logger.debug("could not read the parent's binding for %s", parent_session_id, exc_info=True)
+    raw_slug = f"{parent_slug}-child-{str(sid)[-6:]}" if parent_slug else f"child-{str(sid)[-6:]}"
+    slug = store.sanitize_slug(raw_slug)
+    if not slug:
+        return "", ""
+    return purpose, slug
+
+
 def _tool_new(args: dict[str, Any], **kw: Any) -> str:
     try:
         sid = _session_id(kw)
         title = str(args.get("title") or "").strip()
         slug = str(args.get("slug") or "").strip()
         purpose = str(args.get("purpose") or "")
-        if purpose.startswith("child:"):
+        # LAYER 1: a delegated child may not mint a user-class workspace.
+        # Its purpose and slug are IGNORED and the child shape is forced -
+        # see _forced_child_shape() for the live failure this prevents.
+        child_purpose, child_slug = _forced_child_shape(sid)
+        forced_child = bool(child_purpose)
+        if forced_child:
+            purpose = child_purpose
+            slug = child_slug
+        if purpose.startswith("child:") and not forced_child:
             # Reserved: childspace writes this prefix into workspace records,
             # and gc classifies child workspaces by it. A user-set purpose with
             # the same prefix would make a normal workspace look like a
             # throwaway child and get collected on age alone.
+            # A FORCED child purpose is the plugin's own stamp, not the
+            # caller's - it is exactly what the reserved prefix is for.
             return json.dumps({"ok": False, "error": "purpose: the 'child:' prefix is reserved for delegated-child workspaces"})
 
         existing = store.read_state(sid)
@@ -746,6 +823,71 @@ def _resolve_child_parent(child_sid: str) -> str:
     return ""
 
 
+def _self_heal_child_record(sid: str, parent_session_id: str) -> bool:
+    """Restamp THIS child's own workspace record to the child marker.
+
+    LAYER 2 of the "a child may not mint a user-class workspace" fix.
+
+    WHY this exists: before layer 1, a delegated child could call ws_new with
+    its own goal text as the purpose, and the record was stamped with that
+    goal text. The workspace then classified as a USER workspace: immediate
+    reclaim refused it, ``ws gc --children`` skipped it, and ``gc_apply``
+    never retired it while the session binding existed. The tree and its
+    record leaked until a human intervened - which is exactly what we had to
+    do on 2026-10-25 (``jj workspace forget`` + ``rm`` by hand).
+
+    This is the SELF-HEAL for records that leaked BEFORE the fix: on the
+    child's next gated call the record is restamped, so it rejoins the
+    reclaim system instead of leaking forever.
+
+    It is ONE UPDATE and it is IDEMPOTENT: a record that already carries the
+    child prefix is left alone, so the hot path does not rewrite the record
+    on every gated call.
+
+    A user's workspace is never touched: the restamp only happens when the
+    session resolves as a delegated child AND the child's own session id is
+    in the workspace record's session list - i.e. this child OWNS the
+    workspace. A workspace the child merely INHERITED from its parent (the
+    chatting/external fallback) belongs to the parent and keeps the parent's
+    classification.
+    """
+    if not sid or not parent_session_id:
+        return False
+    wanted = f"{store.CHILD_PURPOSE_PREFIX}{parent_session_id}"
+    try:
+        state = store.read_state(sid) or {}
+        path = str(state.get("path") or "")
+        if not path or state.get("mode") != "repo":
+            return False
+        record = store.read_record(Path(path))
+        if record is None:
+            return False
+        if str(record.get("purpose") or "") == wanted:
+            return False  # already correct: idempotent no-op
+        if str(record.get("purpose") or "").startswith(store.CHILD_PURPOSE_PREFIX):
+            # It is SOME child's workspace. Do not re-stamp it: the prefix
+            # names a different parent, and rewriting it would move the
+            # workspace into another parent's reclaim bucket.
+            return False
+        # The child must OWN the workspace. A workspace the child merely
+        # inherited from its parent is the parent's, and restamping it would
+        # put the parent's workspace into the child reclaim bucket.
+        sessions = [str(s) for s in (record.get("sessions") or [])]
+        if sid not in sessions:
+            return False
+        record["purpose"] = wanted
+        store.write_record(Path(path), record)
+        logger.info(
+            "gate: restamped leaked workspace %s to the child marker (%s)", path, wanted
+        )
+        return True
+    except Exception:
+        # The self-heal is best-effort: a broken bookkeeping path must never
+        # gate-block the child.
+        logger.debug("could not self-heal the child record for %s", sid, exc_info=True)
+        return False
+
+
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
     """Block repo-touching tools until the session resolves a workspace."""
     # WHY the recency tracker is NOT read here any more: it is process-global,
@@ -766,6 +908,16 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                 state = store.read_state(sid) or {}
                 if str(state.get("purpose") or "").startswith(store.CHILD_PURPOSE_PREFIX):
                     store.record_child_heartbeat(sid)
+                else:
+                    # LAYER 2 (self-heal), bound branch: a record this child
+                    # created BEFORE the fix carries goal text instead of the
+                    # child marker, so it classifies as a USER workspace -
+                    # and a bound USER workspace is exactly what gc_apply
+                    # never retires. Restamp it here, on the child's next
+                    # gated call, so the already-leaked records rejoin the
+                    # reclaim system instead of leaking forever.
+                    if _caller_is_delegated_child():
+                        _self_heal_child_record(sid, _resolve_child_parent(sid))
             except Exception:
                 # Broken heartbeat bookkeeping must not gate-block the child.
                 pass
@@ -824,6 +976,12 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
                     ),
                 }
             parent_state = store.read_state(parent) or {} if parent else {}
+            # LAYER 2 (self-heal): a record this child created BEFORE the
+            # fix carries goal text instead of the child marker, so it
+            # classifies as a USER workspace and no reclaim path ever
+            # touches it. Restamp it here - one idempotent UPDATE - so it
+            # rejoins the reclaim system on the child's next gated call.
+            _self_heal_child_record(sid, parent)
             if parent_state.get("mode") not in {"repo", "chatting", "external"}:
                 return {
                     "action": "block",
