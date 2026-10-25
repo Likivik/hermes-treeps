@@ -433,6 +433,15 @@ def gc_apply() -> list[str]:
             # time, and the stale trees it exists to remove stayed. One
             # broken workspace must not stop the other retirements.
             logger.warning("gc could not retire %s: %s", item["slug"], e)
+    # Workspaceless session rows (cron, chat-only) never fire the session-end
+    # hook, so they accumulate one per run and make "live" mean nothing.
+    # They claim no path, so pruning them cannot pin or unpin any tree.
+    try:
+        pruned = db.prune_workspaceless_bindings()
+        if pruned:
+            logger.debug("gc pruned %d workspaceless session row(s)", pruned)
+    except Exception as exc:  # a broken prune must not fail the sweep
+        logger.warning("gc could not prune workspaceless session rows: %s", exc)
     return done
 
 
