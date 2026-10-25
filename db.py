@@ -1029,6 +1029,26 @@ def delete_binding(session_id: str) -> bool:
         return cur.rowcount > 0
 
 
+def prune_workspaceless_bindings(older_than_days: int = 1) -> int:
+    """Drop session rows that never claimed a workspace. Returns rows deleted.
+
+    WHY: a cron or chat-only session hits the gate, gets a binding row so the
+    session has somewhere to record its mode, and then never fires
+    ``on_session_finalize``. Those rows claim no path, so they pin no tree and
+    every liveness check ignores them - but one per cron run accumulates
+    forever, and a table full of sessions that will never end is how "live"
+    stops meaning anything. Deleting them cannot lose state: a row with no
+    path has nothing to point at.
+    """
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - older_than_days * 86400))
+    with transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM bindings WHERE COALESCE(slug, '') = '' AND COALESCE(updated_at, '') < ?",
+            (cutoff,),
+        )
+        return cur.rowcount
+
+
 def workspace_key(record: dict[str, Any]) -> tuple[str, str]:
     repo = str(record.get("repo") or "")
     slug = str(record.get("slug") or "")
