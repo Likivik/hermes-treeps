@@ -352,3 +352,5 @@ def test_a_clean_child_workspace_becomes_retirable_after_the_ttl(tmp_path, monke
     tiers = STORE.gc_tiers()
     slugs = [item["slug"] for item in tiers["tier1"]]
     assert ws.name in slugs, tiers
+
+

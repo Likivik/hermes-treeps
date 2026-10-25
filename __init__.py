@@ -859,6 +859,22 @@ def _opening_prompt() -> str:
     )
 
 
+def _maybe_child_gc() -> None:
+    """Once a day: retire expired CHILD workspaces (never user workspaces)."""
+    try:
+        import time as _t
+
+        last = float(store.db.get_kv("last_child_gc_at") or 0)
+        if _t.time() - last < 86400:
+            return
+        store.db.set_kv("last_child_gc_at", str(_t.time()))
+        done = store.gc_children_apply()
+        if done:
+            logger.info("child gc: retired %s", ", ".join(done))
+    except Exception:
+        logger.debug("child gc skipped", exc_info=True)
+
+
 def _on_session_start(session_id: str = "", **kw: Any) -> None:
     """Seed the first turn so the choice prompt is the first thing the user sees.
 
@@ -870,6 +886,7 @@ def _on_session_start(session_id: str = "", **kw: Any) -> None:
     try:
         sid = session_id or _session_id(kw)
         picker.note_session_id(sid)
+        _maybe_child_gc()
         detail = store.resolve_detail(sid)
         if detail["state"] == "bound":
             # Resumed session: re-pin (a chatting session has no path, and
