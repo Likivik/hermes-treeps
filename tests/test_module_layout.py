@@ -88,3 +88,36 @@ def test_the_split_modules_import_cleanly():
             f"{name}.py does not import cleanly in a fresh interpreter:\n"
             f"{result.stdout}\n{result.stderr}"
         )
+
+
+def test_store_module_is_storage_only():
+    """Prevents: the policy creeping back into the record layer.
+
+    gc/retire/sessions were split out so reclamation policy has one home each;
+    a store.py that grows past this ceiling again means the split is being
+    undone by accretion.
+    """
+    lines = len((ROOT / "store.py").read_text().splitlines())
+    assert lines < 1300, f"store.py regrew to {lines}"
+
+
+def test_split_modules_import_cleanly_in_a_fresh_interpreter():
+    """Prevents: an import cycle that only shows up in a cold start.
+
+    The lazy re-exports in store.py hide cycles at runtime; this proves each
+    module stands alone when it is the FIRST thing imported.
+    """
+    for mod in ("sessions", "gc", "retire"):
+        proc = _fresh_interpreter(f"import {IMPORT_NAME}.{mod}\n")
+        assert proc.returncode == 0, f"{mod}: {proc.stderr}"
+
+
+def test_store_reexports_still_resolve():
+    """Prevents: a moved name disappearing from store's old surface."""
+    body = f"""
+from {IMPORT_NAME} import store
+for name in ("gc_tiers", "gc_apply", "reclaim_child_workspace", "reclaim_children", "retire"):
+    assert callable(getattr(store, name)), name
+"""
+    proc = _fresh_interpreter(body)
+    assert proc.returncode == 0, proc.stderr
