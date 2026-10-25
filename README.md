@@ -234,6 +234,20 @@ looser `child_heartbeat_stale()` helper answers the general liveness question
 and falls back to the workspace's own age when no heartbeat was ever written —
 but the reclamation's backstop does not use it.
 
+**Children cannot create user workspaces.** Every reclaim path keys on the
+`child:` purpose prefix, so a workspace whose record carries anything else is
+invisible to the collector — and a workspace bound to a live session is never
+retired by `gc_apply` either. An agent-run child cannot be trusted to label
+its own workspaces: it passes its goal text as the purpose, and the record
+was stamped with it. So `ws_new` **forces** the child shape when the calling
+session is a delegated child: the caller's purpose and slug are ignored, and
+both are derived from the same per-child channels the gate uses
+(`child:<parent session id>` and `<parent slug>-child-<sid6>`). Any record a
+child creates is therefore child-classified and reclaimable. Records that
+leaked before this rule are restamped on the child's next gated call — one
+idempotent update — so they rejoin the collection system instead of staying
+on disk until a human removes them.
+
 ## Automatic child collection (optional)
 
 Child workspaces (delegated children) are reclaimable once they are 14 days
