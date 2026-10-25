@@ -788,6 +788,175 @@ def session_for_chat(chat_id: Any, thread_id: Any = None) -> dict[str, Any] | No
 # commit stays recoverable as a dangling commit until the repo's own gc.
 CHILD_TTL_DAYS = 14
 
+# A hard-dead child (the gateway restarted mid-child) never receives the
+# ``subagent_stop`` event, so it never gets the graceful ``session_ended_at``
+# stamp. The heartbeat is the second, independent marker for that case.
+CHILD_HEARTBEAT_STALE_HOURS = 24
+CHILD_HEARTBEAT_KEY_PREFIX = "child_seen:"
+CHILD_HEARTBEAT_MIN_INTERVAL_S = 60
+
+
+def child_heartbeat_key(session_id: str) -> str:
+    """The kv key holding one child's last gated-tool heartbeat."""
+    return f"{CHILD_HEARTBEAT_KEY_PREFIX}{session_id}"
+
+
+def record_child_heartbeat(session_id: str, *, now: float | None = None) -> bool:
+    """Record one child heartbeat, rate-limited to one write per minute.
+
+    WHY the read-then-write: a child can make hundreds of gated calls per
+    minute, and one sqlite upsert per call is needless WAL churn. The
+    heartbeat only needs minute-level resolution for a 24-hour staleness
+    threshold.
+
+    WHY this must never raise: the heartbeat is liveness evidence, not a
+    gate. A broken database write must not block the child's tool call or
+    turn a bookkeeping failure into a workspace-access failure.
+    """
+    if not session_id:
+        return False
+    stamp = time.time() if now is None else float(now)
+    key = child_heartbeat_key(session_id)
+    try:
+        previous = db.get_kv(key)
+        if previous:
+            try:
+                if stamp - float(previous) < CHILD_HEARTBEAT_MIN_INTERVAL_S:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        db.set_kv(key, f"{stamp:.6f}")
+        return True
+    except Exception as exc:
+        # A failed heartbeat must not gate-block the child: liveness evidence
+        # is best-effort, and turning its failure into a blocked tool call
+        # would strand a healthy child.
+        logger.warning("could not record child heartbeat for %s: %s", session_id, exc)
+        return False
+
+
+def _parse_timestamp(raw: str) -> float | None:
+    """Parse a heartbeat or workspace timestamp into epoch seconds."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return float(calendar.timegm(time.strptime(text[:19], fmt)))
+        except Exception:
+            continue
+    return None
+
+
+def child_heartbeat_stale(
+    session_id: str,
+    stale_hours: int = CHILD_HEARTBEAT_STALE_HOURS,
+    *,
+    record: dict[str, Any] | None = None,
+    path: str | Path | None = None,
+) -> bool:
+    """True when this child has no fresh heartbeat.
+
+    A heartbeat older than ``stale_hours`` is stale. When no heartbeat was
+    ever written, the WORKSPACE record's ``created_at`` is the age anchor:
+    a brand-new child that has not called a gated tool yet must not look
+    dead. ``updated_at`` and the tree mtime are fallbacks for an older
+    record that has no creation stamp.
+
+    NOTE: the hard-death backstop is stricter - it requires a heartbeat that
+    EXISTS and is stale (see :func:`_child_hard_dead`). This helper answers
+    the general liveness question; the backstop needs positive evidence.
+    """
+    age_s = max(0.0, float(stale_hours) * 3600.0)
+    try:
+        raw = db.get_kv(child_heartbeat_key(session_id))
+    except Exception:
+        raw = None
+    seen = _parse_timestamp(raw or "")
+    if seen is not None:
+        return (time.time() - seen) > age_s
+
+    anchor: Any = None
+    if record:
+        anchor = record.get("created_at") or record.get("updated_at")
+    if not anchor and path:
+        try:
+            anchor = Path(path).stat().st_mtime
+        except Exception:
+            anchor = None
+    if anchor is None:
+        state = read_state(session_id) or {}
+        anchor = state.get("updated_at")
+    created = _parse_timestamp(str(anchor or ""))
+    if created is None:
+        return False
+    return (time.time() - created) > age_s
+
+
+def _child_hard_dead(
+    record: dict[str, Any],
+    path: str | Path,
+    *,
+    stale_hours: int = CHILD_HEARTBEAT_STALE_HOURS,
+) -> bool:
+    """True only when BOTH heartbeat staleness and workspace age exceed 24h.
+
+    A missing heartbeat alone is not enough: a brand-new child that has not
+    called a gated tool has no heartbeat yet. The two-threshold rule is the
+    extra-sure guard against reclaiming a live child.
+
+    WHY the heartbeat must EXIST here: a child with no heartbeat at all has
+    never proved life through the plugin, so only its age can speak for it.
+    The hard-death path requires positive evidence that the child WAS alive
+    and then stopped reporting.
+    """
+    age_days = _workspace_age_days(record, Path(path))
+    if age_days * 24.0 <= float(stale_hours):
+        return False
+    sids = [str(x) for x in (record.get("sessions") or [])]
+    if not sids:
+        return False
+    for sid in sids:
+        try:
+            raw = db.get_kv(child_heartbeat_key(sid))
+        except Exception:
+            return False
+        seen = _parse_timestamp(raw or "")
+        if seen is None:
+            # No heartbeat was ever written: absence is not a stale marker.
+            return False
+        if (time.time() - seen) <= float(stale_hours) * 3600.0:
+            return False
+    return True
+
+
+def _child_workspace_records() -> list[dict[str, Any]]:
+    """Every child workspace record, read straight from the database.
+
+    WHY this exists: the gc sweep walks the workspace ROOT on disk, so a
+    record whose tree lives outside that root would be invisible to it.
+    The database is the plugin's own index of every workspace it created,
+    so the dual-marker rule must consult it too.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        rows = db.all_workspaces()
+    except Exception:
+        rows = []
+    for record in rows:
+        if not str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX):
+            continue
+        path = str(record.get("path") or "")
+        if not path:
+            continue
+        out.append({**record, "path": path, "slug": str(record.get("slug") or Path(path).name)})
+    return out
+
+
 # Written into a workspace record's `purpose` by childspace when a delegated
 # child gets its own tree. One definition, imported by childspace, so gc and
 # the creator cannot disagree about what a child workspace is.
@@ -1141,7 +1310,15 @@ def reclaim_child_workspace(
     # WHY: a session bound to the tree, or with the tree pinned as its
     # cwd, is still working in it. Removing it mid-task is how a session
     # loses its files.
-    if os.path.normpath(str(ws)) in jjlayout.live_session_paths(db):
+    #
+    # The hard-death exception is deliberately narrow: a child that can
+    # never be stamped ended (the gateway restarted mid-child) would be
+    # stranded forever if the end stamp were mandatory. It is waived ONLY
+    # when the heartbeat is stale AND the workspace is older than both
+    # thresholds - belt and braces, so one missing marker cannot delete a
+    # live tree.
+    hard_dead = _child_hard_dead(record, ws)
+    if os.path.normpath(str(ws)) in jjlayout.live_session_paths(db) and not hard_dead:
         out.update(
             {
                 "reason": RECLAIM_REFUSED_IN_USE,
@@ -1415,6 +1592,7 @@ def _ended_child_workspaces() -> list[dict[str, Any]]:
     authoritative one runs inside :func:`reclaim_child_workspace`.
     """
     out: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for item in list_workspaces():
         record = item.get("record") or {}
         if not str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX):
@@ -1423,9 +1601,26 @@ def _ended_child_workspaces() -> list[dict[str, Any]]:
         if not sids:
             continue
         states = [read_state(sid) or {} for sid in sids]
-        if not all(st.get("session_ended_at") for st in states):
+        ended = all(st.get("session_ended_at") for st in states)
+        if not ended and not _child_hard_dead(record, item.get("path") or ""):
             continue
         out.append({"slug": str(item.get("slug") or ""), "path": str(item.get("path") or "")})
+        seen.add(str(item.get("path") or ""))
+    # The disk walk above only sees trees under the workspace root. The
+    # database also knows about child workspaces elsewhere, and a hard-dead
+    # orphan must be reclaimable wherever its tree lives.
+    for record in _child_workspace_records():
+        path = str(record.get("path") or "")
+        if path in seen:
+            continue
+        sids = [str(x) for x in (record.get("sessions") or [])]
+        if not sids:
+            continue
+        states = [read_state(sid) or {} for sid in sids]
+        ended = all(st.get("session_ended_at") for st in states)
+        if not ended and not _child_hard_dead(record, path):
+            continue
+        out.append({"slug": str(record.get("slug") or ""), "path": path})
     return out
 
 
@@ -1455,20 +1650,25 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
     tier3: a bound session is still live                          -> in use
     """
     tiers: dict[str, list[dict[str, Any]]] = {"tier1": [], "tier2": [], "tier3": []}
+    listed: set[str] = set()
     for item in list_workspaces():
         record = item["record"] or {}
         path = Path(item["path"])
+        listed.add(str(path))
         sids = [str(x) for x in (record.get("sessions") or [])]
         if item["orphan"] or not sids:
             tiers["tier2"].append({**item, "why": "orphan: no bound session record"})
             continue
         states = [read_state(sid) or {} for sid in sids]
-        if not all(st.get("session_ended_at") for st in states):
+        ended = all(st.get("session_ended_at") for st in states)
+        is_child = str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX)
+        hard_dead = is_child and _child_hard_dead(record, path)
+        if not ended and not hard_dead:
             tiers["tier3"].append({**item, "why": "session still live"})
             continue
         # Child workspaces: unpublished by design, so the "pushed" test that
         # protects a session's own work does not apply. Age does.
-        if str(record.get("purpose") or "").startswith(CHILD_PURPOSE_PREFIX):
+        if is_child:
             if dirty(path):
                 tiers["tier2"].append({**item, "why": "child workspace with uncommitted changes"})
                 continue
@@ -1500,6 +1700,49 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
             )
         else:
             tiers["tier1"].append({**item, "why": "ended, clean, pushed, no open PRs"})
+    # The disk walk only sees trees under the workspace root. The database
+    # also knows about child workspaces elsewhere; a hard-dead orphan must
+    # be reclaimable wherever its tree lives.
+    for record in _child_workspace_records():
+        path = str(record.get("path") or "")
+        if path in listed:
+            continue
+        listed.add(path)
+        item = {
+            "repo": str(record.get("repo") or ""),
+            "slug": str(record.get("slug") or Path(path).name),
+            "path": path,
+            "record": record,
+            "orphan": False,
+        }
+        sids = [str(x) for x in (record.get("sessions") or [])]
+        if not sids:
+            tiers["tier2"].append({**item, "why": "orphan: no bound session record"})
+            continue
+        states = [read_state(sid) or {} for sid in sids]
+        ended = all(st.get("session_ended_at") for st in states)
+        hard_dead = _child_hard_dead(record, path)
+        if not ended and not hard_dead:
+            tiers["tier3"].append({**item, "why": "session still live"})
+            continue
+        if dirty(Path(path)):
+            tiers["tier2"].append({**item, "why": "child workspace with uncommitted changes"})
+            continue
+        age_days = _workspace_age_days(record, Path(path))
+        if age_days >= CHILD_TTL_DAYS:
+            tiers["tier1"].append(
+                {**item, "why": f"child workspace, clean, {age_days:.0f}d old"}
+            )
+        else:
+            tiers["tier2"].append(
+                {
+                    **item,
+                    "why": (
+                        f"child workspace, clean, {age_days:.0f}d old "
+                        f"(ttl {CHILD_TTL_DAYS}d)"
+                    ),
+                }
+            )
     return tiers
 
 

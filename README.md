@@ -150,6 +150,36 @@ workspace is still reclaimed by age: `hermes ws gc --children --apply` retires
 child workspaces once they are 14 days old, their session ended and their
 tree is clean.
 
+## Child liveness
+
+A delegated child has **two independent liveness markers**, and the plugin
+uses both so that neither a graceful stop nor a hard death is stranded.
+
+1. **Ended stamp (`session_ended_at`)** — written by the `subagent_stop` hook.
+   A genuine stop is authoritative: the child's tree is reclaimed immediately,
+   regardless of the heartbeat.
+2. **Heartbeat (`child_seen:<session-id>` in the plugin's kv store)** — written
+   by the plugin's gate on every gated tool call a child makes, rate-limited to
+   one upsert per 60 seconds. A fresh heartbeat (< 24 hours) is proof of life:
+   the age-based sweep will never reclaim that child.
+
+**Precedence: stop > heartbeat.** A real `subagent_stop` event means the child
+is finished by contract, so the ended stamp wins over any heartbeat value. The
+heartbeat only matters when the stop event never arrived.
+
+**Hard-death thresholds (both required).** If the gateway restarts mid-child,
+`subagent_stop` never fires and no ended stamp is written. Such a child becomes
+reclaimable only when **both** hold:
+
+- its heartbeat is missing or older than **24 hours**, **and**
+- its workspace is older than **24 hours**.
+
+One stale marker alone is never enough: a brand-new child that has not called a
+gated tool has no heartbeat yet, and a child with a fresh heartbeat is alive.
+The in-use guard inside `reclaim_child_workspace` waives the ended-stamp
+requirement under exactly the same two-threshold rule — requiring the stamp
+would strand a hard-dead child forever.
+
 ## Automatic child collection (optional)
 
 Child workspaces (delegated children) are reclaimable once they are 14 days
