@@ -30,18 +30,28 @@ else's tree.
 
 ## Behavior
 
-- **Picker on `/new`** — the gateway's `on_session_reset` hook fires a keyboard
-  with your most recently pushed GitHub/Forgejo repos plus `just chatting` and
-  `new repo…`. One tap binds the session; the keyboard retires itself.
-  A repo that is **not on disk** takes one extra tap: the first tap replaces
-  the keyboard with `clone <repo> from <forge>?`, and only the confirm tap
-  clones. Cloning writes to your disk, so it is never a side effect of
-  choosing a repo.
+- **Picker on `/new`** — the gateway's `on_session_reset` hook fires one flat
+  keyboard of discovered repos. Each row is tagged `(local)`,
+  `(forge:forgejo)`, or `(forge:github)`; the data layer has already deduped
+  those rows by remote identity, so one repo appears once. The keyboard also
+  offers `just chatting` and `new repo…`.
+- **Local tap binds immediately** — tapping a `(local)` row binds the session
+  to a fresh workspace in that checkout; there is no confirmation step.
+- **Forge clone is a two-step tap** — tapping a `(forge:*)` row first replaces
+  the keyboard with `clone <name> from <forge>?`. Only the confirm tap starts
+  the clone, which prevents a fat-fingered selection from writing to disk.
+- **Background clone and automatic bind** — the clone runs on a background
+  thread, so slow network I/O does not block Telegram. The status message is
+  edited at most twice (started, then finished-or-failed). When the clone
+  succeeds, the session binds to the new workspace automatically; on failure
+  the session stays unbound and the error is shown.
+- **60 seconds with no tap** — the session stays unbound. The picker prompt
+  expires and no workspace is created.
 - **Clone URLs are allowlisted** — only `https://` and `ssh://` are cloned.
   git and jj both support "transport helper" URLs (`ext::sh -c …`), which make
   a clone *run a command*; a remote catalogue answer therefore cannot become
-  command execution. A URL with any other scheme is refused with an error
-  naming the scheme.
+  command execution. A URL with any other scheme is refused at the confirm tap
+  with an error naming the scheme.
 - **Tool gate** — `terminal`, `write_file`, etc. are refused with a message that
   names the candidate repos until the session resolves. Fresh sessions are
   asked; delegate_task children inherit their parent's binding (see below).
