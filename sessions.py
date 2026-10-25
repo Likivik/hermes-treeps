@@ -25,12 +25,27 @@ def session_entry(session_id: str) -> dict[str, Any] | None:
     return None
 
 
+# The forum "General" topic is addressed as id 1 in a session key, but the Bot
+# API rejects message_thread_id=1 with "Message thread not found": the General
+# topic IS the chat, so it must be sent with no thread at all.
+GENERAL_TOPIC_ID = 1
+
+
+def normalize_thread(thread_id: Any) -> int | None:
+    """An int topic id, or None for the General topic and for empty ids."""
+    try:
+        value = int(thread_id)
+    except (TypeError, ValueError):
+        return None
+    return None if value in (0, GENERAL_TOPIC_ID) else value
+
+
 def chat_coords(session_key: str, chat_type: str) -> tuple[int | None, int | None]:
     """(chat_id, thread_id) from a durable key like agent:main:telegram:group:-100…:29039."""
     parts = session_key.split(":")
     try:
         if chat_type == "group" and len(parts) >= 2:
-            return int(parts[-2]), int(parts[-1])
+            return int(parts[-2]), normalize_thread(parts[-1])
         return int(parts[-1]), None
     except Exception:
         return None, None
