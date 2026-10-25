@@ -56,14 +56,29 @@ a menu): the session TITLE (required - it becomes the workspace name), and which
 repo - or just chatting. Example: "Session title? (it names the workspace) - and
 which repo: {repos}, an external path, a new repo, or just chatting?"
 
-If a chatting session drifts into repository work (a path under /Git, a clone, a
-git/jj command, a PR), say one line: "this looks like repo work - want a
-workspace for it?" and offer `ws_new <repo> <slug>`. Do not silently start
-editing.
+If a chatting session drifts into repository work (a path under a configured repo
+root, a clone, a git/jj command, a PR), say one line: "this looks like repo work
+- want a workspace for it?" and offer `ws_new <repo> <slug>`. Do not silently
+start editing.
 
 Never create a workspace without the user's choice, and never work in another
 session's workspace.
 """
+
+
+def _repo_roots_label() -> str:
+    """The configured repo roots, as one readable phrase.
+
+    WHY this exists: the user-facing strings used to hardcode "/Git", which
+    was this operator's layout, not the plugin's - a host with a different
+    repo_dir was told about a directory that does not exist there. The roots
+    are read from the settings, so the text follows the configuration.
+    """
+    try:
+        roots = [str(r) for r in store.settings()["repo_roots"] if str(r)]
+    except Exception:
+        return "the configured repo roots"
+    return ", ".join(roots) if roots else "the configured repo roots"
 
 
 def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
@@ -71,21 +86,21 @@ def _ws_tools() -> tuple[tuple[str, dict[str, Any], Any], ...]:
         "name": "ws_new",
         "description": (
             "Create this session's own workspace for a repo and bind the session to it. "
-            "Path: /Git/hermes/workspaces/<repo>/<slug>. Call this before repo work."
+            "Path: <repo_dir>/.workspaces/<repo>/<slug>. Call this before repo work."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "repo": {"type": "string", "description": "repo name under /Git, e.g. hermes-pylon"},
+                "repo": {"type": "string", "description": "repo name under the configured repo roots, e.g. hermes-pylon"},
                 "slug": {"type": "string", "description": "workspace name, lowercase; defaults to <repo>-<last 6 of session id> - pass one only if the user asked for a specific name"},
                 "title": {"type": "string", "description": "the session title the user gave (required when known)"},
                 "purpose": {"type": "string", "description": "one line: what this session is for"},
                 "rebind": {"type": "boolean", "description": "true to move this session from its current workspace to the new one"},
-                "path": {"type": "string", "description": "absolute path to an EXISTING repo outside /Git - binds it directly, no checkout"},
+                "path": {"type": "string", "description": "absolute path to an EXISTING repo outside the configured repo roots - binds it directly, no checkout"},
                 "create_repo": {
                     "type": "boolean",
                     "description": (
-                        "true to make /Git/<repo> exist first: clones it when the repo "
+                        "true to make <clone_root>/<repo> exist first: clones it when the repo "
                         "lives on GitHub/Forgejo, otherwise creates a brand-new project. "
                         "Only pass this after the user approved the clone."
                     ),
@@ -835,7 +850,7 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
             "action": "block",
             "message": (
                 "No workspace resolved for this session. Ask the user, then call ONE of:\n"
-                "  ws_new(repo, slug)  - repo work; creates /Git/hermes/workspaces/<repo>/<slug>\n"
+                f"  ws_new(repo, slug)  - repo work; creates {store.workspaces_base()}/<repo>/<slug>\n"
                 "  ws_chatting()       - talk-only session, no repo, full tools\n"
                 "  repo on GitHub/Forgejo but not on disk: ws_new(repo, slug, create_repo=true) - clone it, after the user approves\n"
                 f"Candidate repos: {listing}\n"
@@ -873,7 +888,7 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
 
 def _opening_prompt() -> str:
     repos = store.candidate_repos()
-    listing = ", ".join(repos) if repos else "(none found under /Git)"
+    listing = ", ".join(repos) if repos else f"(none found under {_repo_roots_label()})"
     return (
         "New session, no workspace yet. Ask me exactly one line: which repo to work in "
         f"({listing}) - or 'just chatting' for a talk-only session with no checkout. "
@@ -1340,7 +1355,7 @@ def register(ctx) -> None:
     )
 
     repos = store.candidate_repos(limit=6)
-    listing = ", ".join(repos) if repos else "(none found under /Git)"
+    listing = ", ".join(repos) if repos else f"(none found under {_repo_roots_label()})"
     ctx.register_system_prompt_section(
         "workspace-discipline",
         # The delegation contract travels with the prompt: the rules that used to

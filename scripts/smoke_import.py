@@ -20,9 +20,29 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
+# ws_prepare lives in prepare.py and is registered through prepare.register(ctx),
+# NOT through _ws_tools() - so the tool set is checked in two places below.
 EXPECTED_TOOLS = {"ws_new", "ws_chatting", "ws_rename", "ws_status", "ws_doctor"}
+EXPECTED_REGISTERED_TOOLS = EXPECTED_TOOLS | {"ws_prepare"}
+
+
+class _StubCtx:
+    """A minimal stand-in for the host's plugin context.
+
+    WHY a stub: ws_prepare is registered through ``prepare.register(ctx)``, so
+    the only way to smoke-test that path is to call it with something that
+    accepts a tool registration. The real context lives in the Hermes host,
+    which CI does not have - a stub keeps the smoke test hermetic.
+    """
+
+    def __init__(self) -> None:
+        self.tools: list[dict[str, Any]] = []
+
+    def register_tool(self, **kwargs: Any) -> None:
+        self.tools.append(kwargs)
 
 
 def main() -> int:
@@ -49,13 +69,31 @@ def main() -> int:
     missing = EXPECTED_TOOLS - tools
     assert not missing, f"missing tools: {sorted(missing)}"
 
+    # The registration path of ws_prepare: prepare.register(ctx) is what puts
+    # the tool on the wire, and a rename or a broken call would only show up
+    # in a live gateway. Smoke it here.
+    ctx = _StubCtx()
+    module.prepare.register(ctx)
+    registered = {str(t.get("name")) for t in ctx.tools}
+    assert "ws_prepare" in registered, (
+        f"prepare.register(ctx) registered {sorted(registered)}, ws_prepare missing"
+    )
+    # The other five are registered by the plugin's own register() from
+    # _ws_tools(); the manifest declares all six.
+    assert tools | registered == EXPECTED_REGISTERED_TOOLS, (
+        f"the plugin offers {sorted(tools | registered)}, "
+        f"expected {sorted(EXPECTED_REGISTERED_TOOLS)}"
+    )
+
     store = module.store
     for attr in ("resolve_detail", "forget", "remote_repos", "ensure_tool_path"):
         assert hasattr(store, attr), f"store.{attr} is missing"
 
     detail = store.resolve_detail("ci-smoke-session-that-does-not-exist")
     assert detail["state"] == "unbound", detail
-    print(f"ok: {len(tools)} tools, unbound resolution verbatim")
+    print(
+        f"ok: {len(tools)} tools, {len(registered)} registered, unbound resolution verbatim"
+    )
     return 0
 
 

@@ -1009,15 +1009,6 @@ def read_child_run(child_session_id: str) -> dict[str, Any] | None:
     return {k: row[k] for k in row.keys()}
 
 
-def delete_child_run(child_session_id: str) -> bool:
-    """Drop a child's run row. True when one existed."""
-    if not child_session_id:
-        return False
-    with transaction() as conn:
-        cur = conn.execute("DELETE FROM child_runs WHERE child_session_id=?", (child_session_id,))
-        return cur.rowcount > 0
-
-
 def write_child_report(
     child_session_id: str,
     parent_session_id: str,
@@ -1132,17 +1123,6 @@ def delete_child_reports(child_session_ids: list[str]) -> int:
         marks = ",".join("?" for _ in ids)
         cur = conn.execute(
             f"DELETE FROM child_reports WHERE child_session_id IN ({marks})", tuple(ids)
-        )
-        return int(cur.rowcount or 0)
-
-
-def delete_child_reports_for_parent(parent_session_id: str) -> int:
-    """Delete every report belonging to a parent. Returns the row count."""
-    if not parent_session_id:
-        return 0
-    with transaction() as conn:
-        cur = conn.execute(
-            "DELETE FROM child_reports WHERE parent_session_id=?", (parent_session_id,)
         )
         return int(cur.rowcount or 0)
 
@@ -1506,36 +1486,6 @@ def read_child_reclaim_for_report(report: dict[str, Any]) -> dict[str, Any] | No
         "was_dirty": bool(row["was_dirty"]),
         "reclaimed_at": row["reclaimed_at"],
     }
-
-
-def list_child_reclaims(repo: str = "", slug: str = "") -> list[dict[str, Any]]:
-    """Every reclamation row, newest first. Optionally filtered."""
-    conn = connect()
-    if repo and slug:
-        rows = conn.execute(
-            "SELECT * FROM child_reclaims WHERE repo=? AND slug=? ORDER BY reclaimed_at DESC",
-            (repo, slug),
-        ).fetchall()
-    elif repo:
-        rows = conn.execute(
-            "SELECT * FROM child_reclaims WHERE repo=? ORDER BY reclaimed_at DESC", (repo,)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM child_reclaims ORDER BY reclaimed_at DESC"
-        ).fetchall()
-    return [
-        {
-            "repo": row["repo"],
-            "slug": row["slug"],
-            "session_id": row["session_id"],
-            "workspace_path": row["workspace_path"],
-            "snapshot_commit_id": row["snapshot_commit_id"],
-            "was_dirty": bool(row["was_dirty"]),
-            "reclaimed_at": row["reclaimed_at"],
-        }
-        for row in rows
-    ]
 
 
 def legacy_state_dir() -> Path:

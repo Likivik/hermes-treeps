@@ -384,7 +384,7 @@ def test_the_line_format_is_pinned():
     line = PLUGIN.contract._report_line(
         {
             "workspace_slug": "parent-tree-child-abcdef",
-            "workspace_path": "/Git/hermes/.workspaces/repo/parent-tree-child-abcdef",
+            "workspace_path": "<repo_dir>/.workspaces/repo/parent-tree-child-abcdef",
             "dirty": "dirty",
             "unpushed": 2,
             "child_status": "completed",
@@ -393,7 +393,7 @@ def test_the_line_format_is_pinned():
     )
     assert line == (
         "child parent-tree-child-abcdef: dirty, 2 unpushed commits"
-        " - /Git/hermes/.workspaces/repo/parent-tree-child-abcdef (worker completed)"
+        " - <repo_dir>/.workspaces/repo/parent-tree-child-abcdef (worker completed)"
     ), line
 
 

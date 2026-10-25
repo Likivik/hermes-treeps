@@ -4,7 +4,7 @@ manifest_version: 2
 api_version: 1
 description: >
   One jj workspace per session, enforced. A session is either bound to a repo
-  (its own workspace under /Git/hermes/workspaces/<repo>/<slug>) or explicitly
+  (its own workspace under <repo_dir>/.workspaces/<repo>/<slug>) or explicitly
   "just chatting" (HERMES_HOME as cwd, full capabilities). Repo-touching tools
   are blocked until the session resolves one of the two, so a workspace can
   never be created without a session record, and a session can never quietly
@@ -61,10 +61,11 @@ config_schema:
       workspaces go - move existing ones with `hermes ws migrate`.
   repo_roots:
     type: list
-    default: [/Git, /Git/hermes, /Git/likivik, /Git/repos]
+    default: [/Git, /Git/hermes, /Git/repos]
     description: >-
-      DEPRECATED. Directories scanned for local repos. Repo discovery
-      follows repo_dir now; this list is still read for this release.
+      DEPRECATED. Directories scanned for local repos. Repo discovery still
+      follows repo_roots in this release; the dot-dir layout does not change
+      discovery yet.
   clone_root:
     type: str
     default: /Git/hermes

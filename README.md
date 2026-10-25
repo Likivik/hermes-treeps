@@ -24,6 +24,7 @@ else's tree.
 | `childspace.py` | per-delegation child workspaces (one tree per child, never shared) |
 | `childreport.py` | child-end reporting: the child's end state for the parent, and the immediate reclamation that follows it |
 | `migrate_layout.py` | the one-time move from the old workspace root to the dot-dir layout |
+| `jjlayout.py` | jj workspace layout facts: is this a jj workspace, is it the primary one, which session paths are live |
 | `contract.py` | the delegation contract rendered into the system-prompt section |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
 
@@ -70,7 +71,7 @@ When a delegated child finishes, the **parent** session learns what the child
 left behind — on its next turn, as one line per child:
 
 ```
-child parent-tree-child-abcdef: dirty, 2 unpushed commits - /Git/hermes/.workspaces/repo/parent-tree-child-abcdef (worker completed)
+child parent-tree-child-abcdef: dirty, 2 unpushed commits - <repo_dir>/.workspaces/repo/parent-tree-child-abcdef (worker completed)
 ```
 
 The line carries the four things the parent cannot otherwise know: the
@@ -320,7 +321,7 @@ plugins:
 | key | status | replacement |
 | --- | --- | --- |
 | `workspace_root` | **deprecated** — still parsed, no longer decides where a workspace goes | `repo_dir` (the root is derived: `<repo_dir>/.workspaces`) |
-| `repo_roots` | **deprecated** — still read for this release | `repo_dir` (repo discovery follows it) |
+| `repo_roots` | **deprecated** — still read for this release | `repo_dir` (repo discovery still follows `repo_roots` in this release) |
 
 Both keys are still accepted so an old config does not break the plugin, and
 an explicit value that differs from the new behaviour produces a **one-time**
