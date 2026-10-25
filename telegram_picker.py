@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import store
+from . import discovery, store
 
 logger = logging.getLogger(__name__)
 
@@ -25,20 +25,13 @@ TG: dict[str, Any] = {
     "application": None,
     "adapter": None,
     "loop": None,
-    # chat_key -> {"coords": (chat_id, thread), "at": ts}; the most recent entry
-    # is the fallback chat when a session row has no answer.
     "chats": {},
     "last_chat_key": None,
-    # chat_key -> claim dict while a /new is in flight in that chat
     "pending_picker": {},
-    # (chat_id, thread) -> ts of the last picker sent there
     "last_picker": {},
     "warned_no_allowlist": False,
 }
 
-# Last session id seen from any hook, with a timestamp: the gate uses recency
-# to let subagents inherit their parent's binding (a subagent's first gated
-# tool call comes seconds after its parent dispatched it).
 _LAST_SESSION = {"sid": "", "at": 0.0}
 
 
@@ -67,12 +60,6 @@ def _most_recent_chat() -> tuple[Any, Any] | None:
 
 
 def _clone_root_label() -> str:
-    """Where a new repo is created, as text.
-
-    WHY this exists: the picker message used to hardcode "/Git", which is one
-    operator's layout and not the plugin's - on a host with a different
-    clone_root the message pointed at a directory that does not exist there.
-    """
     from . import settings as _settings
 
     try:
@@ -82,14 +69,6 @@ def _clone_root_label() -> str:
 
 
 def _allowlist() -> list[int]:
-    """User ids allowed to tap the picker. Empty/unset means open (legacy).
-
-    SINGLE SOURCE OF TRUTH: the ids are read straight from the settings dict
-    here. The plugin used to have a second reader (``settings.allowed_user_ids``)
-    that did exactly this - two functions returning the same list is two
-    places to forget to update, and the settings module's copy was the one
-    nobody called.
-    """
     from . import settings as _settings
 
     raw = _settings.settings().get("allowed_user_ids") or []
@@ -98,8 +77,6 @@ def _allowlist() -> list[int]:
         try:
             out.append(int(value))
         except (TypeError, ValueError):
-            # A malformed id must not open the picker to everybody and must
-            # not crash the tap handler: skip it, the rest of the list stands.
             logger.warning("allowed_user_ids: skipping a non-numeric entry %r", value)
     return out
 
@@ -120,7 +97,29 @@ def _tapper_allowed(user_id: Any) -> bool:
         return False
 
 
-# ── adapter wiring ────────────────────────────────────────────────────────────
+def _forge_name(entry: dict[str, Any]) -> str:
+    tag = str(entry.get("tag") or entry.get("source") or "")
+    return tag.split(":", 1)[-1] if ":" in tag else tag
+
+
+def _entry_name(entry: dict[str, Any]) -> str:
+    return str(entry.get("name") or "")
+
+
+def _entry_clone_url(entry: dict[str, Any]) -> str:
+    return str(entry.get("clone_url") or entry.get("url") or "")
+
+
+def _is_local(entry: dict[str, Any]) -> bool:
+    tag = str(entry.get("tag") or entry.get("source") or "")
+    return tag == discovery.TAG_LOCAL
+
+
+def _find_entry(entries: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+    for entry in entries:
+        if _entry_name(entry) == name:
+            return entry
+    return None
 
 
 def wire(application: Any, adapter: Any) -> None:
@@ -128,14 +127,12 @@ def wire(application: Any, adapter: Any) -> None:
     try:
         from telegram import Update
         from telegram.ext import CallbackQueryHandler, TypeHandler
-    except Exception:  # PTB lives in the hermes env, not in plugin import scope
+    except Exception:
         return
     TG["application"] = application
     TG["adapter"] = adapter
 
     async def _capture_loop(update: Any, context: Any) -> None:
-        # Runs first (group -1) and must never block: PTB processes updates in
-        # order, and a slow handler here delayed the user's approval taps.
         TG["loop"] = asyncio.get_running_loop()
         chat = getattr(update, "effective_chat", None)
         if chat is not None:
@@ -150,7 +147,6 @@ def wire(application: Any, adapter: Any) -> None:
         await _maybe_claim_on_new(update)
 
     async def _maybe_claim_on_new(update: Any) -> None:
-        """/new claims the slot for ITS chat; the on_session_reset hook sends."""
         msg = getattr(update, "effective_message", None)
         text = (getattr(msg, "text", "") or "").strip()
         if not text.startswith("/new"):
@@ -164,20 +160,14 @@ def wire(application: Any, adapter: Any) -> None:
         }
 
     application.add_handler(TypeHandler(Update, _capture_loop), group=-1)
-    application.add_handler(CallbackQueryHandler(_on_choice_callback, pattern=r"^ws:"))
-
-
-# ── hooks ─────────────────────────────────────────────────────────────────────
+    application.add_handler(CallbackQueryHandler(_on_choice_callback, pattern=r"^(sel|clone-confirm):"))
 
 
 def on_session_reset(session_id: str = "", new_session_id: str = "", **kw: Any) -> None:
-    """The gateway fires this at /new (`gateway/slash_commands_session.py:214`),
-    with the NEW session id, before the "Session reset!" notice is sent."""
+    """The gateway fires this at /new, with the NEW session id, before the notice."""
     sid = new_session_id or session_id or ""
     if sid:
         note_session_id(sid)
-    # Which chat? The new session's own row in sessions.json - /new may have run
-    # in a different chat than the last update we saw.
     row = store.session_entry(sid) or {}
     coords = store.chat_coords(
         str(row.get("session_key") or ""), str(row.get("chat_type") or "dm")
@@ -186,28 +176,22 @@ def on_session_reset(session_id: str = "", new_session_id: str = "", **kw: Any) 
         return
     key = _chat_key(*coords)
     if key not in TG.get("pending_picker", {}):
-        return  # no /new claim waiting in that chat
-    try:
-        async def _send_after_notice() -> None:
-            # The notice is sent on return from this hook, so a short wait keeps
-            # the keyboard below it. The hook is the event; this is only ordering.
-            await asyncio.sleep(1.5)
-            await fire_picker_once(sid, key)
+        return
 
-        loop = TG.get("loop")
-        if loop is not None and loop.is_running():
-            asyncio.run_coroutine_threadsafe(_send_after_notice(), loop)
-        # else: the claim stays armed; the session-start path still covers it
-    except Exception:
-        logger.warning("could not schedule the reset picker", exc_info=True)
+    async def _send_after_notice() -> None:
+        await asyncio.sleep(1.5)
+        await fire_picker_once(sid, key)
+
+    loop = TG.get("loop")
+    if loop is not None and loop.is_running():
+        asyncio.run_coroutine_threadsafe(_send_after_notice(), loop)
 
 
 def handle_session_start(session_id: str, **kw: Any) -> bool:
-    """The Telegram branch of on_session_start. True = handled (caller returns)."""
+    """The Telegram branch of on_session_start. True = handled."""
     platform = str(kw.get("platform") or "").strip().lower()
     if "telegram" not in platform:
         return False
-    # Fallback claim for brand-new sessions that never saw a /new update.
     row = store.session_entry(session_id) or {}
     coords = store.chat_coords(
         str(row.get("session_key") or ""), str(row.get("chat_type") or "dm")
@@ -223,20 +207,15 @@ def handle_session_start(session_id: str, **kw: Any) -> bool:
             asyncio.run_coroutine_threadsafe(coro, loop)
         elif TG.get("application") is not None:
             TG["application"].create_task(coro)
-        else:  # in-process CLI host: we ARE in a loop
-            logger.debug("no gateway loop for picker; skipping")
+        else:
             coro.close()
     except Exception:
         logger.warning("could not schedule the workspace button prompt", exc_info=True)
     return True
 
 
-# ── sending ───────────────────────────────────────────────────────────────────
-
-
 async def fire_picker_once(session_id: str, key: str | None = None) -> None:
-    """Single consumer per chat: pop that chat's claim, then send. The sender
-    dedupes per chat, so a second trigger cannot stack a keyboard."""
+    """Single consumer per chat: pop that chat's claim, then send."""
     pending = TG.get("pending_picker") or {}
     if key is None:
         if not pending:
@@ -247,7 +226,7 @@ async def fire_picker_once(session_id: str, key: str | None = None) -> None:
 
 
 async def send_choice_message(session_id: str, hint_key: str | None = None) -> None:
-    """Send the repo picker keyboard to the session's chat."""
+    """Send the flat, tagged repo picker keyboard to the session's chat."""
     try:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -257,9 +236,6 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
             logger.info("workspace picker skipped: picker_enabled is false")
             return
 
-        # The session's OWN key first: the last-update chat is only a fallback -
-        # in a multi-topic group it can be a different thread entirely (that
-        # mistake once put a keyboard in topic 29039 while the user sat in 14650).
         entry = store.session_entry(session_id) or {}
         chat_id, thread_id = store.chat_coords(
             str(entry.get("session_key") or ""), str(entry.get("chat_type") or "dm")
@@ -279,37 +255,32 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
             )
             return
 
-        # Dedupe per chat+thread (a global flag once blocked chat B because chat
-        # A got a picker a minute earlier).
         key = (chat_id, thread_id)
         last = TG["last_picker"].get(key)
         if last and (time.time() - float(last)) < 60:
             logger.info("workspace picker skipped: chat %s got one recently", key)
             return
 
-        # Remote-first: the user's repos from GitHub + Forgejo (most recently
-        # pushed), NOT what happens to be on disk - that is what he asked for.
-        repos = store.remote_repos(limit_per_source=5)
+        repos, errors = discovery.discover()
         if not repos:
             logger.info("workspace picker skipped: no repos from any source")
             return
         token = store.new_token(repos, session_id=session_id)
         rows = []
-        for i in range(0, len(repos), 2):
-            pair = repos[i : i + 2]
-            rows.append([
-                InlineKeyboardButton(
-                    f"{r['name']} ({r['source'][:2]})",
-                    callback_data=f"ws:{token}:{i + j}",
-                )
-                for j, r in enumerate(pair)
-            ])
-        rows.append([InlineKeyboardButton("just chatting", callback_data=f"ws:{token}:chat")])
-        rows.append([InlineKeyboardButton("new repo…", callback_data=f"ws:{token}:newrepo")])
+        for repo in repos:
+            rows.append([InlineKeyboardButton(
+                f"{_entry_name(repo)} ({repo.get('tag') or 'local'})",
+                callback_data=f"sel:{token}:{_entry_name(repo)}",
+            )])
+        rows.append([InlineKeyboardButton("just chatting", callback_data=f"sel:{token}:__chat__")])
+        rows.append([InlineKeyboardButton("new repo…", callback_data=f"sel:{token}:__newrepo__")])
+        text = "Workspace for this session? Pick one, or say just chatting."
+        if errors:
+            text += "\nSome forges were unavailable."
         msg = await bot.send_message(
             chat_id=chat_id,
             message_thread_id=thread_id,
-            text="Workspace for this session? Pick one, or say just chatting.",
+            text=text,
             reply_markup=InlineKeyboardMarkup(rows),
             disable_web_page_preview=True,
         )
@@ -322,43 +293,10 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
         logger.warning("workspace picker failed for session %s", session_id, exc_info=True)
 
 
-# ── taps ──────────────────────────────────────────────────────────────────────
-
-
-def _repo_is_local(name: str) -> bool:
-    """True when the repo already has a checkout under the repo roots.
-
-    WHY this decides whether the picker asks for a clone confirmation: a
-    repo that is ALREADY on disk needs no clone, so the tap binds a
-    workspace in it directly. A repo that is NOT on disk needs a clone, and a
-    clone writes to the user's disk - so it needs the user's approval
-    (P1-3). The old code cloned silently from the tap.
-    """
-    try:
-        store.find_repo(str(name))
-    except Exception:
-        return False
-    return True
-
-
 async def _ask_to_clone(q: Any, entry: dict[str, Any], session_id: str) -> None:
-    """Replace the repo keyboard with an explicit clone confirmation.
-
-    WHY this exists (P1-3): tapping a repo that is not on disk used to
-    CLONE it - silently, as a side effect, with the raw ``clone_url`` from
-    the remote catalogue. Two things were wrong with that:
-
-    * cloning writes to the user's disk and was never approved;
-    * the URL was unchecked, so a hostile forge response could name a git
-      transport helper (``ext::sh -c ...``) and make the clone RUN A
-      COMMAND on this host.
-
-    The scheme allowlist in ``store.ensure_local`` closes the second hole.
-    This closes the first: the clone only happens on an explicit second tap
-    on a button that says what it will do.
-    """
-    repo = str(entry.get("name") or "")
-    source = str(entry.get("source") or "") or "the remote"
+    """First forge tap: replace the keyboard with an explicit clone confirmation."""
+    repo = _entry_name(entry)
+    forge = _forge_name(entry) or "the remote"
     owner = str(entry.get("owner") or "")
     label = f"{owner}/{repo}" if owner else repo
     try:
@@ -366,42 +304,120 @@ async def _ask_to_clone(q: Any, entry: dict[str, Any], session_id: str) -> None:
     except Exception:
         logger.warning("telegram is not importable; cannot ask for a clone confirmation")
         return
-    # A token of its own, marked as a clone approval: the picker's "pick"
-    # token cannot be replayed as a clone approval, and the approval expires
-    # with it.
     token = store.new_token([entry], session_id=session_id, kind="clone")
     try:
-        await q.answer(
-            f"{repo} is not on disk. Confirm to clone it from {source}.",
-            show_alert=True,
-        )
+        await q.answer(f"{repo} is not on disk. Confirm to clone it from {forge}.", show_alert=True)
     except Exception:
         pass
     try:
         await q.edit_message_text(
-            f"Clone {label} from {source} into {_clone_root_label()}?",
+            f"Clone {label} from {forge} into {_clone_root_label()}?",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
-                    f"clone {repo} from {source}?",
-                    callback_data=f"ws:{token}:clone",
+                    f"clone {repo} from {forge}?",
+                    callback_data=f"clone-confirm:{token}:{repo}",
                 )],
-                [InlineKeyboardButton("cancel", callback_data=f"ws:{token}:cancel")],
+                [InlineKeyboardButton("cancel", callback_data=f"sel:{token}:__cancel__")],
             ]),
         )
     except Exception:
         logger.debug("could not edit the choice message for the clone confirmation", exc_info=True)
 
 
+def _resolve_session(update: Any, record: dict[str, Any]) -> str:
+    chat = getattr(update, "effective_chat", None)
+    msg = getattr(update, "effective_message", None)
+    token_sid = str((record or {}).get("sid") or "")
+    if token_sid and store.session_entry(token_sid):
+        return token_sid
+    row = store.session_for_chat(
+        getattr(chat, "id", None),
+        getattr(msg, "message_thread_id", None) if msg is not None else None,
+    )
+    session_id = str((row or {}).get("session_id") or "")
+    return session_id or last_session()
+
+
+def _bind_local(entry: dict[str, Any], session_id: str) -> dict[str, Any]:
+    repo = _entry_name(entry)
+    slug = f"{repo}-{session_id[-6:]}" if session_id else repo
+    workspace = store.create(repo, slug, purpose="")
+    bound_slug = str(workspace.get("slug") or slug)
+    bound_path = str(workspace.get("path") or store.workspace_path(repo, bound_slug))
+    store.bind_session(Path(bound_path), session_id)
+    store.write_state(
+        session_id,
+        {"mode": "repo", "repo": repo, "slug": bound_slug, "path": bound_path},
+    )
+    return {"repo": repo, "slug": bound_slug, "path": bound_path}
+
+
+def _clone_and_bind(entry: dict[str, Any], session_id: str) -> dict[str, Any]:
+    repo = _entry_name(entry)
+    url = _entry_clone_url(entry)
+    # The URL is checked on this thread before the clone starts, so a hostile
+    # transport-helper scheme can never reach the clone subprocess.
+    store.validate_clone_url(repo, url)
+    store.ensure_local(repo, url)
+    return _bind_local(entry, session_id)
+
+
+async def _run_clone_in_background(
+    q: Any, entry: dict[str, Any], session_id: str,
+) -> None:
+    """Clone off the Telegram loop, then bind and report the terminal state.
+
+    The status message gets exactly two edits: started and finished/failed.
+    This prevents a retrying clone from flooding the chat with progress edits.
+    """
+    repo = _entry_name(entry)
+    try:
+        await q.edit_message_text(f"Cloning {repo}…")
+    except Exception:
+        logger.debug("could not edit the clone status message", exc_info=True)
+
+    try:
+        result = await asyncio.to_thread(_clone_and_bind, entry, session_id)
+    except Exception as exc:
+        logger.warning("background clone of %s failed", repo, exc_info=True)
+        text = f"Clone failed for {repo}: {str(exc)[:240]}"
+        try:
+            await q.edit_message_text(text)
+        except Exception:
+            logger.debug("could not edit the failed clone status", exc_info=True)
+        return
+
+    text = f"Workspace: {result['repo']}/{result['slug']}"
+    try:
+        await q.edit_message_text(text)
+    except Exception:
+        logger.debug("could not edit the completed clone status", exc_info=True)
+
+
 async def _on_choice_callback(update: Any, context: Any) -> None:
-    """A repo/chatting button was tapped: record the choice, retire the keyboard."""
+    """Handle the flat picker and the two-step clone confirmation."""
     q = getattr(update, "callback_query", None)
     if q is None:
         return
-    try:
-        _, token, choice = (q.data or "").split(":", 2)
-    except ValueError:
+    data = str(getattr(q, "data", "") or "")
+    parts = data.split(":", 2)
+    if len(parts) != 3 or parts[0] not in {"sel", "clone-confirm", "ws"}:
         await q.answer()
         return
+    action, token, choice = parts
+    if action == "ws":
+        # Compatibility with the pre-flat-menu callback shape: the old
+        # keyboard selected by index and used ``clone`` for the confirm tap.
+        action = "clone-confirm" if choice == "clone" else "sel"
+        if action == "sel":
+            try:
+                choice = str(int(choice))
+            except ValueError:
+                await q.answer("This prompt expired - send /wsbtn for a fresh one.", show_alert=True)
+                return
+    elif action == "clone-confirm" and choice == "clone":
+        action = "clone-confirm"
+        choice = ""
 
     user = getattr(q, "from_user", None)
     if user is not None and not _tapper_allowed(getattr(user, "id", None)):
@@ -413,42 +429,14 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
         await q.answer("This prompt expired - send /wsbtn for a fresh one.", show_alert=True)
         return
 
-    token_kind = str(record.get("kind") or "pick")
-
-    # Resolve the session NOW, at tap time. Order matters:
-    # 1. the session the token was minted for - IF it is still alive (a /new
-    #    reset kills it, which is why the token alone is not trusted);
-    # 2. the chat's sessions.json row - the reset updates it, so it names the
-    #    session that is actually waiting for an answer;
-    # 3. last_session() - recency tracker, LAST resort only: it is
-    #    process-global, and in a chat with two live sessions it names
-    #    whichever session started last, which bound one session's choice to
-    #    another session's workspace.
-    chat = getattr(update, "effective_chat", None)
-    msg = getattr(update, "effective_message", None)
-    session_id = ""
-    token_sid = str((record or {}).get("sid") or "")
-    if token_sid and store.session_entry(token_sid):
-        session_id = token_sid
-    if not session_id:
-        row = store.session_for_chat(
-            getattr(chat, "id", None),
-            getattr(msg, "message_thread_id", None) if msg is not None else None,
-        )
-        session_id = str((row or {}).get("session_id") or "")
-    if not session_id:
-        session_id = last_session()
+    session_id = _resolve_session(update, record)
     if not session_id:
         await q.answer("No active session for this chat - cannot bind a workspace.", show_alert=True)
         return
     note_session_id(session_id)
 
     already = store.read_state(session_id)
-    if (
-        choice not in {"other", "newrepo", "clone", "cancel"}
-        and already
-        and already.get("mode") == "repo"
-    ):
+    if already and already.get("mode") == "repo":
         await q.answer(
             f"This session is already bound to {already.get('repo')}/{already.get('slug')} - "
             "tell the agent to rebind if you meant to switch.",
@@ -456,133 +444,83 @@ async def _on_choice_callback(update: Any, context: Any) -> None:
         )
         return
 
-    try:
-        if choice == "chat":
-            store.mark_chatting(session_id)
-            label = "just chatting"
-        elif choice == "newrepo":
-            await q.answer()
-            try:
-                await q.edit_message_text(
-                    "Tell the agent the name for the new repo and it will create it "
-                    f"under {_clone_root_label()} and give this session a workspace in it."
-                )
-            except Exception:
-                pass
-            return
-        elif choice == "cancel":
-            await q.answer("Cancelled - nothing was cloned.")
-            try:
-                await q.edit_message_text("Cancelled - nothing was cloned.")
-            except Exception:
-                pass
-            return
-        elif choice == "clone":
-            # The CONFIRM tap. This is the only path that clones from the
-            # picker, and it only runs for a token that was minted as a
-            # clone confirmation (see below).
-            if token_kind != "clone":
-                await q.answer(
-                    "This button does not approve a clone - send /wsbtn for a fresh one.",
-                    show_alert=True,
-                )
-                return
-            repos = record.get("repos") or []
-            if not repos:
-                await q.answer("Nothing to clone - send /wsbtn for a fresh one.", show_alert=True)
-                return
-            entry = repos[0] if isinstance(repos[0], dict) else {"name": str(repos[0])}
-            repo = str(entry.get("name") or "")
-            url = str(entry.get("url") or "")
-            if not repo:
-                await q.answer("Nothing to clone - send /wsbtn for a fresh one.", show_alert=True)
-                return
-            slug = f"{repo}-{session_id[-6:]}" if session_id else repo
-            import asyncio
-
-            def _clone_and_bind() -> dict:
-                # The scheme allowlist lives in ensure_local: a URL like
-                # ext::sh -c ... would make the clone RUN a command, and the
-                # URL comes from a remote catalogue response.
-                if url:
-                    store.ensure_local(repo, url)
-                # WHY the record is returned and used: create() SANITISES the
-                # slug, so the slug we passed in is not necessarily the slug
-                # on disk. Binding our own copy pointed at a non-existent
-                # path: the session stayed unbound and the workspace leaked.
-                return store.create(repo, slug, purpose="")
-
-            await q.answer(f"cloning {repo}…")
-            # A clone can take a minute; run it in a thread or every Telegram
-            # update in the process stalls behind it.
-            # WHY the name is not ``record``: that is the TOKEN record, and
-            # overwriting it would hide which token authorised this clone.
-            workspace = await asyncio.to_thread(_clone_and_bind)
-            bound_slug = str(workspace.get("slug") or slug)
-            bound_path = str(workspace.get("path") or store.workspace_path(repo, bound_slug))
-            store.bind_session(Path(bound_path), session_id)
-            store.write_state(
-                session_id,
-                {"mode": "repo", "repo": repo, "slug": bound_slug, "path": bound_path},
+    entries = [e for e in (record.get("repos") or []) if isinstance(e, dict)]
+    if action == "clone-confirm":
+        if str(record.get("kind") or "pick") != "clone":
+            # A pick token cannot be replayed as clone approval: the second
+            # tap must be backed by the token minted for the confirm button.
+            await q.answer(
+                "This button does not approve a clone - send /wsbtn for a fresh one.",
+                show_alert=True,
             )
-            label = f"{repo}/{bound_slug}"
-        else:
-            repos = record.get("repos") or []
+            return
+        entry = _find_entry(entries, choice)
+        if not entry and len(entries) == 1:
+            entry = entries[0]
+        if not entry:
+            await q.answer("Nothing to clone - send /wsbtn for a fresh one.", show_alert=True)
+            return
+        repo = _entry_name(entry)
+        url = _entry_clone_url(entry)
+        try:
+            # Validate at the confirm tap, before the background thread starts.
+            store.validate_clone_url(repo, url)
+        except store.WorkspaceError as exc:
+            await q.answer(str(exc)[:240], show_alert=True)
+            return
+        await q.answer(f"cloning {repo}…")
+        await _run_clone_in_background(q, entry, session_id)
+        return
+
+    if choice == "__chat__":
+        store.mark_chatting(session_id)
+        label = "just chatting"
+    elif choice == "__newrepo__":
+        await q.answer()
+        try:
+            await q.edit_message_text(
+                "Tell the agent the name for the new repo and it will create it "
+                f"under {_clone_root_label()} and give this session a workspace in it."
+            )
+        except Exception:
+            pass
+        return
+    elif choice == "__cancel__":
+        await q.answer("Cancelled - nothing was cloned.")
+        try:
+            await q.edit_message_text("Cancelled - nothing was cloned.")
+        except Exception:
+            pass
+        return
+    else:
+        entry = _find_entry(entries, choice)
+        if not entry and choice.isdigit():
             idx = int(choice)
-            if idx < 0 or idx >= len(repos):
-                raise store.WorkspaceError(f"unknown choice {choice!r}")
-            entry = repos[idx]
-            repo = entry["name"] if isinstance(entry, dict) else entry
-            url = str(entry.get("url") or "") if isinstance(entry, dict) else ""
-            # P1-3: a repo that is NOT on disk must not be cloned by this tap.
-            # The old code called ensure_local() here, which cloned as a side
-            # effect - with the RAW clone_url from the remote catalogue, so a
-            # hostile forge response could run a command (ext::sh -c ...).
-            # Cloning writes to the user's disk, so it needs the user's
-            # approval: show a confirm button and clone only on that tap.
-            if url and not _repo_is_local(repo):
-                await _ask_to_clone(q, entry, session_id)
-                return
-            slug = f"{repo}-{session_id[-6:]}" if session_id else repo
-            import asyncio
-
-            def _bind_local() -> dict:
-                if url:
-                    store.ensure_local(repo, url)
-                # WHY the record is returned and used: create() SANITISES the
-                # slug, so the slug we passed in is not necessarily the slug on
-                # disk. Binding our own copy pointed at a non-existent path:
-                # the session stayed unbound and the workspace leaked.
-                return store.create(repo, slug, purpose="")
-
-            await q.answer(f"setting up {repo} (cloning if needed)…")
-            # A clone can take a minute; run it in a thread or every Telegram
-            # update in the process stalls behind it.
-            record = await asyncio.to_thread(_bind_local)
-            bound_slug = str(record.get("slug") or slug)
-            bound_path = str(record.get("path") or store.workspace_path(repo, bound_slug))
-            store.bind_session(Path(bound_path), session_id)
-            store.write_state(
-                session_id,
-                {"mode": "repo", "repo": repo, "slug": bound_slug, "path": bound_path},
-            )
-            label = f"{repo}/{bound_slug}"
-    except store.WorkspaceError as e:
-        await q.answer(str(e)[:180], show_alert=True)
-        return
-    except Exception:
-        logger.exception("workspace button choice failed")
-        await q.answer("Something went wrong - use /ws status.", show_alert=True)
-        return
+            if 0 <= idx < len(entries):
+                entry = entries[idx]
+        if not entry:
+            await q.answer("This prompt expired - send /wsbtn for a fresh one.", show_alert=True)
+            return
+        if not _is_local(entry):
+            # A forge row needs a second, explicit tap before it can clone.
+            await _ask_to_clone(q, entry, session_id)
+            return
+        try:
+            result = await asyncio.to_thread(_bind_local, entry, session_id)
+        except store.WorkspaceError as exc:
+            await q.answer(str(exc)[:180], show_alert=True)
+            return
+        except Exception:
+            logger.exception("workspace button choice failed")
+            await q.answer("Something went wrong - use /ws status.", show_alert=True)
+            return
+        label = f"{result['repo']}/{result['slug']}"
 
     await q.answer(f"-> {label}")
     try:
         await q.edit_message_text(f"Workspace: {label}")
     except Exception:
         logger.debug("could not edit the choice message", exc_info=True)
-
-
-# ── manual trigger ────────────────────────────────────────────────────────────
 
 
 def cmd_buttons(raw_args: str = "") -> str:
@@ -599,9 +537,6 @@ def cmd_buttons(raw_args: str = "") -> str:
     except Exception as e:
         logger.warning("/wsbtn failed", exc_info=True)
         return f"/wsbtn failed: {type(e).__name__}: {e}"
-
-
-# ── registration ──────────────────────────────────────────────────────────────
 
 
 def register(ctx: Any) -> None:
