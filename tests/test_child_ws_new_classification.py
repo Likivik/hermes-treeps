@@ -33,7 +33,7 @@ import types
 from pathlib import Path
 
 import pytest
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import PLUGIN, STORE, TOOLS
 
 CHILD_PREFIX = STORE.CHILD_PURPOSE_PREFIX
 
@@ -63,7 +63,7 @@ def fake_repo(tmp_path, monkeypatch):
 
 
 def _ws_new(args, sid):
-    return json.loads(PLUGIN._tool_new(args, session_id=sid))
+    return json.loads(TOOLS._tool_new(args, session_id=sid))
 
 
 # ── (a) a child calling ws_new gets the forced child shape ──────────────────

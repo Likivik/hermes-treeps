@@ -37,7 +37,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import PLUGIN, STORE, TOOLS
 
 MIGRATE = importlib.import_module("hermes_treeps.migrate_layout")
 CHILDSPACE = importlib.import_module("hermes_treeps.childspace")
@@ -462,7 +462,7 @@ def test_a_child_slug_collision_binds_to_the_disambiguated_slug(tmp_path, monkey
 
 
 def _ws_new_schema():
-    for name, schema, _handler in PLUGIN._ws_tools():
+    for name, schema, _handler in TOOLS._ws_tools():
         if name == "ws_new":
             return schema
     raise AssertionError("ws_new is not registered")

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from plugin_loader import PLUGIN, STORE
+from plugin_loader import GATE, PLUGIN, STORE, TOOLS
 
 
 def _gate(tool: str, sid: str):
@@ -90,7 +90,7 @@ def test_forgetting_the_record_leaves_the_session_gated(state_home, tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
     STORE.write_state("sid-forget", {"mode": "repo", "repo": "r", "slug": "s", "path": str(ws)})
-    out = json.loads(PLUGIN._tool_doctor({"forget": True}, session_id="sid-forget"))
+    out = json.loads(TOOLS._tool_doctor({"forget": True}, session_id="sid-forget"))
     assert out["forgot"] is True
     assert STORE.resolve_detail("sid-forget")["state"] == "unbound"
     res = _gate("terminal", "sid-forget")
@@ -203,7 +203,7 @@ def test_binding_pins_the_session_cwd(tmp_path, monkeypatch, state_home):
     fake = _install_fake_runtime_cwd(monkeypatch)
     ws = tmp_path / "ws"
     ws.mkdir()
-    PLUGIN._pin_session_cwd(ws)
+    GATE._pin_session_cwd(ws)
     assert fake.pinned == [str(ws)], fake.pinned
 
 
@@ -215,7 +215,7 @@ def test_chatting_pins_hermes_home(monkeypatch, state_home):
     still write into whatever directory the gateway was launched from.
     """
     fake = _install_fake_runtime_cwd(monkeypatch, path="/somewhere")
-    PLUGIN._tool_chatting({}, session_id="sid-chat-pin")
+    TOOLS._tool_chatting({}, session_id="sid-chat-pin")
     assert fake.pinned, "ws_chatting left the previous workspace pinned"
     assert str(STORE.hermes_home()) in fake.pinned[-1], fake.pinned
 
@@ -281,7 +281,7 @@ def test_the_child_branch_runs_before_the_pinned_fallback(monkeypatch, state_hom
     _install_fake_runtime_cwd(monkeypatch, path="/Git/hermes/workspaces/repo/parent")
     # A bound parent's pin is in the child's inherited context; force the
     # fallback to fire so the test proves the ORDER, not the fallback's mood.
-    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/parent")
+    monkeypatch.setattr(GATE, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/parent")
 
     child_calls = []
     fake_childspace = types.ModuleType("childspace")
@@ -290,7 +290,7 @@ def test_the_child_branch_runs_before_the_pinned_fallback(monkeypatch, state_hom
         or {"ok": True, "path": "/Git/hermes/workspaces/repo/parent-child-abc123", "slug": "child"}
     )
     monkeypatch.setitem(sys.modules, "childspace", fake_childspace)
-    monkeypatch.setattr(PLUGIN, "childspace", fake_childspace)
+    monkeypatch.setattr(GATE, "childspace", fake_childspace)
 
     fake_delegation = types.ModuleType("agent.delegation_context")
     fake_delegation.is_delegated_child_context = lambda: True
@@ -311,7 +311,7 @@ def test_fail_closed_still_allows_a_session_pinned_into_a_workspace(monkeypatch,
     disagreeing about what a pinned cwd proves.
     """
     _install_fake_runtime_cwd(monkeypatch, path="/Git/hermes/workspaces/repo/ws")
-    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/ws")
+    monkeypatch.setattr(GATE, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/ws")
     monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("database is locked")))
     assert PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-pinned-ok") is None
 
@@ -326,7 +326,7 @@ def test_a_chatting_parent_may_delegate_but_an_unbound_one_may_not(monkeypatch, 
     res = PLUGIN._on_pre_tool_call(tool_name="delegate_task", session_id="sid-no-binding")
     assert res is not None and res["action"] == "block", res
 
-    PLUGIN._tool_chatting({}, session_id="sid-chat-delegate")
+    TOOLS._tool_chatting({}, session_id="sid-chat-delegate")
     assert PLUGIN._on_pre_tool_call(tool_name="delegate_task", session_id="sid-chat-delegate") is None, (
         "a chatting session is bound (to HERMES_HOME) and must be able to delegate"
     )
@@ -355,7 +355,7 @@ def test_a_failed_childspace_for_a_repo_parent_blocks_instead_of_inheriting(monk
     fake_childspace.ensure_child_workspace = lambda sid, parent_state, **kw: {
         "ok": False, "reason": "repo 'repo' is not a jj repo - no child workspace",
     }
-    monkeypatch.setattr(PLUGIN, "childspace", fake_childspace)
+    monkeypatch.setattr(GATE, "childspace", fake_childspace)
     fake_delegation = types.ModuleType("agent.delegation_context")
     fake_delegation.is_delegated_child_context = lambda: True
     monkeypatch.setitem(__import__("sys").modules, "agent.delegation_context", fake_delegation)
@@ -374,7 +374,7 @@ def test_a_stale_session_is_warned_even_when_pinned(monkeypatch, state_home):
     pinned inside the workspace root was silently allowed - the user was never
     told the binding was dead.
     """
-    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/ws")
+    monkeypatch.setattr(GATE, "_pinned_workspace", lambda: "/Git/hermes/workspaces/repo/ws")
     monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: None)
     monkeypatch.setattr(PLUGIN.store, "resolve_detail", lambda *a, **kw: {
         "state": "stale", "reason": "path /old/tree no longer exists"})
@@ -392,7 +392,7 @@ def test_a_bound_session_rearms_the_pin_after_a_restart(monkeypatch, state_home)
     gateway directory until the session rebound.
     """
     fake = _install_fake_runtime_cwd(monkeypatch, path="")
-    monkeypatch.setattr(PLUGIN, "_pinned_workspace", lambda: "")
+    monkeypatch.setattr(GATE, "_pinned_workspace", lambda: "")
     monkeypatch.setattr(PLUGIN.store, "resolve", lambda *a, **kw: {
         "mode": "repo", "path": "/Git/hermes/workspaces/repo/ws"})
     assert PLUGIN._on_pre_tool_call(tool_name="terminal", session_id="sid-resumed") is None
