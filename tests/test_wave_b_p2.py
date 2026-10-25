@@ -8,7 +8,6 @@ The findings covered here:
 
 * F1  - ``prepare.py``: the "workspace must be inside the repo" guard was a
         SELF-comparison and could never fire.
-* F2  - ``migrate_layout.py``: the live-session set was snapshotted once
         before the move loop, so a session bound mid-run lost its tree.
 * F4  - ``__init__.py``: report delivery read only the literal
         ``session_id`` key.
@@ -32,14 +31,11 @@ No network, no jj repo, no Hermes install: tmp dirs and the stdlib only.
 from __future__ import annotations
 
 import importlib
-import os
 import subprocess
-from pathlib import Path
 
 import pytest
 from plugin_loader import PLUGIN, STORE, TOOLS
 
-MIGRATE = importlib.import_module("hermes_treeps.migrate_layout")
 CHILDSPACE = importlib.import_module("hermes_treeps.childspace")
 PREPARE = importlib.import_module("hermes_treeps.prepare")
 SETTINGS = importlib.import_module("hermes_treeps.settings")
@@ -118,118 +114,6 @@ def test_prepare_still_runs_for_a_workspace_inside_the_repo_dir(tmp_path, monkey
     assert out["ok"] is True, out
     assert out["copied"] == [".env"], out
     assert (workspace / ".env").read_text() == "TOKEN=secret\n"
-
-
-# ── F2: the migration re-checks liveness at rename time ─────────────────────
-
-
-def _legacy_root(tmp_path: Path) -> Path:
-    return tmp_path / "repos" / "workspaces"
-
-
-@pytest.fixture
-def migrate_layout(tmp_path, monkeypatch):
-    """A tmp repo dir with the OLD workspace root, wired like the real one."""
-    repo_dir = tmp_path / "repos"
-    repo_dir.mkdir()
-    legacy = _legacy_root(tmp_path)
-    legacy.mkdir()
-    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
-    monkeypatch.setattr(
-        STORE,
-        "settings",
-        lambda: {
-            "repo_dir": str(repo_dir),
-            "workspace_root": str(legacy),
-            "repo_roots": [str(repo_dir)],
-        },
-    )
-    monkeypatch.setattr(MIGRATE, "legacy_roots", lambda *a, **kw: [legacy])
-    return {"repo_dir": repo_dir, "legacy": legacy}
-
-
-def _seed_workspace(layout, repo="demo", slug="demo-abc123", sessions=()):
-    ws = layout["legacy"] / repo / slug
-    ws.mkdir(parents=True)
-    STORE.write_record(
-        ws,
-        {
-            "repo": repo,
-            "slug": slug,
-            "path": str(ws),
-            "vcs": "jj",
-            "sessions": list(sessions),
-            "created_at": "2024-01-01T00:00:00",
-        },
-    )
-    return ws
-
-
-def test_the_migration_rechecks_liveness_at_rename_time(migrate_layout, monkeypatch):
-    """A session that binds DURING the migration keeps its tree.
-
-    Prevents: the live-session set being snapshotted ONCE, before the
-    move loop. The loop runs a dirty-tree check (a subprocess) per
-    workspace, so it can take minutes; a session that binds to a tree
-    while it runs was not in the pre-loop snapshot, and its tree was
-    renamed away underneath it - the session then resolves to a path that
-    no longer exists.
-
-    WHY the second workspace matters: the migration walks every
-    workspace, and the check happens per workspace. The mock reports the
-    SECOND tree as live from the moment the FIRST tree has been
-    processed - which is exactly "a session bound while the migration
-    was running". With the pre-loop snapshot the second tree was judged
-    against a set that did not contain it, so it was moved away from
-    under the session that had just bound to it.
-    """
-    first = _seed_workspace(migrate_layout, repo="demo", slug="demo-aaaaaa")
-    second = _seed_workspace(migrate_layout, repo="demo", slug="demo-bbbbbb")
-
-    calls: list[str] = []
-
-    def _live_paths():
-        calls.append("check")
-        # The first tree has already been through the loop by the time
-        # the second one is judged: the session has bound to the second
-        # tree WHILE the migration was running.
-        processed = [p for p in (first, second) if not p.exists()]
-        if processed:
-            # At least one tree was already processed: the session has
-            # bound to the remaining tree mid-run.
-            return {os.path.normpath(str(second))}
-        return set()
-
-    monkeypatch.setattr(MIGRATE, "_live_session_paths", _live_paths)
-    # The trees are clean: the dirty check is a jj/git call, stub it out.
-    monkeypatch.setattr(STORE, "dirty", lambda path: False)
-
-    report = MIGRATE.migrate_workspaces()
-
-    assert len(calls) >= 2, (
-        f"the liveness check was called {len(calls)} time(s) - it must be "
-        "re-checked per workspace, not snapshotted once"
-    )
-    assert second.exists(), "a tree a live session bound to was moved away"
-    assert report["in_use"], report
-    assert any(row["path"] == str(second) for row in report["in_use"]), report
-    assert all(row["path"] != str(second) for row in report["moved"]), report
-
-
-def test_the_migration_moves_a_tree_no_session_uses(migrate_layout, monkeypatch):
-    """The re-check does not block the normal move.
-
-    Prevents: the F2 fix becoming a guard that refuses everything.
-    """
-    ws = _seed_workspace(migrate_layout, sessions=["sid-gone"])
-    monkeypatch.setattr(MIGRATE, "_live_session_paths", lambda: set())
-    monkeypatch.setattr(STORE, "dirty", lambda path: False)
-
-    report = MIGRATE.migrate_workspaces()
-
-    assert report["in_use"] == [], report
-    assert len(report["moved"]) == 1, report
-    assert not ws.exists(), "the tree should have moved"
 
 
 # ── F4: report delivery finds the session id under every spelling ───────────

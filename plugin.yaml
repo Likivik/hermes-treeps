@@ -58,7 +58,7 @@ config_schema:
     description: >-
       DEPRECATED. The workspace root is derived from repo_dir now
       (<repo_dir>/.workspaces). Still parsed, but it no longer decides where
-      workspaces go - move existing ones with `hermes ws migrate`.
+      workspaces go.
   repo_roots:
     type: list
     default: [/Git, /Git/hermes, /Git/repos]

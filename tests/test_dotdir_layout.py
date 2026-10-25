@@ -8,13 +8,9 @@ Two things are pinned here:
 
 from __future__ import annotations
 
-import argparse
 import importlib
 
-from plugin_loader import CLI, STORE
-
-MIGRATE = importlib.import_module("hermes_treeps.migrate_layout")
-
+from plugin_loader import STORE
 
 # ── the derivation: one function, one shape ──────────────────────────────────
 
@@ -82,7 +78,6 @@ def test_the_prepare_step_accepts_a_workspace_in_the_new_layout(tmp_path, monkey
     workspace created after the change would silently lose its prepare
     step.
     """
-    import importlib
 
     prepare = importlib.import_module("hermes_treeps.prepare")
     repo_dir = tmp_path / "repos"
@@ -108,101 +103,3 @@ def test_the_prepare_step_accepts_a_workspace_in_the_new_layout(tmp_path, monkey
     assert out["command"]["ran"] is True, out
     assert "not inside the workspace root" not in out["command"]["output_tail"], out
 
-
-# ── the CLI: `hermes ws migrate` ─────────────────────────────────────────────
-
-
-def _cli(action="migrate", **kwargs):
-    """Run the plugin's CLI handler with a parsed-args stand-in."""
-    args = argparse.Namespace(ws_action=action, **kwargs)
-    return CLI._cli(args)
-
-
-def _registered_actions():
-    """The action names the `hermes ws` CLI registers."""
-    parser = argparse.ArgumentParser()
-    CLI._register_cli(parser)
-    # argparse stores the subparsers action; its choices are the commands.
-    for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            return set(action.choices)
-    return set()
-
-
-def test_the_migrate_subcommand_is_registered():
-    """`hermes ws migrate` exists and moves the layout.
-
-    WHY: the migration has to be something the operator runs ONCE, by
-    hand. A command that is not registered is a migration that never
-    happens - and then every workspace stays in the old layout forever.
-    """
-    assert "migrate" in _registered_actions()
-
-
-def test_the_migrate_cli_prints_the_report(tmp_path, monkeypatch, capsys):
-    """The CLI prints the report, bucket by bucket.
-
-    WHY: the structured dict is what a script reads; the text is what the
-    operator reads. A CLI that printed only the dict would make the
-    "skipped because dirty" case invisible - and that case is the one the
-    operator has to act on.
-    """
-    repo_dir = tmp_path / "repos"
-    repo_dir.mkdir()
-    legacy = repo_dir / "workspaces"
-    legacy.mkdir()
-    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
-    monkeypatch.setattr(
-        STORE, "settings",
-        lambda: {"repo_dir": str(repo_dir), "workspace_root": str(legacy),
-                 "repo_roots": [str(repo_dir)]},
-    )
-    monkeypatch.setattr(MIGRATE, "legacy_roots", lambda *a, **kw: [legacy])
-    monkeypatch.setattr(STORE, "dirty", lambda path: True)
-
-    ws = legacy / "demo" / "demo-abc123"
-    ws.mkdir(parents=True)
-    STORE.write_record(ws, {
-        "repo": "demo", "slug": "demo-abc123", "path": str(ws),
-        "vcs": "jj", "sessions": [], "created_at": "2024-01-01T00:00:00",
-    })
-
-    rc = _cli("migrate")
-
-    out = capsys.readouterr().out
-    assert rc == 0, rc
-    assert "moved" in out, out
-    assert "skipped_dirty" in out, out
-    assert str(ws) in out, out
-    assert ws.is_dir(), "the CLI moved a dirty workspace"
-
-
-def test_the_migrate_cli_dry_run_moves_nothing(tmp_path, monkeypatch, capsys):
-    """`--dry-run` reports the plan and changes nothing."""
-    repo_dir = tmp_path / "repos"
-    repo_dir.mkdir()
-    legacy = repo_dir / "workspaces"
-    legacy.mkdir()
-    monkeypatch.setattr(STORE, "repo_dir", lambda: repo_dir)
-    monkeypatch.setattr(
-        STORE, "settings",
-        lambda: {"repo_dir": str(repo_dir), "workspace_root": str(legacy),
-                 "repo_roots": [str(repo_dir)]},
-    )
-    monkeypatch.setattr(MIGRATE, "legacy_roots", lambda *a, **kw: [legacy])
-    monkeypatch.setattr(STORE, "dirty", lambda path: False)
-
-    ws = legacy / "demo" / "demo-abc123"
-    ws.mkdir(parents=True)
-    STORE.write_record(ws, {
-        "repo": "demo", "slug": "demo-abc123", "path": str(ws),
-        "vcs": "jj", "sessions": [], "created_at": "2024-01-01T00:00:00",
-    })
-
-    rc = _cli("migrate", dry_run=True)
-
-    out = capsys.readouterr().out
-    assert rc == 0, rc
-    assert "dry run" in out, out
-    assert ws.is_dir(), "the dry run moved the workspace"
-    assert not (repo_dir / ".workspaces" / "demo" / "demo-abc123").exists()

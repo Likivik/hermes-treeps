@@ -412,8 +412,7 @@ def settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
                 "settings.workspace_root is deprecated and ignored for path "
                 f"derivation (configured {legacy_root!r}); the workspace root is "
                 f"now derived from settings.repo_dir: {derived!r}. Set "
-                "repo_dir (or HERMES_TREEPS_REPO_DIR) instead. Existing "
-                "workspaces under the old root are moved by `hermes ws migrate`.",
+                "repo_dir (or HERMES_TREEPS_REPO_DIR) instead.",
             )
     # The derived value WINS over the legacy key: one source of truth.
     values["workspace_root"] = derived
