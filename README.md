@@ -49,7 +49,7 @@ else's tree.
   `rebind=true` instead of silently dual-binding. Rebinding detaches the old
   tree (the directory stays).
 - **Not on disk ≠ does not exist** — `ws_new` for a repo that is not under
-  the configured `repo_roots` checks the GitHub/Forgejo catalogue. If the repo
+  the configured `repo_dir` checks the GitHub/Forgejo catalogue. If the repo
   lives there,
   the answer is `needs_confirmation: true` with the remote's name, owner, url
   and source, and nothing is written to disk; the clone happens only on the
@@ -359,12 +359,46 @@ plugins:
         child_immediate_reclaim: true           # reclaim a child's tree the moment it stops
 ```
 
+### What discovery looks at
+
+The plugin offers the user **one flat list** of repos. Every entry carries a
+`tag` that says where it came from:
+
+| tag | meaning | keys |
+| --- | --- | --- |
+| `local` | a clone under `repo_dir` | `local_path` is set |
+| `forge:github` | a repo on GitHub, owned by the login `gh` is authenticated as | `clone_url`, `owner` |
+| `forge:forgejo` | a repo on Forgejo, owned by the login the token belongs to | `clone_url`, `owner` |
+
+Three rules decide what lands in the list:
+
+1. **The local scan walks `repo_dir` and nothing else.** A clone outside it
+   is not offered, because the plugin creates its workspaces under `repo_dir`
+   and cannot bind a repo it cannot reach. The deprecated `repo_roots` is
+   still parsed — an old config must not crash the plugin — but discovery
+   does not read it.
+2. **The forge scan is owner-filtered.** Each forge lists the repos of the
+   login the plugin is authenticated as — and nothing else, with no limit.
+   The login is **derived** from the credentials the plugin already has
+   (`GET /api/v1/user` with the Forgejo token; `gh api user` for GitHub),
+   not configured: there is no setting to name a login, so there is no way
+   to name the wrong one. A forge whose login cannot be derived (no token,
+   no `gh`, a dead API) is **skipped**, quietly — it is not an error the
+   user has to read in the middle of a session. The derived login is cached
+   for the life of the process.
+3. **The list is deduped by remote identity** — forge + owner + repo name,
+   parsed from the clone's `origin` URL — never by path. A forge repo that
+   already has a clone under `repo_dir` therefore appears **once**, tagged
+   `local`: the user knows one repo, and offering it twice would make them
+   clone a copy they already have. Two repos with the same name under
+   different owners are two different repos, and both stay.
+
 ### Deprecated settings
 
 | key | status | replacement |
 | --- | --- | --- |
 | `workspace_root` | **deprecated** — still parsed, no longer decides where a workspace goes | `repo_dir` (the root is derived: `<repo_dir>/.workspaces`) |
-| `repo_roots` | **deprecated** — still read for this release | `repo_dir` (repo discovery still follows `repo_roots` in this release) |
+| `repo_roots` | **deprecated** — still parsed, no longer read | `repo_dir` (repo discovery walks `repo_dir` and nothing else) |
 
 Both keys are still accepted so an old config does not break the plugin, and
 an explicit value that differs from the new behaviour produces a **one-time**
