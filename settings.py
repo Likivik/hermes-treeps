@@ -42,6 +42,7 @@ FORGEJO_TOKEN_ENV_LEGACY = "HERMES_TREEPS_FORGEJO_TOKEN"
 # The keys settings() reads. The test suite compares this set with the
 # ``config_schema`` in plugin.yaml - they must be identical.
 SETTINGS_KEYS: tuple[str, ...] = (
+    "repo_dir",
     "workspace_root",
     "repo_roots",
     "clone_root",
@@ -64,7 +65,17 @@ SETTINGS_KEYS: tuple[str, ...] = (
 SECRET_KEYS: tuple[str, ...] = ("forgejo_token",)
 
 DEFAULTS: dict[str, Any] = {
+    # The repo directory: everything the plugin owns lives under it, and the
+    # session workspaces live in its .workspaces/ dot-dir. This is the ONE
+    # knob that decides where workspaces are created.
+    "repo_dir": "/Git/hermes",
+    # DEPRECATED: the workspace root is DERIVED from repo_dir now
+    # (repo_dir/.workspaces). The key is still parsed so an old config does
+    # not break the plugin, and a one-time hint names repo_dir as the
+    # replacement - but the value below is only the pre-dot-dir default.
     "workspace_root": "/Git/hermes/workspaces",
+    # DEPRECATED: repo discovery reads repo_roots; the dot-dir layout does
+    # not change discovery in this release. A one-time hint names repo_dir.
     "repo_roots": ["/Git", "/Git/hermes", "/Git/likivik", "/Git/repos"],
     "clone_root": "/Git/hermes",
     "repo_sources": ["local", "github", "forgejo"],
@@ -99,9 +110,11 @@ ALLOWED_VCS = ("auto", "jj", "git")
 
 # Environment overrides: ENV_VAR -> settings key.
 ENV_OVERRIDES: dict[str, str] = {
-    "HERMES_TREEPS_WORKSPACE_ROOT": "workspace_root",
-    "HERMES_WS_ROOT": "workspace_root",  # the original override name
-    "HERMES_TREEPS_REPO_ROOTS": "repo_roots",
+    "HERMES_TREEPS_REPO_DIR": "repo_dir",
+    "HERMES_WS_REPO_DIR": "repo_dir",  # the short alias
+    "HERMES_TREEPS_WORKSPACE_ROOT": "workspace_root",  # deprecated
+    "HERMES_WS_ROOT": "workspace_root",  # the original override name, deprecated
+    "HERMES_TREEPS_REPO_ROOTS": "repo_roots",  # deprecated
     "HERMES_TREEPS_CLONE_ROOT": "clone_root",
     "HERMES_TREEPS_REPO_SOURCES": "repo_sources",
     "HERMES_TREEPS_VCS": "vcs",
@@ -113,6 +126,73 @@ ENV_OVERRIDES: dict[str, str] = {
 }
 
 _LIST_SEPARATORS = (":", ",")
+
+# The dot-dir name of the workspaces directory, under repo_dir.
+WORKSPACES_DIRNAME = ".workspaces"
+
+# One-time deprecation hints, keyed by the deprecated setting name.
+#
+# WHY a module-level set: settings() is called on EVERY session start, every
+# ws_doctor, every gate check. A hint that fires on each of those would
+# scroll the operator's log with the same sentence all day. The hint is meant
+# to say "your config still names the old key, here is the new one" ONCE.
+# The set is process-local, which is the right scope: a fresh process (a new
+# gateway start) says it again, because the operator may not have seen it.
+_DEPRECATION_HINTS_SHOWN: set[str] = set()
+
+
+def reset_deprecation_hints() -> None:
+    """Forget which deprecation hints were already shown.
+
+    WHY the tests need it: the one-time behaviour is process-global state, so
+    a test that asserts "the hint fires" would poison every later test that
+    asserts "the hint does NOT fire again". Resetting is the only way to
+    test both halves of a one-time rule.
+    """
+    _DEPRECATION_HINTS_SHOWN.clear()
+
+
+def deprecation_hint(key: str, message: str) -> None:
+    """Log a deprecation hint for ``key`` - once per process."""
+    if key in _DEPRECATION_HINTS_SHOWN:
+        return
+    _DEPRECATION_HINTS_SHOWN.add(key)
+    logger.warning("hermes-treeps: %s", message)
+
+
+def derived_workspace_root(repo_dir: str) -> str:
+    """The workspace root for a repo dir: ``<repo_dir>/.workspaces``.
+
+    WHY derived and not configured: the workspaces live NEXT TO the repos they
+    belong to, in a dot-dir, so they are invisible to a plain ``ls`` of the
+    repo dir and cannot be mistaken for a repo. Two knobs (workspace_root AND
+    repo_dir) could disagree about where a workspace goes, and the loser
+    would be whichever one a caller happened to read. One knob, derived.
+    """
+    return f"{str(repo_dir).rstrip('/')}/{WORKSPACES_DIRNAME}"
+
+
+def legacy_workspace_root(config: Mapping[str, Any] | None = None) -> str:
+    """The workspace root the operator CONFIGURED, before the derivation.
+
+    WHY this exists: ``settings()["workspace_root"]`` now returns the
+    DERIVED root, so the configured one is gone from the settings dict. The
+    one-time migration needs it - it is how the old workspaces are FOUND.
+    Without it, a host whose workspaces live under a custom root would
+    report "nothing to move" and the operator would have to move them by
+    hand.
+
+    Returns "" when the operator set nothing (the shipped default applies).
+    """
+    configured = _settings_entry(config)
+    if "workspace_root" in configured:
+        return str(configured["workspace_root"])
+    for var, key in ENV_OVERRIDES.items():
+        if key == "workspace_root":
+            raw = os.environ.get(var, "")
+            if raw.strip():
+                return raw.strip()
+    return ""
 
 
 class SettingsError(WorkspaceError):
@@ -182,6 +262,7 @@ def _validate(values: dict[str, Any]) -> dict[str, Any]:
             )
         out[key] = val
 
+    _abs_path("repo_dir")
     _abs_path("workspace_root")
     _abs_path("clone_root")
 
@@ -262,10 +343,57 @@ def settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     Raises :class:`SettingsError` (a ``WorkspaceError``) naming the key when a
     value cannot work - a bad path or an unknown discovery source is a
     configuration bug, and silently falling back would hide it.
+
+    The workspace root is DERIVED: ``<repo_dir>/.workspaces``. The legacy
+    ``workspace_root`` key is still parsed (so an old config does not crash
+    the plugin), and when it was set explicitly to something other than the
+    derived value, a one-time hint names ``repo_dir`` as the replacement.
     """
     values: dict[str, Any] = dict(DEFAULTS)
-    values.update(_settings_entry(config))
-    values.update(_env_overrides())
+    configured = _settings_entry(config)
+    values.update(configured)
+    env = _env_overrides()
+    values.update(env)
+
+    # Which deprecated keys did the OPERATOR set (config.yaml or env), as
+    # opposed to inherited from the defaults? Only an explicit value is worth
+    # a deprecation hint: a default nobody typed is not something to nag
+    # about, and the defaults still carry the old key so the manifest schema
+    # test keeps its shape.
+    explicit = set(configured) | {
+        key for var, key in ENV_OVERRIDES.items() if os.environ.get(var, "").strip()
+    }
+
+    derived = derived_workspace_root(str(values["repo_dir"]))
+
+    # Validate the values as they were configured BEFORE the derivation
+    # overwrites the deprecated key: a stale config with a relative
+    # workspace_root has to be refused and named, not silently accepted
+    # because the derived value happens to be fine.
+    _validate(values)
+
+    if "workspace_root" in explicit:
+        legacy_root = str(values["workspace_root"])
+        if legacy_root.rstrip("/") != derived.rstrip("/"):
+            deprecation_hint(
+                "workspace_root",
+                "settings.workspace_root is deprecated and ignored for path "
+                f"derivation (configured {legacy_root!r}); the workspace root is "
+                f"now derived from settings.repo_dir: {derived!r}. Set "
+                "repo_dir (or HERMES_TREEPS_REPO_DIR) instead. Existing "
+                "workspaces under the old root are moved by `hermes ws migrate`.",
+            )
+    # The derived value WINS over the legacy key: one source of truth.
+    values["workspace_root"] = derived
+
+    if "repo_roots" in explicit:
+        deprecation_hint(
+            "repo_roots",
+            "settings.repo_roots is deprecated; repo discovery now follows "
+            f"settings.repo_dir ({values['repo_dir']!r}). The list is still "
+            "read for this release, but set repo_dir instead.",
+        )
+
     return _validate(values)
 
 

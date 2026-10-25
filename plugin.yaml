@@ -37,14 +37,25 @@ provides_hooks:
 # and the code cannot drift apart. The test suite asserts that this set is
 # exactly the set settings() reads.
 config_schema:
+  repo_dir:
+    type: str
+    default: /Git/hermes
+    description: >-
+      The repo directory. Session workspaces live in its .workspaces/ dot-dir
+      (<repo_dir>/.workspaces/<repo>/<slug>).
   workspace_root:
     type: str
     default: /Git/hermes/workspaces
-    description: Where session workspaces are created (<repo>/<slug> under this root).
+    description: >-
+      DEPRECATED. The workspace root is derived from repo_dir now
+      (<repo_dir>/.workspaces). Still parsed, but it no longer decides where
+      workspaces go - move existing ones with `hermes ws migrate`.
   repo_roots:
     type: list
     default: [/Git, /Git/hermes, /Git/likivik, /Git/repos]
-    description: Directories scanned for local repos.
+    description: >-
+      DEPRECATED. Directories scanned for local repos. Repo discovery
+      follows repo_dir now; this list is still read for this release.
   clone_root:
     type: str
     default: /Git/hermes

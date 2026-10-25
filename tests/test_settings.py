@@ -28,9 +28,15 @@ def _config(**settings):
 
 
 def test_defaults_reproduce_the_original_constants():
-    """With nothing configured, the plugin behaves exactly as it did before."""
+    """With nothing configured, the plugin behaves exactly as it did before.
+
+    WHY the workspace root is no longer one of the "original constants": it is
+    DERIVED from repo_dir now (``<repo_dir>/.workspaces``), so the constant
+    that decides where workspaces live is repo_dir.
+    """
     cfg = settings_module.settings()
-    assert cfg["workspace_root"] == "/Git/hermes/workspaces"
+    assert cfg["repo_dir"] == "/Git/hermes"
+    assert cfg["workspace_root"] == "/Git/hermes/.workspaces"
     assert cfg["repo_roots"] == ["/Git", "/Git/hermes", "/Git/likivik", "/Git/repos"]
     assert cfg["clone_root"] == "/Git/hermes"
     assert cfg["repo_sources"] == ["local", "github", "forgejo"]
@@ -39,14 +45,25 @@ def test_defaults_reproduce_the_original_constants():
     assert cfg["allowed_user_ids"] == []
     assert cfg["forgejo_url"] == ""
     # The store's own constants must agree with the settings defaults.
-    assert settings_module.DEFAULTS["workspace_root"] == cfg["workspace_root"]
+    assert settings_module.DEFAULTS["repo_dir"] == cfg["repo_dir"]
     assert list(settings_module.DEFAULTS["repo_roots"]) == cfg["repo_roots"]
+
+
+def test_the_workspace_root_is_derived_from_the_repo_dir():
+    """The workspace root follows repo_dir - it is not configured separately.
+
+    WHY: two knobs that both claim to decide where a workspace goes can
+    disagree, and the loser is whichever one a caller happened to read. One
+    knob, derived.
+    """
+    cfg = settings_module.settings(_config(repo_dir="/srv/repos"))
+    assert cfg["workspace_root"] == "/srv/repos/.workspaces", cfg
 
 
 def test_a_custom_config_is_honoured():
     """What the user configured is what the plugin uses."""
     cfg = settings_module.settings(_config(
-        workspace_root="/srv/ws",
+        repo_dir="/srv/repos",
         repo_roots=["/srv/repos"],
         clone_root="/srv/new",
         repo_sources=["local"],
@@ -55,7 +72,8 @@ def test_a_custom_config_is_honoured():
         allowed_user_ids=[42],
         forgejo_url="https://forgejo.example",
     ))
-    assert cfg["workspace_root"] == "/srv/ws"
+    assert cfg["repo_dir"] == "/srv/repos"
+    assert cfg["workspace_root"] == "/srv/repos/.workspaces"
     assert cfg["repo_roots"] == ["/srv/repos"]
     assert cfg["clone_root"] == "/srv/new"
     assert cfg["repo_sources"] == ["local"]
@@ -73,16 +91,37 @@ def test_a_legacy_top_level_key_is_ignored():
     value than the live one is worse than none.
     """
     cfg = settings_module.settings({"plugins": {"entries": {"hermes-treeps": {
-        "workspace_root": "/legacy/root",
-        "settings": {"workspace_root": "/current/root"},
+        "repo_dir": "/legacy/dir",
+        "settings": {"repo_dir": "/current/dir"},
     }}}})
-    assert cfg["workspace_root"] == "/current/root", cfg
+    assert cfg["repo_dir"] == "/current/dir", cfg
+    assert cfg["workspace_root"] == "/current/dir/.workspaces", cfg
 
 
 # ── validation: a bad value names its key ────────────────────────────────────
 
 
+def test_a_relative_repo_dir_is_refused_and_names_the_key():
+    """A relative repo_dir would derive a relative workspace root.
+
+    WHY it matters: the workspace root is DERIVED from repo_dir now, so a
+    relative repo_dir produces a relative workspace path - and a relative
+    path resolves against whatever cwd the process happens to have. The
+    workspaces would then land in different places depending on who started
+    the gateway. The key is named so the operator knows which one to fix.
+    """
+    with pytest.raises(SettingsError) as exc:
+        settings_module.settings(_config(repo_dir="relative/path"))
+    assert "repo_dir" in str(exc.value), exc.value
+
+
 def test_a_relative_workspace_root_is_refused_and_names_the_key():
+    """The deprecated key is still validated, even though it is not used.
+
+    WHY: a stale config with a relative workspace_root would otherwise be
+    accepted silently, and the operator would only find out when the
+    migration found nothing to move.
+    """
     with pytest.raises(SettingsError) as exc:
         settings_module.settings(_config(workspace_root="relative/path"))
     assert "workspace_root" in str(exc.value), exc.value
@@ -105,6 +144,72 @@ def test_a_relative_clone_root_is_refused_and_names_the_key():
     with pytest.raises(SettingsError) as exc:
         settings_module.settings(_config(clone_root="somewhere"))
     assert "clone_root" in str(exc.value), exc.value
+
+
+# ── deprecation hints: one per process, and they name the replacement ────────
+
+
+def test_a_deprecated_workspace_root_hints_once_and_names_repo_dir(caplog):
+    """An explicitly set legacy workspace_root produces ONE hint.
+
+    WHY it matters: settings() is called on every session start, every
+    ws_doctor and every gate check. A hint that fired on each of those
+    would scroll the operator's log with the same sentence all day. The hint
+    also has to NAME the replacement - "something is deprecated" is not
+    actionable, "set repo_dir" is.
+    """
+    settings_module.reset_deprecation_hints()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        settings_module.settings(_config(workspace_root="/srv/ws"))
+        settings_module.settings(_config(workspace_root="/srv/ws"))
+    hints = [r for r in caplog.records if "workspace_root" in r.getMessage()]
+    assert len(hints) == 1, [r.getMessage() for r in caplog.records]
+    message = hints[0].getMessage()
+    assert "repo_dir" in message, message
+    assert "/srv/ws" in message, message
+
+
+def test_a_deprecated_repo_roots_hints_once(caplog):
+    """repo_roots is deprecated too, and says so."""
+    settings_module.reset_deprecation_hints()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        settings_module.settings(_config(repo_roots=["/srv/repos"]))
+        settings_module.settings(_config(repo_roots=["/srv/repos"]))
+    hints = [r for r in caplog.records if "repo_roots" in r.getMessage()]
+    assert len(hints) == 1, [r.getMessage() for r in caplog.records]
+    assert "repo_dir" in hints[0].getMessage(), hints[0].getMessage()
+
+
+def test_an_untouched_default_does_not_hint(caplog):
+    """A default nobody typed is not worth a deprecation nag.
+
+    WHY: the defaults still carry the legacy keys (the manifest schema is
+    built from them), so without this the plugin would nag every operator
+    on every start about a setting they never wrote.
+    """
+    settings_module.reset_deprecation_hints()
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        settings_module.settings()
+    hints = [r for r in caplog.records if "deprecated" in r.getMessage()]
+    assert hints == [], [r.getMessage() for r in hints]
+
+
+def test_a_workspace_root_that_equals_the_derived_one_does_not_hint(caplog):
+    """Setting the legacy key to the derived value is not a conflict.
+
+    WHY: an operator who copies the derived path into their config (the
+    value the plugin itself prints) should not be told they are wrong.
+    """
+    settings_module.reset_deprecation_hints()
+    caplog.clear()
+    derived = settings_module.derived_workspace_root("/Git/hermes")
+    with caplog.at_level("WARNING"):
+        settings_module.settings(_config(workspace_root=derived))
+    hints = [r for r in caplog.records if "workspace_root" in r.getMessage()]
+    assert hints == [], [r.getMessage() for r in hints]
 
 
 # ── schema drift: the manifest and the code must agree ───────────────────────

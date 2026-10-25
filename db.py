@@ -735,6 +735,77 @@ def workspace_paths_for_slug(slug: str) -> list[str]:
     ]
 
 
+def all_workspaces() -> list[dict[str, Any]]:
+    """Every workspace record, oldest first.
+
+    WHY the migration needs the whole table and not a per-slug lookup: the
+    move is driven by the recorded PATH (is it under the old root?), and a
+    workspace whose record no longer matches its slug would be invisible to
+    a slug-keyed query.
+    """
+    conn = connect()
+    rows = conn.execute(
+        "SELECT * FROM workspaces ORDER BY created_at, repo, slug"
+    ).fetchall()
+    return [_workspace_row_to_dict(conn, row) for row in rows]
+
+
+def all_bindings() -> list[dict[str, Any]]:
+    """Every session binding row, as plain dicts.
+
+    WHY the raw rows and not ``read_binding``: the migration needs to know
+    which sessions are still LIVE, and that is the ``session_ended_at``
+    column - a per-session query would be one round trip per row.
+    """
+    conn = connect()
+    rows = conn.execute(
+        "SELECT session_id, mode, repo, slug, path, session_ended_at FROM bindings"
+    ).fetchall()
+    return [
+        {
+            "session_id": str(r["session_id"]),
+            "mode": str(r["mode"] or ""),
+            "repo": str(r["repo"] or ""),
+            "slug": str(r["slug"] or ""),
+            "path": str(r["path"] or ""),
+            "session_ended_at": str(r["session_ended_at"] or ""),
+        }
+        for r in rows
+    ]
+
+
+def rebind_workspace_path(repo: str, slug: str, new_path: str) -> None:
+    """Point a workspace (and every session bound to it) at a new path.
+
+    WHY the session rows move with the workspace row: a binding that still
+    names the old path is a session whose tree "is gone" - resolve_detail
+    calls that state stale, and the session is broken until somebody repairs
+    it by hand.
+
+    WHY this goes through ``write_binding`` and not a bare UPDATE: the
+    binding's path lives in TWO places - the ``path`` column AND the
+    ``payload`` JSON - and ``read_binding`` returns the payload. A bare
+    UPDATE of the column would leave the payload naming the old path, so the
+    session would still resolve to a tree that is gone.
+    """
+    with transaction() as conn:
+        conn.execute(
+            "UPDATE workspaces SET path=? WHERE repo=? AND slug=?",
+            (new_path, repo, slug),
+        )
+    rows = connect().execute(
+        "SELECT session_id FROM bindings WHERE repo=? AND slug=?",
+        (repo, slug),
+    ).fetchall()
+    for row in rows:
+        sid = str(row["session_id"])
+        payload = read_binding(sid)
+        if not payload:
+            continue
+        payload["path"] = new_path
+        write_binding(sid, payload)
+
+
 def delete_workspace(repo: str, slug: str) -> None:
     with transaction() as conn:
         conn.execute("DELETE FROM workspace_sessions WHERE repo=? AND slug=?", (repo, slug))
