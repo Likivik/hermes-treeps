@@ -139,7 +139,9 @@ def wire(application: Any, adapter: Any) -> None:
             msg = getattr(update, "effective_message", None)
             coords = (
                 getattr(chat, "id", None),
-                getattr(msg, "message_thread_id", None) if msg is not None else None,
+                store.normalize_thread(
+                    getattr(msg, "message_thread_id", None) if msg is not None else None
+                ),
             )
             key = _chat_key(*coords)
             TG["chats"][key] = {"coords": coords, "at": time.time()}
@@ -244,6 +246,7 @@ async def send_choice_message(session_id: str, hint_key: str | None = None) -> N
         if chat_id is None:
             claim = (TG.get("pending_picker") or {}).get(hint_key or "", {})
             chat_id, thread_id = claim.get("coords") or _most_recent_chat() or (None, None)
+            thread_id = store.normalize_thread(thread_id)
             source = "last-update"
 
         adapter = TG.get("adapter")
