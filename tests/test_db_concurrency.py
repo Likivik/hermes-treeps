@@ -17,14 +17,12 @@ audit's control run, 0 with per-thread connections.
 The other defects are quieter but just as real: ``reset()`` segfaulted the
 process by closing a connection another thread was using, a failed write
 left a dirty transaction that the NEXT unrelated commit published, the
-purge deleted files it had failed to back up, the env override did not
-actually isolate the database, and the connection was published before its
-schema existed.
+env override did not actually isolate the database, and the connection was
+published before its schema existed.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 import subprocess
@@ -237,45 +235,6 @@ def test_failed_write_leaves_nothing_behind(tmp_path):
         assert sids == ["s-keep"], f"the failed write changed the session list: {sids}"
     finally:
         observer.close()
-
-
-# ── 4. the purge must not delete what it could not back up ─────────────────
-
-
-def test_purge_keeps_a_file_it_could_not_back_up(tmp_path):
-    """A record the backup could not read must SURVIVE the purge.
-
-    Prevents (P0): ``_write_backup`` swallowed the per-file tar error, and
-    the caller deleted the files unconditionally - so an unreadable record
-    was purged with an EMPTY tarball. The record was simply gone. Now the
-    purge deletes only what is really in the tarball and reports the rest.
-    """
-    root = tmp_path / "wsroot"
-    good = root / "repo" / "good"
-    bad = root / "repo" / "bad"
-    for ws in (good, bad):
-        (ws / ".hermes").mkdir(parents=True)
-        rec = ws / ".hermes" / "session.json"
-        rec.write_text(json.dumps({"repo": "repo", "slug": ws.name, "sessions": []}))
-        DB.write_workspace(
-            {"repo": "repo", "slug": ws.name, "path": str(ws), "purpose": ""},
-            path=str(ws),
-        )
-
-    unreadable = bad / ".hermes" / "session.json"
-    unreadable.chmod(0o000)
-    try:
-        out = DB.purge_legacy_records(dry_run=False, workspace_root=root)
-    finally:
-        if unreadable.exists():
-            unreadable.chmod(0o644)
-
-    assert str(good / ".hermes" / "session.json") in out["purged"], out
-    assert not (good / ".hermes" / "session.json").exists(), out
-    assert str(unreadable) in out["not_backed_up"], (
-        f"the purge did not report the file it could not back up: {out}"
-    )
-    assert unreadable.exists(), "the purge deleted a file that was never backed up"
 
 
 # ── 5. the env override must actually isolate the database ─────────────────

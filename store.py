@@ -13,8 +13,8 @@ the last writer wrote back a list it had read before the others wrote. A row
 per binding with one transaction per mutation removes that class of bug.
 
 The install directory is git-pulled and deleted on update, so nothing is
-written there: the old JSON files are imported once (see ``db.migrate_legacy``)
-and then purged explicitly.
+written there: the old JSON files were imported into the database once, and
+that import pathway is gone - every record lives in the database now.
 
 The paths, the VCS and the discovery sources come from the configuration (see
 :mod:`settings`), and the jj/git differences sit behind a small adapter (see
@@ -2117,26 +2117,3 @@ def ensure_local(name: str, url: str) -> Path:
         raise WorkspaceError(f"{dest} already exists but is not a repo")
     run(["jj", "git", "clone", "--colocate", safe, str(dest)], cwd=base)
     return dest
-
-
-# ── migration ─────────────────────────────────────────────────────────────────
-
-
-def migrate_legacy(workspace_root: Path | None = None, dry_run: bool = False) -> dict[str, Any]:
-    """Import the legacy JSON records into the database. Idempotent.
-
-    ``dry_run`` is forwarded, not swallowed: this wrapper dropped it once and
-    the CLI then imported 38 rows under --dry-run while the underlying
-    function was already fixed. The wrapper is the seam the CLI actually
-    calls, so it carries every argument.
-    """
-    return db.migrate_legacy(
-        workspace_root if workspace_root is not None else root_dir(), dry_run=dry_run
-    )
-
-
-def purge_legacy_records(dry_run: bool = False, workspace_root: Path | None = None) -> dict[str, Any]:
-    """Delete the in-tree ``.hermes/session.json`` files, after a backup."""
-    return db.purge_legacy_records(
-        dry_run=dry_run, workspace_root=workspace_root if workspace_root is not None else root_dir()
-    )

@@ -1425,24 +1425,6 @@ def _register_cli(subparser) -> None:
         help="report what would move, move nothing",
     )
 
-    # The legacy JSON-record import used to be `hermes ws migrate`. It keeps
-    # working under an explicit name, because the one-time LAYOUT migration
-    # now owns the short form.
-    p_legacy = sub.add_parser(
-        "migrate-legacy",
-        help="import the legacy JSON records into the plugin database (idempotent)",
-    )
-    p_legacy.add_argument(
-        "--purge",
-        action="store_true",
-        help="after importing, delete the in-tree .hermes/session.json files (backed up first)",
-    )
-    p_legacy.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="with --purge: list the files that would be deleted and delete none",
-    )
-
     subparser.set_defaults(ws_action="list")
 
 
@@ -1677,18 +1659,6 @@ def _cli(args) -> int:
                     f"verify failed {len(out.get('verify_failed') or [])}, "
                     f"repair failed {len(out.get('repair_failed') or [])}"
                 )
-            return 0
-        if action == "migrate-legacy":
-            out = store.migrate_legacy(dry_run=bool(getattr(args, "dry_run", False)))
-            print(json.dumps(out, indent=2, default=str))
-            if not getattr(args, "purge", False):
-                return 0
-            purge = store.purge_legacy_records(dry_run=bool(getattr(args, "dry_run", False)))
-            print(json.dumps(purge, indent=2, default=str))
-            if getattr(args, "dry_run", False):
-                print("dry run: nothing was deleted")
-            else:
-                print(f"purged {len(purge.get('purged') or [])} legacy record(s)")
             return 0
     except store.WorkspaceError as e:
         print(f"refused: {e}")

@@ -16,7 +16,7 @@ else's tree.
 | `__init__.py` | tools (`ws_new`, `ws_chatting`, `ws_rename`, `ws_status`, `ws_doctor`), the tool gate, `hermes ws` CLI, system-prompt section |
 | `telegram_picker.py` | Telegram inline keyboard: repo picker on `/new`, tap handling, `/wsbtn` |
 | `store.py` | workspaces, session records, tokens, remote repo listing (GitHub + Forgejo), retire ladder, gc tiers |
-| `db.py` | the SQLite schema and every query: sessions, bindings, workspaces, remote cache, legacy import |
+| `db.py` | the SQLite schema and every query: sessions, bindings, workspaces, remote cache |
 | `settings.py` | one accessor for the config: defaults, env overrides, validation, the manifest schema contract |
 | `discovery.py` | repo discovery: local roots plus the GitHub/Forgejo catalogue |
 | `vcs.py` | the jj/git adapter: one API, two backends |
@@ -517,10 +517,6 @@ The command prints the five buckets and their counts. The same data is
 available as a dict (`moved`, `skipped_dirty`, `in_use`, `verify_failed`,
 `repair_failed`) for anything that wants to read it.
 
-> `hermes ws migrate` used to import the legacy JSON records. That import
-> still exists under the explicit name **`hermes ws migrate-legacy`**
-> (`--purge` deletes the in-tree copies after writing a tarball backup).
-
 ## Prepare
 
 A workspace is not usable the moment `jj workspace add` returns. Every other
@@ -611,11 +607,11 @@ in it, and every mutation is one transaction — the old JSON read-modify-write
 lost half of eight concurrent bindings.
 
 The plugin install directory holds no state, so `hermes plugins update` can
-replace it without touching anything. Legacy JSON records (the old
+replace it without touching anything. The legacy JSON records (the old
 `state/*.json` files and the in-tree `<workspace>/.hermes/session.json` files)
-are imported into the database by an explicit `hermes ws migrate-legacy` —
-nothing imports them on open. `hermes ws migrate-legacy --purge` deletes the
-in-tree copies after writing a tarball backup of them.
+were imported into the database once, by an explicit command that no longer
+exists: every record is in the database now, and the import pathway has been
+removed along with its `--purge` variant. Nothing imports them on open.
 
 ## Requirements
 
