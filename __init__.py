@@ -21,7 +21,8 @@ import logging
 import time
 from typing import Any, Mapping
 
-from . import childreport, contract, prepare, store
+from . import childreport, prepare, store
+from . import contract as contract
 from . import telegram_picker as picker
 from .cli import _cli, _register_cli
 from .gate import _on_pre_tool_call as _gate_on_pre_tool_call
@@ -36,33 +37,14 @@ logger = logging.getLogger(__name__)
 _PROMPT_TEMPLATE = """\
 ## Workspace discipline (hermes-treeps)
 
-This session starts unresolved. Repository work - anything that reads, writes or
-runs commands in a checkout - requires a workspace first:
+Repo work needs a workspace. On an unresolved session, ask in ONE line: the
+session title + which repo - {repos}, an external path, a new repo - or just
+chatting. Then `ws_new`, or `ws_chatting` for a talk-only session. Children
+are bound for you: never bind a child yourself.
 
-- `ws_new(repo, slug)` creates `<repo_dir>/.workspaces/<repo>/<slug>` and binds
-  this session to it. Use for any real work: code, docs, config, git. Omit slug
-  and it defaults to `<repo>-<last 6 of the session id>` - the path is derived
-  from the id, never from the session title, because titles get renamed.
-- `ws_chatting()` declares a talk-only session: cwd stays HERMES_HOME and all
-  tools stay available, but nothing repo-shaped should be edited.
-- A repo that is not on disk but lives on GitHub/Forgejo goes through
-  `ws_new(repo, slug, create_repo=true)`, and the user must approve the clone
-  first - never clone on your own initiative.
-
-On the first turn, ask BOTH questions in a single line (never two messages, never
-a menu): the session TITLE (required - it is metadata only; the workspace name
-is derived from the session id, never from the title, because titles get
-renamed), and which repo - or just chatting. Example: "Session title? (metadata
-only - the workspace name comes from the session id) - and which repo: {repos},
-an external path, a new repo, or just chatting?"
-
-If a chatting session drifts into repository work (a path under a configured repo
-root, a clone, a git/jj command, a PR), say one line: "this looks like repo work
-- want a workspace for it?" and offer `ws_new <repo> <slug>`. Do not silently
-start editing.
-
-Never create a workspace without the user's choice, and never work in another
-session's workspace.
+A chatting session that drifts into repo work (a path under a repo root, a
+clone, a git/jj command, a PR): say "this looks like repo work - want a
+workspace?" and offer `ws_new`.
 """
 
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
@@ -314,9 +296,11 @@ def register(ctx) -> None:
     listing = ", ".join(repos) if repos else f"(none found under {_repo_roots_label()})"
     ctx.register_system_prompt_section(
         "workspace-discipline",
-        # The delegation contract travels with the prompt: the rules that used to
-        # live in a skill file and in the operator's head are now in every session.
-        _PROMPT_TEMPLATE.format(repos=listing) + "\n\n" + contract.as_prompt_section(),
+        # ONE section, routing only. It ships in every session's prompt - parent
+        # and child - so every line here is a tax on every turn. The gate blocks
+        # repo tools until a workspace exists; the ask is the only thing it
+        # cannot do for the session, so the ask is all this carries.
+        _PROMPT_TEMPLATE.format(repos=listing),
         position="after_memory",
     )
 

@@ -47,10 +47,11 @@ def test_a_child_gets_its_own_workspace_before_inheriting(tmp_path, monkeypatch,
     assert calls["parent_state"]["repo"] == "repo", calls
 
 
-def test_the_prompt_section_carries_the_delegation_contract(monkeypatch):
-    """The contract ships inside the system prompt, not in a skill file.
+def test_the_prompt_section_is_registered(monkeypatch):
+    """The section ships inside the system prompt, with the plugin's tools named.
 
-    Prevents: the rules being remembered only by an operator who is in a hurry.
+    Prevents: a session that is told nothing about the workspace ask, which is
+    the one thing the gate cannot do for it.
     """
     registered = {}
 
@@ -73,7 +74,6 @@ def test_the_prompt_section_carries_the_delegation_contract(monkeypatch):
     monkeypatch.setattr(STORE, "candidate_repos", lambda limit=6: ["repo"])
     PLUGIN.register(Ctx())
     text = registered.get("workspace-discipline", "")
-    assert PLUGIN.contract.SECTION_TITLE in text, text[:200]
-    assert "ws_new" in text
+    assert "ws_new" in text, text[:200]
 
 

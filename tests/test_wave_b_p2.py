@@ -367,20 +367,6 @@ def test_the_ws_new_schema_does_not_require_a_slug():
     assert "defaults to" in params["properties"]["slug"]["description"], schema
 
 
-def test_the_injected_prompt_does_not_say_the_title_names_the_workspace():
-    """The prompt must match the code: the title is metadata only.
-
-    Prevents: the agent being told to derive a workspace name from the
-    title. The code names the workspace after the SESSION ID (twice, and
-    explicitly: "the path is derived from the id, never from the session
-    title, because titles get renamed"). The prompt said the opposite -
-    "it becomes the workspace name" - and the example repeated it.
-    """
-    prompt = PLUGIN._PROMPT_TEMPLATE
-    assert "it becomes the workspace name" not in prompt, prompt
-    assert "metadata only" in prompt, prompt
-
-
 # ── F11: the repo_roots deprecation hint tells the truth ────────────────────
 
 
