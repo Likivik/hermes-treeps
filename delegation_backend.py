@@ -60,12 +60,12 @@ class HermesTreepsDelegationProvider:
 
         s = settings()
         index = _task_index(task)
-        live_minimax = capacity.count_live(
-            scope=s["capacity_tracking_scope"],
-            profiles=s["capacity_tracking_profiles"],
-            ledger_dir=s["capacity_ledger_dir"],
-            match=lambda row: capacity.is_minimax(row.get("model", ""), row.get("provider", "")),
-        )
+        # WHY the transcripts and not the ledger: a ledger row cannot name the
+        # child's route (subagent_start carries no model/provider), so a child
+        # this backend already sent to the overflow provider would still count
+        # as primary and poison the next batch. The host's manifests name the
+        # route per delegation; capacity.live_from_logs reads them.
+        live_minimax = capacity.live_from_logs(minimax_only=True)
         overflow_after = int(s["capacity_overflow_after"] or 4)
         overflow = capacity.should_overflow(index, live_minimax, overflow_after)
 

@@ -42,7 +42,7 @@ def backend(monkeypatch):
 
 def test_a_six_task_batch_splits_four_default_two_overflow(backend, monkeypatch):
     monkeypatch.setattr(
-        CAPACITY, "count_live", lambda **kw: 0
+        CAPACITY, "live_from_logs", lambda **kw: 0
     )  # live=0, overflow_after=4
     routes = [backend.route_task({"goal": f"g{i}", "index": i}, CONFIG) for i in range(6)]
     for r in routes[:4]:
@@ -56,14 +56,14 @@ def test_a_six_task_batch_splits_four_default_two_overflow(backend, monkeypatch)
 
 
 def test_live_minimax_children_shrink_the_default_slots(backend, monkeypatch):
-    monkeypatch.setattr(CAPACITY, "count_live", lambda **kw: 2)
+    monkeypatch.setattr(CAPACITY, "live_from_logs", lambda **kw: 2)
     routes = [backend.route_task({"goal": "g", "index": i}, CONFIG) for i in range(3)]
     assert routes[0] == CONFIG and routes[1] == CONFIG, routes
     assert routes[2].get("label") == "overflow", routes
 
 
 def test_one_info_line_per_decision(backend, monkeypatch, caplog):
-    monkeypatch.setattr(CAPACITY, "count_live", lambda **kw: 0)
+    monkeypatch.setattr(CAPACITY, "live_from_logs", lambda **kw: 0)
     with caplog.at_level(logging.INFO, logger="hermes_treeps.delegation_backend"):
         for i in range(3):
             backend.route_task({"goal": "g", "index": i}, CONFIG)
@@ -154,5 +154,5 @@ print("ok")
 
 
 def test_a_task_without_an_index_defaults_to_zero(backend, monkeypatch):
-    monkeypatch.setattr(CAPACITY, "count_live", lambda **kw: 0)
+    monkeypatch.setattr(CAPACITY, "live_from_logs", lambda **kw: 0)
     assert backend.route_task({"goal": "g"}, CONFIG) == CONFIG

@@ -29,6 +29,7 @@ and the delegation-config fallback are imported lazily inside functions.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -338,3 +339,114 @@ def delegation_route_defaults() -> tuple[str, str]:
     except Exception:
         logger.debug("capacity ledger: could not read the delegation route", exc_info=True)
     return model, provider
+
+
+# ── live children, classified, from the host's own transcripts ────────────────
+#
+# WHY a second source and not the ledger: the ledger cannot tell WHICH route a
+# child is on. ``subagent_start`` carries no model/provider, so every start row
+# falls back to the configured delegation route and a child this plugin sent to
+# the overflow provider is still counted as primary. Counting those as primary
+# is not merely conservative - it is self-poisoning: after one overflowing batch
+# the next batch sees every slot taken and moves the WHOLE fleet to the overflow
+# provider while the earlier children are still running.
+#
+# The host's own live transcripts do carry the answer: one manifest per
+# delegation with ``provider``/``model`` for the batch, and one log per child
+# that ends with a ``final`` marker. A log without that marker whose mtime is
+# still recent is a child that is still running. The marker is written on every
+# normal exit path (completed, failed, interrupted); only a hard kill (OOM,
+# reboot) leaves a log with no marker, which is what the stale window is for -
+# it is an ORPHAN GUARD, not a liveness clock, and it is deliberately long
+# enough that a child thinking through one huge turn is never counted dead.
+
+#: The marker the host writes as the last line of a child's log when it stops.
+FINAL_MARKER = "final"
+
+#: Orphan guard: a log with no final marker and no write for this long is
+#: treated as dead. 6h because children legitimately run for hours; the cost of
+#: counting a ghost is one child routed to the overflow provider.
+DEFAULT_STALE_SECONDS = 6 * 60 * 60
+
+#: How much of a log to read when looking for the final marker. The marker is
+#: the last line, so the tail is enough and the read stays bounded.
+_LOG_TAIL_BYTES = 8192
+
+#: Lines of the tail that are searched - the marker is on the final line, but
+#: the host can append a couple of trailing summary lines after it.
+_LOG_TAIL_LINES = 25
+
+
+def live_transcript_root() -> Path:
+    """``<hermes home>/cache/delegation/live`` - the host's transcript root."""
+    try:
+        return db.hermes_home() / "cache" / "delegation" / "live"
+    except Exception:
+        return Path("")
+
+
+def _log_is_live(log: Path, now: float, stale_seconds: float) -> bool:
+    """True when the child behind ``log`` is still running (or unknowably so)."""
+    try:
+        age = now - log.stat().st_mtime
+    except OSError:
+        return False
+    if age > stale_seconds:
+        # No final marker and no write for hours: an orphan, not a live child.
+        return False
+    try:
+        with log.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - _LOG_TAIL_BYTES))
+            tail = handle.read().decode("utf-8", "ignore")
+    except OSError:
+        return False
+    lines = tail.splitlines()[-_LOG_TAIL_LINES:]
+    return not any(FINAL_MARKER in line for line in lines)
+
+
+def live_from_logs(
+    minimax_only: bool = False,
+    root: Path | None = None,
+    stale_seconds: float = DEFAULT_STALE_SECONDS,
+    now: float | None = None,
+) -> int:
+    """Count running children from the host's transcripts, per route.
+
+    ``minimax_only`` counts only children whose batch manifest names MiniMax as
+    model or provider - the number that must stay under
+    ``capacity_overflow_after``. Never raises: a missing, unreadable or
+    half-written transcript tree counts as zero.
+    """
+    base = root if root is not None else live_transcript_root()
+    if not base:
+        return 0
+    clock = time.time() if now is None else now
+    total = 0
+    try:
+        manifests = sorted(base.glob("*/manifest.json"))
+    except OSError:
+        return 0
+    for manifest_path in manifests:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        if minimax_only and not is_minimax(
+            str(manifest.get("model") or ""), str(manifest.get("provider") or "")
+        ):
+            continue
+        tasks = manifest.get("tasks")
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            raw = str(task.get("log") or "")
+            log = Path(raw) if raw else manifest_path.parent / f"task-{task.get('index', 0)}.log"
+            if _log_is_live(log, clock, stale_seconds):
+                total += 1
+    return total
