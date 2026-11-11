@@ -37,7 +37,7 @@ _PIN_LOGGED = {"at": False}
 def _turn_key_for_log() -> str:
     """The gateway turn key the terminal layer would read, for the pin log."""
     try:
-        from tools.terminal_tool import get_current_session_key
+        from tools.approval_context import get_current_session_key
 
         return str(get_current_session_key() or "")
     except Exception:
@@ -74,7 +74,15 @@ def _pin_session_cwd(
             sid, task_id, _turn_key_for_log(), path,
         )
         if sid:
-            from tools.terminal_tool import get_current_session_key, record_session_cwd
+            # TWO modules, not one: the host keeps record_session_cwd in
+            # tools.terminal_tool but get_current_session_key in
+            # tools.approval_context. Importing all three from terminal_tool
+            # raised ImportError, and because the import headlined this block
+            # the ENTIRE pin - the child task_id write included - was skipped.
+            # Live symptom: a child bound to its own workspace ran its shell in
+            # the parent's tree (jj op log attribution proved it).
+            from tools.approval_context import get_current_session_key
+            from tools.terminal_tool import record_session_cwd
 
             record_session_cwd(sid, str(path or ""))
             # The terminal resolves its cwd from get_current_session_key() -
@@ -104,12 +112,8 @@ def _unpin_session_cwd(sid: str = "") -> None:
     try:
         clear_session_cwd()
         if sid:
-            from tools.terminal_tool import (
-                clear_session_cwd as _clear_terminal_cwd,
-            )
-            from tools.terminal_tool import (
-                get_current_session_key,
-            )
+            from tools.approval_context import get_current_session_key
+            from tools.terminal_tool import clear_session_cwd as _clear_terminal_cwd
 
             _clear_terminal_cwd(sid)
             key = get_current_session_key()
