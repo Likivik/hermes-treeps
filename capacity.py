@@ -178,7 +178,9 @@ def _ledger_paths(scope: str, profiles: list[str] | None, ledger_dir: str) -> li
         try:
             homes.extend(sorted(p for p in profiles_dir.iterdir() if p.is_dir()))
         except OSError:
-            pass
+            # No profiles directory (single-profile install) or unreadable:
+            # the default home alone is the correct global scope then.
+            logger.debug("capacity ledger: profiles dir unreadable", exc_info=True)
     else:
         logger.debug("capacity ledger: unknown scope %r; falling back to profile", scope)
         homes.append(db.hermes_home())
