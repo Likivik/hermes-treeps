@@ -194,6 +194,53 @@ def _install_fake_runtime_cwd(monkeypatch, path: str = ""):
     return fake
 
 
+def _install_fake_terminal_modules(monkeypatch):
+    """Stand-in for the host's two modules, split the way the host splits them.
+
+    The real tree keeps ``record_session_cwd``/``clear_session_cwd`` in
+    ``tools.terminal_tool`` and ``get_current_session_key`` in
+    ``tools.approval_context``. The fake mirrors that exactly - including the
+    absence of the key function from ``terminal_tool`` - because the bug this
+    guards was one ``from tools.terminal_tool import (..., get_current_session_key)``
+    that raises ImportError and silently skips the whole pin block.
+    """
+    import sys as _sys
+    import types
+
+    recorded: dict[str, str] = {}
+    terminal = types.ModuleType("tools.terminal_tool")
+    terminal.record_session_cwd = lambda key, path: recorded.__setitem__(key, path)
+    terminal.clear_session_cwd = lambda key: recorded.pop(key, None)
+    approval = types.ModuleType("tools.approval_context")
+    approval.get_current_session_key = lambda default="default": "turn-key:chat-1"
+    monkeypatch.setitem(_sys.modules, "tools.terminal_tool", terminal)
+    monkeypatch.setitem(_sys.modules, "tools.approval_context", approval)
+    return recorded
+
+
+def test_a_childs_task_id_gets_its_own_workspace_recorded(tmp_path, monkeypatch, state_home):
+    """A delegated child's shell must start in the CHILD's workspace.
+
+    Prevents: the incident where ``ws_status`` showed the child bound to its own
+    workspace while the jj op log attributed its commands to the parent's tree.
+    The child's tools resolve their cwd under the child's ``task_id``, and that
+    record was never written: the write sat behind a
+    ``from tools.terminal_tool import get_current_session_key`` that raises
+    ImportError, so the whole ``if sid:`` block - task_id write included - was
+    skipped and the shell kept the parent's cwd.
+    """
+    _install_fake_runtime_cwd(monkeypatch)
+    recorded = _install_fake_terminal_modules(monkeypatch)
+    ws = tmp_path / "repo" / "parent-child-abc123"
+    ws.mkdir(parents=True)
+
+    GATE._pin_session_cwd(ws, sid="child-sid-1", task_id="subagent-1-abc")
+
+    assert recorded.get("subagent-1-abc") == str(ws), recorded
+    assert recorded.get("child-sid-1") == str(ws), recorded
+    assert recorded.get("turn-key:chat-1") == str(ws), recorded
+
+
 def test_binding_pins_the_session_cwd(tmp_path, monkeypatch, state_home):
     """ws_new moves the session into the workspace it just bound.
 
