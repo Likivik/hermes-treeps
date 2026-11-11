@@ -21,7 +21,7 @@ import logging
 import time
 from typing import Any, Mapping
 
-from . import childreport, prepare, store
+from . import capacity, childreport, delegation_backend, prepare, store
 from . import contract as contract
 from . import telegram_picker as picker
 from .cli import _cli, _register_cli
@@ -167,6 +167,35 @@ def _on_subagent_start(**kw: Any) -> None:
         # the child is about to run, and observers cannot veto work.
         logger.warning("child report: start hook failed", exc_info=True)
 
+    # The capacity ledger row. Same never-breaks-the-delegation rule, in its
+    # own try: a reporter failure must not take the ledger write down with
+    # it (and vice versa). The hook payload carries no model/provider for
+    # the child (verified against the host's dispatch), so the row falls
+    # back to the host's configured delegation route.
+    try:
+        _record_capacity_start(kw)
+    except Exception:
+        logger.warning("capacity ledger: start hook failed", exc_info=True)
+
+
+def _record_capacity_start(kw: dict[str, Any]) -> None:
+    subagent_id = str(kw.get("child_subagent_id") or kw.get("child_session_id") or "")
+    if not subagent_id:
+        return
+    model = str(kw.get("model") or "")
+    provider = str(kw.get("provider") or "")
+    if not model or not provider:
+        fallback_model, fallback_provider = capacity.delegation_route_defaults()
+        model = model or fallback_model
+        provider = provider or fallback_provider
+    capacity.record_start(
+        subagent_id,
+        child_session_id=str(kw.get("child_session_id") or ""),
+        delegation_id=str(kw.get("delegation_id") or ""),
+        model=model,
+        provider=provider,
+    )
+
 def _on_subagent_stop(**kw: Any) -> None:
     """Hand the child's end state to a background thread, then return.
 
@@ -190,6 +219,19 @@ def _on_subagent_stop(**kw: Any) -> None:
     describes the tree as it was at stop time. The setting
     ``child_immediate_reclaim`` turns it off; the reporting is unaffected.
     """
+    # Close the capacity ledger row the start hook opened. A row that stays
+    # open forever would eat a capacity slot for the rest of the install's
+    # life, so the stop side matters more than the start side - but the same
+    # never-breaks-the-delegation rule applies. It runs FIRST, before the
+    # parent-id early return below: a stop without a parent id still has to
+    # free the child's slot.
+    try:
+        _subagent_id = str(kw.get("child_subagent_id") or kw.get("child_session_id") or "")
+        if _subagent_id:
+            capacity.record_stop(_subagent_id)
+    except Exception:
+        logger.warning("capacity ledger: stop hook failed", exc_info=True)
+
     try:
         parent_sid = str(kw.get("parent_session_id") or "")
         child_sid = str(kw.get("child_session_id") or "")
@@ -210,6 +252,7 @@ def _on_subagent_stop(**kw: Any) -> None:
         # The report is a nicety; the delegation's result is not. A failure
         # here must never surface as a failed child.
         logger.warning("child report: stop hook failed", exc_info=True)
+
 
 def _on_pre_llm_call(**kw: Any) -> Any:
     """Deliver the parent's pending child-end reports, once, on this turn.
@@ -328,3 +371,12 @@ def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     picker.register(ctx)
     prepare.register(ctx)
+
+    # The delegation-seam half of the capacity feature. The seam
+    # (agent.delegation_provider) only exists on Hermes >= 0.22.5; on today's
+    # 0.21.7 host this logs the inert branch and returns False, and only the
+    # gate half (inline at the cap) is active.
+    if delegation_backend.register_provider(ctx):
+        logger.info("hermes-treeps: delegation overflow backend registered")
+    else:
+        logger.info("hermes-treeps: delegation overflow backend inert (seam absent)")

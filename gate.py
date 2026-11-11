@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import childspace, store
+from . import capacity, childspace, store
 from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
@@ -369,6 +369,93 @@ def _self_heal_child_record(sid: str, parent_session_id: str) -> bool:
         logger.debug("could not self-heal the child record for %s", sid, exc_info=True)
         return False
 
+def _requested_children(kw: dict[str, Any]) -> int | None:
+    """How many children this delegate_task asks for, or None when unreadable.
+
+    The host's pre_tool_call payload carries the tool arguments under
+    ``args``; delegate_task's schema is a ``tasks`` list (each item at least
+    a ``goal``), with a legacy single-``goal`` shape still accepted by the
+    host. Anything else - a missing ``args``, a non-mapping, a ``tasks`` that
+    is not a list - is unreadable, and unreadable means ALLOW: a capacity
+    gate that blocks a call it could not count is a worse failure mode than
+    one over-saturated batch.
+    """
+    args = kw.get("args")
+    if not isinstance(args, dict):
+        return None
+    tasks = args.get("tasks")
+    if isinstance(tasks, list) and tasks:
+        return len(tasks)
+    if isinstance(args.get("goal"), str) and args["goal"].strip():
+        return 1
+    return None
+
+
+def _refused_goals(kw: dict[str, Any], limit: int = 5) -> list[str]:
+    """The goals of the refused children, for the block message."""
+    args = kw.get("args")
+    if not isinstance(args, dict):
+        return []
+    tasks = args.get("tasks")
+    if not isinstance(tasks, list):
+        goals = [args.get("goal")] if isinstance(args.get("goal"), str) else []
+    else:
+        goals = [t.get("goal") if isinstance(t, dict) else t for t in tasks]
+    out = [g.strip() for g in goals if isinstance(g, str) and g.strip()]
+    if len(out) > limit:
+        more = len(out) - limit
+        out = out[:limit]
+        out.append(f"(+{more} more)")
+    return out
+
+
+def _capacity_block(kw: dict[str, Any]) -> dict[str, Any] | None:
+    """The over-capacity delegate_task block, or None when the call may run.
+
+    WHY the whole thing is one try/except that allows on failure: this runs
+    on the pre_tool_call hot path of EVERY delegate_task. A capacity feature
+    that raises there does not just miscount - it fails the tool call, which
+    is the one thing the gate must never do by accident.
+    """
+    try:
+        cfg = capacity.config_from_settings(store.settings())
+        if not cfg["enabled"]:
+            return None
+        requested = _requested_children(kw)
+        if requested is None:
+            return None
+        # No subprocesses here: count_live is sqlite reads plus os.kill
+        # liveness probes, both bounded and fast, because this is the hot
+        # path of every delegate_task the agent makes.
+        live = capacity.count_live(
+            scope=cfg["scope"], profiles=cfg["profiles"], ledger_dir=cfg["ledger_dir"]
+        )
+        allowed, reason = capacity.verdict(requested, live, cfg["max_children"])
+        if allowed:
+            return None
+        goals = _refused_goals(kw)
+        lines = [
+            f"delegate_task refused: {reason}.",
+        ]
+        if goals:
+            lines.append("Refused goals:")
+            for g in goals:
+                lines.append(f"- {g}")
+            lines.append("")
+        lines.append(
+            "Do the refused goals INLINE, in your own workspace, now - do not "
+            "spawn children for them."
+        )
+        lines.append(
+            f"Or re-dispatch with at most {cfg['max_children'] - live} task(s). "
+            "Do not retry this same call."
+        )
+        return {"action": "block", "message": "\n".join(lines)}
+    except Exception:
+        logger.warning("capacity gate: refusing to guess; allowing the call", exc_info=True)
+        return None
+
+
 def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> dict[str, Any] | None:
     """Block repo-touching tools until the session resolves a workspace."""
     # WHY the recency tracker is NOT read here any more: it is process-global,
@@ -379,6 +466,14 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
     try:
         if tool_name not in store.GATED_TOOLS:
             return None
+        # The capacity half of the delegation gate: BEFORE any workspace
+        # resolution, an over-cap delegate_task is refused and the agent is
+        # told to do the refused goals inline. It runs first so the message
+        # is about the delegation itself, not about the session's binding.
+        if tool_name == "delegate_task":
+            block = _capacity_block(kw)
+            if block:
+                return block
         sid = session_id or _session_id(kw)
         bound = store.resolve(sid)
         if bound:

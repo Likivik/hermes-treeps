@@ -57,6 +57,14 @@ SETTINGS_KEYS: tuple[str, ...] = (
     "prepare_files",
     "prepare_timeout_seconds",
     "child_immediate_reclaim",
+    "capacity_enabled",
+    "capacity_max_children",
+    "capacity_overflow_after",
+    "capacity_overflow_provider",
+    "capacity_overflow_model",
+    "capacity_tracking_scope",
+    "capacity_tracking_profiles",
+    "capacity_ledger_dir",
 )
 
 # Keys whose schema entry is a SECRET: they live in .env, never in config.yaml.
@@ -124,8 +132,42 @@ DEFAULTS: dict[str, Any] = {
     # a human what happened; the reclamation is the part that acts on it.
     # Turning this off leaves every other behaviour intact.
     "child_immediate_reclaim": True,
+    # ── capacity-aware delegation ─────────────────────────────────────────
+    # WHY a ledger at all: delegate_task has no backpressure of its own on
+    # this host beyond the delegation section's own limits, and the agent
+    # happily queues a 6-child batch while 5 are already running. The plugin
+    # counts live children itself (subagent hooks + the child_capacity table)
+    # and the gate turns an over-cap batch into "do it inline".
+    "capacity_enabled": True,
+    # The cap on live children the gate enforces. The default follows the
+    # host's delegation.max_concurrent_children when it is readable, else 8.
+    "capacity_max_children": 8,
+    # The first N MiniMax-class children of a batch stay on the primary
+    # route; the rest overflow to the second provider (see
+    # delegation_backend.py).
+    "capacity_overflow_after": 4,
+    "capacity_overflow_provider": "custom:neuralwatt",
+    "capacity_overflow_model": "deepseek-v4.1-flash-flex",
+    # Which ledgers count against the cap: 'profile' (this profile's own
+    # ledger), 'profiles' (the homes named in capacity_tracking_profiles),
+    # or 'global' (every profile home under the plugin's hermes home).
+    "capacity_tracking_scope": "profile",
+    # Profile names or absolute profile-home paths, for scope 'profiles'.
+    "capacity_tracking_profiles": [],
+    # An explicit directory holding one ledger data.db; empty = derive from
+    # the scope. Reads only - the writes always go to this profile's own db.
+    "capacity_ledger_dir": "",
     # The verification command: run in the CHILD's workspace to find out
 }
+
+# The ledger scopes capacity.verdict can count against (see capacity.py).
+ALLOWED_TRACKING_SCOPES = ("profile", "profiles", "global")
+
+# NOT settings keys: the two host config.yaml field names the delegation
+# default below reads. Named as module constants so the settings-key scanner
+# (tests/test_settings.py) does not mistake them for plugin settings keys.
+_DELEGATION_SECTION = "delegation"
+_DELEGATION_CAP_KEY = "max_concurrent_children"
 
 ALLOWED_SOURCES = ("local", "github", "forgejo")
 ALLOWED_VCS = ("auto", "jj", "git")
@@ -219,6 +261,23 @@ def legacy_workspace_root(config: Mapping[str, Any] | None = None) -> str:
 
 class SettingsError(WorkspaceError):
     """A bad configuration value, named by key."""
+
+
+def _delegation_max_children() -> int:
+    """The host's ``delegation.max_concurrent_children``, or 0 when unreadable.
+
+    Used only as the DEFAULT for ``capacity_max_children`` (an operator-set
+    value always wins): the plugin's cap and the host's own limit should not
+    disagree about how many children may run.
+    """
+    section = _load_config().get(_DELEGATION_SECTION)
+    if not isinstance(section, Mapping):
+        return 0
+    try:
+        val = int(section.get(_DELEGATION_CAP_KEY) or 0)  # type: ignore[union-attr]
+        return val if val > 0 else 0
+    except (TypeError, ValueError):
+        return 0
 
 
 def _load_config() -> dict[str, Any]:
@@ -363,6 +422,38 @@ def _validate(values: dict[str, Any]) -> dict[str, Any]:
             "hermes-treeps settings.child_immediate_reclaim: must be true or false"
         )
 
+    # ── capacity-aware delegation ─────────────────────────────────────────
+    # Validated the same loud way as every other knob: a typo in the cap is a
+    # configuration bug, and a gate that quietly counted against the wrong
+    # number would refuse (or allow) delegations for reasons nobody set.
+    if not isinstance(out.get("capacity_enabled"), bool):
+        raise SettingsError("hermes-treeps settings.capacity_enabled: must be true or false")
+
+    for key in ("capacity_max_children", "capacity_overflow_after"):
+        val = out.get(key)
+        if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+            raise SettingsError(f"hermes-treeps settings.{key}: must be a positive integer")
+
+    for key in ("capacity_overflow_provider", "capacity_overflow_model", "capacity_ledger_dir"):
+        if not isinstance(out.get(key), str):
+            raise SettingsError(f"hermes-treeps settings.{key}: must be a string")
+
+    scope = out.get("capacity_tracking_scope")
+    if scope not in ALLOWED_TRACKING_SCOPES:
+        raise SettingsError(
+            "hermes-treeps settings.capacity_tracking_scope: must be one of "
+            f"{', '.join(ALLOWED_TRACKING_SCOPES)}, got {scope!r}"
+        )
+
+    tracking = out.get("capacity_tracking_profiles")
+    if not isinstance(tracking, list) or not all(
+        isinstance(p, str) and p.strip() for p in tracking
+    ):
+        raise SettingsError(
+            "hermes-treeps settings.capacity_tracking_profiles: "
+            "must be a list of profile names or profile-home paths"
+        )
+
     return out
 
 
@@ -397,6 +488,14 @@ def settings(config: Mapping[str, Any] | None = None) -> dict[str, Any]:
     }
 
     derived = derived_workspace_root(str(values["repo_dir"]))
+
+    # The capacity cap defaults to the HOST's own delegation limit when the
+    # operator did not set one: two knobs that disagree about how many
+    # children may run are two knobs too many.
+    if "capacity_max_children" not in explicit:
+        host_cap = _delegation_max_children()
+        if host_cap:
+            values["capacity_max_children"] = host_cap
 
     # Validate the values as they were configured BEFORE the derivation
     # overwrites the deprecated key: a stale config with a relative

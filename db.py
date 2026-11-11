@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 PLUGIN_NAME = "hermes-treeps"
 DB_FILENAME = "data.db"
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # One lock for every multi-statement write. It is NEVER held across a
 # subprocess call: those can take seconds, and a lock held that long would
@@ -213,6 +213,32 @@ CREATE TABLE IF NOT EXISTS child_reclaims (
 );
 CREATE INDEX IF NOT EXISTS child_reclaims_snapshot_idx
     ON child_reclaims(snapshot_commit_id);
+
+-- ── child capacity ledger (v5) ────────────────────────────────────────────────
+--
+-- WHY this table exists: the delegation gate must know how many delegated
+-- children are LIVE before it can refuse an over-capacity delegate_task. The
+-- host fires subagent_start / subagent_stop hooks, which are the only moments
+-- a child's life is observable to a plugin; each start opens a row (with the
+-- pid of the gateway process that wrote it, so a crashed gateway's rows can
+-- be told from a live gateway's) and each stop stamps `ended_at`.
+--
+-- WHY `subagent_id` is UNIQUE and the upsert rewrites in place: a re-dispatched
+-- child reuses its subagent id, so the second start must not stack a second
+-- open row for the same child (it would be counted twice against the cap).
+CREATE TABLE IF NOT EXISTS child_capacity (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    subagent_id      TEXT NOT NULL UNIQUE,
+    child_session_id TEXT NOT NULL DEFAULT '',
+    delegation_id    TEXT NOT NULL DEFAULT '',
+    model            TEXT NOT NULL DEFAULT '',
+    provider         TEXT NOT NULL DEFAULT '',
+    gateway_pid      INTEGER NOT NULL DEFAULT 0,
+    started_at       TEXT NOT NULL,
+    ended_at         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_capacity_open_idx
+    ON child_capacity(ended_at);
 """"""
 CREATE TABLE IF NOT EXISTS workspaces (
     repo        TEXT NOT NULL,
@@ -382,6 +408,27 @@ CREATE TABLE IF NOT EXISTS child_reclaims (
 );
 CREATE INDEX IF NOT EXISTS child_reclaims_snapshot_idx
     ON child_reclaims(snapshot_commit_id);
+"""
+
+# v5: the child capacity ledger (see the comment block in SCHEMA above).
+# Created for a fresh database by the schema script and for an EXISTING
+# database by _migrate_to_current, unconditionally (same reasoning as
+# V3_TABLES: IF NOT EXISTS keeps it free and idempotent, independent of the
+# version row).
+V5_TABLES = """
+CREATE TABLE IF NOT EXISTS child_capacity (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    subagent_id      TEXT NOT NULL UNIQUE,
+    child_session_id TEXT NOT NULL DEFAULT '',
+    delegation_id    TEXT NOT NULL DEFAULT '',
+    model            TEXT NOT NULL DEFAULT '',
+    provider         TEXT NOT NULL DEFAULT '',
+    gateway_pid      INTEGER NOT NULL DEFAULT 0,
+    started_at       TEXT NOT NULL,
+    ended_at         TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS child_capacity_open_idx
+    ON child_capacity(ended_at);
 """
 
 # Columns added to a table that already exists in the live install.
@@ -610,6 +657,7 @@ def _migrate_to_current(conn: sqlite3.Connection) -> None:
     """
     try:
         conn.executescript(V3_TABLES)
+        conn.executescript(V5_TABLES)
         conn.commit()
         _add_missing_columns(conn)
         conn.commit()
