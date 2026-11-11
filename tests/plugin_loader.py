@@ -40,3 +40,5 @@ VCS = STORE._vcs
 GATE = importlib.import_module("hermes_treeps.gate")
 TOOLS = importlib.import_module("hermes_treeps.tools")
 CLI = importlib.import_module("hermes_treeps.cli")
+CAPACITY = importlib.import_module("hermes_treeps.capacity")
+DELEGATION_BACKEND = importlib.import_module("hermes_treeps.delegation_backend")

@@ -127,3 +127,49 @@ config_schema:
       working copy is snapshotted into a commit, and the commit id is
       recorded). Turn it off to keep the reporting but leave the tree on
       disk - the tree is then reclaimed by the age-based sweep.
+  capacity_enabled:
+    type: bool
+    default: true
+    description: >-
+      Refuse a delegate_task that would push the live delegated-child count
+      past capacity_max_children, with a message telling the agent to do the
+      refused goals inline instead.
+  capacity_max_children:
+    type: int
+    default: 8
+    description: >-
+      The cap on live delegated children. Defaults to the host's
+      delegation.max_concurrent_children when that is readable, else 8.
+  capacity_overflow_after:
+    type: int
+    default: 4
+    description: >-
+      The first N MiniMax-class children of a batch stay on the primary
+      route; the rest overflow to the second provider (delegation backend).
+  capacity_overflow_provider:
+    type: str
+    default: custom:neuralwatt
+    description: The provider overflow children run on.
+  capacity_overflow_model:
+    type: str
+    default: deepseek-v4.1-flash-flex
+    description: The model overflow children run on.
+  capacity_tracking_scope:
+    type: str
+    default: profile
+    description: >-
+      Which ledgers count against the cap - profile (this profile's own
+      ledger), profiles (capacity_tracking_profiles), or global (every
+      profile home under the plugin's hermes home).
+  capacity_tracking_profiles:
+    type: list
+    default: []
+    description: >-
+      Profile names or absolute profile-home paths counted in scope
+      'profiles'.
+  capacity_ledger_dir:
+    type: str
+    default: ""
+    description: >-
+      An explicit directory holding one ledger data.db to read (empty =
+      derive from the tracking scope; writes always go to this profile's db).

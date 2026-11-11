@@ -18,6 +18,7 @@ else's tree.
 | `store.py` | workspaces, session records, tokens, remote repo listing (GitHub + Forgejo), retire ladder, gc tiers |
 | `db.py` | the SQLite schema and every query: sessions, bindings, workspaces, remote cache |
 | `settings.py` | one accessor for the config: defaults, env overrides, validation, the manifest schema contract |
+| `capacity.py` | the live-child ledger: subagent hooks open/close rows, the gate counts the open ones (pid-liveness-filtered, per profile) |
 | `discovery.py` | repo discovery: local roots plus the GitHub/Forgejo catalogue |
 | `vcs.py` | the jj/git adapter: one API, two backends |
 | `prepare.py` | workspace prepare step: copies ignored files (`.env`), optional setup command |
@@ -25,6 +26,7 @@ else's tree.
 | `childreport.py` | child-end reporting: the child's end state for the parent, and the immediate reclamation that follows it |
 | `jjlayout.py` | jj workspace layout facts: is this a jj workspace, is it the primary one, which session paths are live |
 | `contract.py` | the delegation contract rendered into the system-prompt section |
+| `delegation_backend.py` | the Hermes >=0.22.5 delegation-provider seam: primary route up to `capacity_overflow_after` MiniMax slots, then overflow to a second provider (inert on older hosts) |
 | `errors.py` | the plugin's exception types (`WorkspaceError` and friends) |
 
 ## CLI verbs

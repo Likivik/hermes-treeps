@@ -108,6 +108,7 @@ def test_an_existing_database_opens_and_keeps_its_rows(v2_database):
         }
         assert "child_runs" in tables, sorted(tables)
         assert "child_reports" in tables, sorted(tables)
+        assert "child_capacity" in tables, sorted(tables)
         version = conn.execute(
             "SELECT value FROM kv WHERE key='schema_version'"
         ).fetchone()
@@ -145,6 +146,6 @@ def test_a_fresh_database_has_the_new_tables(tmp_path, monkeypatch):
             r[0]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-        assert {"child_runs", "child_reports"} <= tables, sorted(tables)
+        assert {"child_runs", "child_reports", "child_capacity"} <= tables, sorted(tables)
     finally:
         conn.close()
