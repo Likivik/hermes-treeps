@@ -286,14 +286,64 @@ def _workspace_age_days(record: dict[str, Any], path: Path) -> float:
         return 0.0
 
 
+ORPHAN_FRESH_DAYS = 7.0
+
+
+def _classify_orphan(item: dict[str, Any], tiers: dict[str, list[dict[str, Any]]]) -> None:
+    """Route an orphan by EVIDENCE, not by its lack of a record.
+
+    The old orphan path put every record-less workspace in tier2 without
+    looking at the tree. On the real fleet that lumped 21 dirty trees (real
+    uncommitted work) and 10 freshly-touched ones (one had a live session
+    working inside it) with the 46 genuinely disposable ones.
+
+    Evidence, in order of cost:
+      dirty tree        -> tier4 (retiring would lose work)
+      unpushed commits  -> tier4 (work exists only here)
+      cannot verify     -> tier4 (unknown is unsafe, same rule as tier1)
+      touched recently  -> tier4 (fresh trees may be in active use; the
+                           plugin cannot see live sessions in unregistered
+                           trees - the host's cwd pins are not enumerable
+                           from here - so recency is the proxy)
+      clean, stale,
+      nothing unpushed  -> tier2 (still "check first": gc --apply only ever
+                           retires tier1; forgetting these is a deliberate
+                           per-workspace decision)
+    """
+    path = Path(item["path"])
+    if store.dirty(path):
+        tiers["tier4"].append({**item, "why": "orphan: dirty tree"})
+        return
+    pushed = store.unpushed_commits(path)
+    if pushed is True:
+        tiers["tier4"].append({**item, "why": "orphan: has unpushed commits"})
+        return
+    if pushed is None:
+        tiers["tier4"].append({**item, "why": "orphan: could not verify pushed state"})
+        return
+    age_days = _workspace_age_days(item.get("record") or {}, path)
+    if age_days < ORPHAN_FRESH_DAYS:
+        tiers["tier4"].append(
+            {**item, "why": f"orphan: touched {age_days:.0f}d ago"}
+        )
+        return
+    tiers["tier2"].append({**item, "why": "orphan: clean, nothing unpushed"})
+
+
 def gc_tiers() -> dict[str, list[dict[str, Any]]]:
     """Classify workspaces for reclamation. Dry-run by design: this only labels.
 
     tier1: session(s) ended AND clean AND pushed AND no open PRs  -> safe to retire
     tier2: ended but something could not be verified (or orphans) -> check first
     tier3: a bound session is still live                          -> in use
+    tier4: orphans with evidence of value (dirty, unpushed, fresh) -> needs attention
     """
-    tiers: dict[str, list[dict[str, Any]]] = {"tier1": [], "tier2": [], "tier3": []}
+    tiers: dict[str, list[dict[str, Any]]] = {
+        "tier1": [],
+        "tier2": [],
+        "tier3": [],
+        "tier4": [],
+    }
     listed: set[str] = set()
     for item in store.list_workspaces():
         record = item["record"] or {}
@@ -301,7 +351,7 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
         listed.add(str(path))
         sids = [str(x) for x in (record.get("sessions") or [])]
         if item["orphan"] or not sids:
-            tiers["tier2"].append({**item, "why": "orphan: no bound session record"})
+            _classify_orphan(item, tiers)
             continue
         states = [store.read_state(sid) or {} for sid in sids]
         ended = all(st.get("session_ended_at") for st in states)
@@ -361,7 +411,8 @@ def gc_tiers() -> dict[str, list[dict[str, Any]]]:
         }
         sids = [str(x) for x in (record.get("sessions") or [])]
         if not sids:
-            tiers["tier2"].append({**item, "why": "orphan: no bound session record"})
+            item = {**item, "orphan": True}
+            _classify_orphan(item, tiers)
             continue
         states = [store.read_state(sid) or {} for sid in sids]
         ended = all(st.get("session_ended_at") for st in states)

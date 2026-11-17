@@ -201,7 +201,14 @@ def _cli(args) -> int:
                 record = item["record"] or {}
                 flags = []
                 if item["orphan"]:
-                    flags.append("ORPHAN(no session.json)")
+                    # A DATABASE fact: no record row for this path. The old
+                    # label claimed a missing session.json file nothing reads.
+                    flags.append("ORPHAN(no db record)")
+                elif not (record.get("sessions") or []):
+                    # A record exists, but no session ever bound to it (the
+                    # post-migration shape) - a different state, and gc
+                    # classifies it separately.
+                    flags.append("UNBOUND(no bound sessions)")
                 else:
                     # A workspace whose every session was finalised is done, not
                     # orphaned - distinguish that from a vanished session.
@@ -243,12 +250,13 @@ def _cli(args) -> int:
                 "tier1": "safe to retire (session ended, clean, pushed, no open PRs)",
                 "tier2": "needs a look first (unverified, orphans, open PRs, or dirty)",
                 "tier3": "in use (session still live)",
+                "tier4": "needs attention (orphan with a dirty tree, unpushed or unverifiable commits, or touched recently - gc --apply never touches these)",
             }
             total = sum(len(v) for v in tiers.values())
             if total == 0:
                 print("no workspaces found - nothing to reclaim")
                 return 0
-            for name in ("tier1", "tier2", "tier3"):
+            for name in ("tier1", "tier2", "tier4", "tier3"):
                 rows = tiers[name]
                 print(f"\n{titles[name]}: {len(rows)}")
                 for row in rows:
