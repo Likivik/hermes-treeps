@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path
 
-from . import store
+from . import lifecycle, store
 
 
 def _register_cli(subparser) -> None:
@@ -211,13 +211,15 @@ def _cli(args) -> int:
                     flags.append("UNBOUND(no bound sessions)")
                 else:
                     # A workspace whose every session was finalised is done, not
-                    # orphaned - distinguish that from a vanished session.
-                    ends = []
-                    for sid in record.get("sessions") or []:
-                        st = store.read_state(str(sid)) or {}
-                        if st.get("session_ended_at"):
-                            ends.append(str(st["session_ended_at"]))
-                    if ends and len(ends) == len(record.get("sessions") or []):
+                    # orphaned - distinguish that from a vanished session. The
+                    # answer comes from lifecycle.py, the one derivation, so
+                    # this list can never drift from what gc believes.
+                    lc = lifecycle.lifecycle(item)
+                    if lc.ended:
+                        ends = [
+                            str((store.read_state(sid) or {}).get("session_ended_at"))
+                            for sid in lc.sessions
+                        ]
                         flags.append(f"session ended {max(ends)}")
                     elif record.get("last_synced"):
                         flags.append(f"synced {record['last_synced']}")
