@@ -144,6 +144,45 @@ def is_delegated_child() -> bool:
         return False
 
 
+def is_pinned_child(path: str) -> bool:
+    """True when the host holds a live resume pin that covers this worktree.
+
+    Best effort by design: the ``resumable_subagents`` table arrived in 0.23.2
+    and its columns are not a public contract, so the row is matched by
+    scanning it for the worktree path rather than by naming columns. A missing
+    table, an old version or a lock all answer False - and False means gc may
+    apply its own age rules, which is the pre-0.23.2 behaviour.
+    """
+    import json as _json
+    import sqlite3
+
+    target = str(path or "").rstrip("/")
+    if not target:
+        return False
+    from . import db as _db
+
+    try:
+        state = _db.hermes_home() / "state.db"
+        if not state.is_file():
+            return False
+        conn = sqlite3.connect(f"file:{state}?mode=ro", uri=True, timeout=5.0)
+        try:
+            rows = conn.execute("SELECT * FROM resumable_subagents").fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        _log_once("state.db/resumable_subagents")
+        return False
+    for row in rows:
+        try:
+            blob = _json.dumps(row, default=str)
+        except Exception:
+            continue
+        if target in blob:
+            return True
+    return False
+
+
 def register_idle_task(ctx: Any, name: str, *, interval_hours: int, min_idle_hours: int, fn: Any) -> bool:
     """Ask the host to run `fn` when the gateway is idle (hermes >= 0.23.2).
 
