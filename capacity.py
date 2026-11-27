@@ -204,7 +204,7 @@ def open_rows(
     return rows
 
 
-def _open_rows_at(path: Path) -> list[dict[str, Any]]:
+def _open_rows_at(path: Path, *, alive_only: bool = True) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     try:
@@ -218,7 +218,7 @@ def _open_rows_at(path: Path) -> list[dict[str, Any]]:
             out = []
             for row in cur.fetchall():
                 d = {k: row[k] for k in CAPACITY_COLUMNS}
-                if _pid_is_alive(int(d.get("gateway_pid") or 0)):
+                if not alive_only or _pid_is_alive(int(d.get("gateway_pid") or 0)):
                     out.append(d)
             return out
         finally:
@@ -244,6 +244,28 @@ def count_live(
     except Exception:
         logger.debug("capacity ledger: match predicate failed; counting nothing", exc_info=True)
         return 0
+
+
+def count_live_detail(
+    scope: str = "profile",
+    profiles: list[str] | None = None,
+    ledger_dir: str = "",
+) -> tuple[int, int]:
+    """(live children, open ledger rows) - the two numbers a refusal must show.
+
+    WHY both: a count of 8 with 0 of those rows matching a live pid is a stale
+    ledger, and saying so is the difference between a five-minute fix and an
+    evening of guessing which counter lied (2026-11-26).
+    """
+    alive = 0
+    total = 0
+    for path in _ledger_paths(scope=scope, profiles=profiles, ledger_dir=ledger_dir):
+        try:
+            alive += len(_open_rows_at(path))
+            total += len(_open_rows_at(path, alive_only=False))
+        except Exception:
+            logger.debug("capacity ledger: could not read %s", path, exc_info=True)
+    return alive, total
 
 
 # ── classification and decisions ──────────────────────────────────────────────
@@ -276,7 +298,13 @@ def should_overflow(index: int, live_minimax: int, overflow_after: int) -> bool:
         return False
 
 
-def verdict(requested_children: int, live: int, max_children: int) -> tuple[bool, str]:
+def verdict(
+    requested_children: int,
+    live: int,
+    max_children: int,
+    *,
+    open_rows: int | None = None,
+) -> tuple[bool, str]:
     """The gate's decision: (allowed, reason naming the counts).
 
     The reason is shown to the model verbatim when the call is refused, so it
@@ -290,16 +318,26 @@ def verdict(requested_children: int, live: int, max_children: int) -> tuple[bool
     except (TypeError, ValueError):
         return True, "capacity verdict: unreadable counts; allowing"
     free = max(0, cap - live_n)
+    ledger = ""
+    if open_rows is not None:
+        try:
+            rows_n = int(open_rows)
+        except (TypeError, ValueError):
+            rows_n = live_n
+        if rows_n != live_n:
+            ledger = f" [ledger: {rows_n} open row(s), {live_n} matched a live pid]"
+        else:
+            ledger = f" [ledger: {rows_n} open row(s)]"
     if live_n + requested <= cap:
         return (
             True,
             f"capacity: {live_n} children live, {requested} requested, cap {cap}"
-            f" ({free} free slots)",
+            f" ({free} free slots){ledger}",
         )
     return (
         False,
         f"capacity: {live_n} children live, {requested} requested, cap {cap}"
-        f" - only {free} free slot(s)",
+        f" - only {free} free slot(s){ledger}",
     )
 
 

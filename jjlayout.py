@@ -132,12 +132,9 @@ def pinned_cwd() -> str:
     pinned path - it is asking "is somebody standing in this directory right
     now", and the directory can be under the OLD root.
     """
-    try:
-        from agent.runtime_cwd import scoped_session_cwd
+    from . import hostapi
 
-        return str(scoped_session_cwd() or "")
-    except Exception:
-        return ""
+    return hostapi.scoped_cwd()
 
 
 def live_session_paths(db_module=None) -> set[str]:

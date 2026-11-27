@@ -456,8 +456,9 @@ def test_the_secret_env_name_agrees_with_the_code():
     passed = {
         node.args[0].id
         for node in ast.walk(tree)
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-            and node.func.id == "get_secret" and node.args
+        if (isinstance(node, ast.Call)
+            and (getattr(node.func, "id", None) == "get_secret" or getattr(node.func, "attr", None) == "get_secret")
+            and node.args
             and isinstance(node.args[0], ast.Name))
     }
     assert "FORGEJO_TOKEN_ENV" in passed, (

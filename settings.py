@@ -545,12 +545,9 @@ def forgejo_token() -> str:
     on its own) is still read as a fallback, so a token already written to
     ``.env`` under the old name keeps working.
     """
-    try:
-        from agent.secret_scope import get_secret  # type: ignore
+    from . import hostapi
 
-        val = get_secret(FORGEJO_TOKEN_ENV)
-        if val:
-            return str(val)
-    except Exception:
-        logger.debug("agent.secret_scope is unavailable; falling back to the environment", exc_info=True)
+    val = hostapi.get_secret(FORGEJO_TOKEN_ENV)
+    if val:
+        return val
     return os.environ.get(FORGEJO_TOKEN_ENV) or os.environ.get(FORGEJO_TOKEN_ENV_LEGACY, "")
