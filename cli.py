@@ -41,6 +41,8 @@ def _register_cli(subparser) -> None:
     )
     p_state.add_argument("--apply", action="store_true", help="actually rename the directory (default: report only)")
 
+    sub.add_parser("reconcile", help="report DB/disk/host drift (never deletes anything)")
+
     p_forget = sub.add_parser(
         "forget",
         help="targeted removal of a stale workspace record; refuses live sessions and unforced trees",
@@ -254,6 +256,12 @@ def _cli(args) -> int:
             return 0
         if action == "forget":
             return _cli_ws_forget(args)
+        if action == "reconcile":
+            from . import reconcile
+
+            payload = reconcile.report(write=True)
+            print(json.dumps(payload, indent=2, default=str))
+            return 0
         if action == "gc":
             tiers = store.gc_tiers()
             if getattr(args, "children", False):

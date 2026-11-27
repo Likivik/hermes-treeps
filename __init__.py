@@ -369,6 +369,17 @@ def register(ctx) -> None:
     # freezes plugin system-prompt sections per session, so a section cannot
     # carry a report about a child that finishes later.
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
+
+    # The reconciler: reports DB/disk/host drift when the gateway is idle.
+    # Below hermes 0.23.2 the ctx has no register_idle_task; reconcile.register
+    # returns False and `hermes ws reconcile` stays the manual trigger.
+    try:
+        from . import reconcile as _reconcile
+
+        if _reconcile.register(ctx):
+            logger.info("hermes-treeps: reconcile idle task registered")
+    except Exception:
+        logger.debug("hermes-treeps: could not register the reconcile idle task", exc_info=True)
     picker.register(ctx)
     prepare.register(ctx)
 
