@@ -104,9 +104,10 @@ def register_provider(ctx: Any) -> bool:
     (0.21.7 today) it returns False - the overflow half stays inert and the
     inline gate half keeps working - and logs which branch ran.
     """
-    try:
-        from agent.delegation_provider import DelegationProvider  # type: ignore
-    except Exception:
+    from . import hostapi
+
+    DelegationProvider = hostapi.delegation_provider_class()
+    if DelegationProvider is None:
         logger.info(
             "hermes-treeps delegation backend: agent.delegation_provider is absent "
             "(host predates the >=0.22.5 seam); overflow routing stays inert"

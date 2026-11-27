@@ -47,7 +47,11 @@ def counted(monkeypatch, state_home):
         return base
 
     STORE.mark_chatting("sess-cap")
-    monkeypatch.setattr(CAPACITY, "count_live", fake_count_live)
+    def fake_detail(scope="profile", profiles=None, ledger_dir=""):
+        n = fake_count_live(scope=scope, profiles=profiles, ledger_dir=ledger_dir)
+        return n, n
+
+    monkeypatch.setattr(CAPACITY, "count_live_detail", fake_detail)
     monkeypatch.setattr(STORE, "settings", fake_settings)
     return state
 
@@ -121,6 +125,6 @@ def test_a_broken_capacity_feature_allows_the_call(counted, monkeypatch):
     def boom(**_kw):
         raise RuntimeError("ledger exploded")
 
-    monkeypatch.setattr(CAPACITY, "count_live", boom)
+    monkeypatch.setattr(CAPACITY, "count_live_detail", lambda **_kw: boom())
     counted["live"] = 0
     assert _call(TASKS) is None

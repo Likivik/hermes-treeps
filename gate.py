@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import capacity, childspace, store
+from . import capacity, childspace, hostapi, store
 from . import telegram_picker as picker
 
 logger = logging.getLogger(__name__)
@@ -36,12 +36,7 @@ _PIN_LOGGED = {"at": False}
 
 def _turn_key_for_log() -> str:
     """The gateway turn key the terminal layer would read, for the pin log."""
-    try:
-        from tools.approval_context import get_current_session_key
-
-        return str(get_current_session_key() or "")
-    except Exception:
-        return "<unavailable>"
+    return hostapi.session_key() or "<unavailable>"
 
 def _pin_session_cwd(
     path: str | os.PathLike[str] | None, sid: str = "", task_id: str = ""
@@ -56,15 +51,10 @@ def _pin_session_cwd(
     it: an empty key collapses to "default", which would re-point EVERY
     session without its own record.
     """
-    try:
-        from agent.runtime_cwd import set_session_cwd
-    except Exception:
-        if not _PIN_LOGGED["at"]:
-            _PIN_LOGGED["at"] = True
-            logger.debug("agent.runtime_cwd unavailable: the gate stays the only barrier")
+    if not hostapi.set_logical_cwd(str(path or "")):
+        logger.debug("agent.runtime_cwd unavailable: the gate stays the only barrier")
         return
     try:
-        set_session_cwd(str(path or ""))
         # One INFO line per pin: the terminal reads its cwd back under one of
         # three keys (agent session id, gateway turn key, child task id) and
         # the live probe showed the child's shell STILL landing in the parent
@@ -73,52 +63,22 @@ def _pin_session_cwd(
             "cwd pin: sid=%r task_id=%r turn_key=%r path=%s",
             sid, task_id, _turn_key_for_log(), path,
         )
-        if sid:
-            # TWO modules, not one: the host keeps record_session_cwd in
-            # tools.terminal_tool but get_current_session_key in
-            # tools.approval_context. Importing all three from terminal_tool
-            # raised ImportError, and because the import headlined this block
-            # the ENTIRE pin - the child task_id write included - was skipped.
-            # Live symptom: a child bound to its own workspace ran its shell in
-            # the parent's tree (jj op log attribution proved it).
-            from tools.approval_context import get_current_session_key
-            from tools.terminal_tool import record_session_cwd
-
-            record_session_cwd(sid, str(path or ""))
-            # The terminal resolves its cwd from get_current_session_key() -
-            # the gateway's turn key ("agent:...:<chat>") - NOT from the agent
-            # session id. Record under both: the sid for the file-tools layer,
-            # the turn key for the shell. An empty key collapses to "default",
-            # which would re-point EVERY session, so it is only written when
-            # the key is known.
-            key = get_current_session_key()
-            if key:
-                record_session_cwd(key, str(path or ""))
-            # A delegated child's tools read their cwd under the CHILD's
-            # task_id ("subagent-N-..."), which the host seeds from the
-            # PARENT's record at spawn. Overwrite it with the child's own
-            # workspace - verified live: without this, the child's shell runs
-            # in the parent's tree even though its binding points elsewhere.
-            if task_id:
-                record_session_cwd(task_id, str(path or ""))
+        # Three keys, deliberately: the sid for the file-tools layer, the turn
+        # key for the shell (it resolves cwd from that, not the sid), and a
+        # delegated child's task_id, which the host seeds from the PARENT's
+        # record at spawn. Verified live: without the task_id write the child's
+        # shell runs in the parent's tree even though its binding points
+        # elsewhere. An empty key is refused inside hostapi.
+        for key in (sid, hostapi.session_key(), task_id):
+            hostapi.record_terminal_cwd(key, str(path or ""))
     except Exception:
         logger.debug("could not pin the session cwd", exc_info=True)
 
 def _unpin_session_cwd(sid: str = "") -> None:
     try:
-        from agent.runtime_cwd import clear_session_cwd
-    except Exception:
-        return
-    try:
-        clear_session_cwd()
-        if sid:
-            from tools.approval_context import get_current_session_key
-            from tools.terminal_tool import clear_session_cwd as _clear_terminal_cwd
-
-            _clear_terminal_cwd(sid)
-            key = get_current_session_key()
-            if key:
-                _clear_terminal_cwd(key)
+        hostapi.clear_logical_cwd()
+        for key in (sid, hostapi.session_key()):
+            hostapi.clear_terminal_cwd(key)
     except Exception:
         logger.debug("could not clear the session cwd", exc_info=True)
 
@@ -130,9 +90,7 @@ def _pinned_workspace() -> str:
     hand-pinned tmp path) must fall through to the gate.
     """
     try:
-        from agent.runtime_cwd import scoped_session_cwd
-
-        raw = scoped_session_cwd()
+        raw = hostapi.scoped_cwd()
         if not raw:
             return ""
         candidate = Path(raw).resolve()
@@ -156,15 +114,9 @@ def _caller_is_delegated_child() -> bool:
     Wave A removed ``_LAST_DELEGATION`` for exactly that reason and it must
     not come back in another shape.
     """
-    try:
-        from agent.delegation_context import is_delegated_child_context
-
-        return bool(is_delegated_child_context())
-    except Exception:
-        # No delegation context module (a plain session, or a test): the
-        # caller is NOT a child. Failing open here would be wrong - it would
-        # let an unclassifiable caller mint a user workspace.
-        return False
+    # hostapi fails CLOSED when the context module is absent (a plain session,
+    # or a test): an unclassifiable caller must not mint a user workspace.
+    return hostapi.is_delegated_child()
 
 def _forced_child_shape(sid: str) -> tuple[str, str]:
     """The (purpose, slug) a delegated child's workspace MUST carry.
@@ -427,10 +379,12 @@ def _capacity_block(kw: dict[str, Any]) -> dict[str, Any] | None:
         # No subprocesses here: count_live is sqlite reads plus os.kill
         # liveness probes, both bounded and fast, because this is the hot
         # path of every delegate_task the agent makes.
-        live = capacity.count_live(
+        live, open_rows = capacity.count_live_detail(
             scope=cfg["scope"], profiles=cfg["profiles"], ledger_dir=cfg["ledger_dir"]
         )
-        allowed, reason = capacity.verdict(requested, live, cfg["max_children"])
+        allowed, reason = capacity.verdict(
+            requested, live, cfg["max_children"], open_rows=open_rows
+        )
         if allowed:
             return None
         goals = _refused_goals(kw)
@@ -514,12 +468,7 @@ def _on_pre_tool_call(tool_name: str = "", session_id: str = "", **kw: Any) -> d
         # False for every fresh session, so a new session can NEVER silently
         # grab another session's workspace. (The recency tracker alone was not
         # airtight: two concurrent delegations could cross-inherit.)
-        try:
-            from agent.delegation_context import is_delegated_child_context
-
-            is_child = is_delegated_child_context()
-        except Exception:
-            is_child = False
+        is_child = hostapi.is_delegated_child()
         # NOTE: there is deliberately NO "recent delegation dispatch" fallback
         # here any more. The old fallback set is_child=True for ANY unresolved
         # session while the delegation pointer was younger than 600 s, so an
