@@ -62,3 +62,28 @@ def test_idle_task_registers_when_available():
 
     assert HOST.register_idle_task(NewCtx(), "reconcile", interval_hours=6, min_idle_hours=1, fn="f") is True
     assert seen["reconcile"]["interval_hours"] == 6
+
+
+def test_pin_requires_pinned_flag_and_future_expiry(tmp_path, monkeypatch):
+    import importlib
+    import sqlite3
+    import time
+
+    conn = sqlite3.connect(tmp_path / "state.db")
+    conn.execute(
+        "CREATE TABLE resumable_subagents (subagent_id TEXT, state TEXT, pinned INTEGER,"
+        " record_json TEXT, expires_at REAL)"
+    )
+    now = time.time()
+    conn.execute("INSERT INTO resumable_subagents VALUES ('a','resumable',1,?,?)", ('{"worktree": "/w/kid1"}', now + 3600))
+    conn.execute("INSERT INTO resumable_subagents VALUES ('b','resumable',0,?,?)", ('{"worktree": "/w/kid2"}', now + 3600))
+    conn.execute("INSERT INTO resumable_subagents VALUES ('c','resumable',1,?,?)", ('{"worktree": "/w/kid3"}', now - 60))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(HOST, "_LOGGED", set())
+    db_mod = importlib.import_module("hermes_treeps.db")
+    monkeypatch.setattr(db_mod, "hermes_home", lambda: tmp_path)
+    assert HOST.is_pinned_child("/w/kid1") is True
+    assert HOST.is_pinned_child("/w/kid2") is False, "not pinned"
+    assert HOST.is_pinned_child("/w/kid3") is False, "expired"

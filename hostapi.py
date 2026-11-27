@@ -145,16 +145,21 @@ def is_delegated_child() -> bool:
 
 
 def is_pinned_child(path: str) -> bool:
-    """True when the host holds a live resume pin that covers this worktree.
+    """True when the host holds an UNEXPIRED resume pin covering this worktree.
 
-    Best effort by design: the ``resumable_subagents`` table arrived in 0.23.2
-    and its columns are not a public contract, so the row is matched by
-    scanning it for the worktree path rather than by naming columns. A missing
-    table, an old version or a lock all answer False - and False means gc may
-    apply its own age rules, which is the pre-0.23.2 behaviour.
+    Schema verified live on 0.23.1 (``resumable_subagents``: subagent_id, state,
+    pinned, stop_cause, owner_pid, owner_started_at, record_json, created_at,
+    updated_at, expires_at). Three conditions, all required: the row is pinned,
+    its expiry is in the future, and its payload mentions this worktree. The
+    path lives inside ``record_json``, which is why the match is a substring
+    scan rather than a column comparison.
+
+    A missing table or lock answers False - exactly the pre-0.23.2 behaviour,
+    where gc's own age rules decide.
     """
     import json as _json
     import sqlite3
+    import time as _time
 
     target = str(path or "").rstrip("/")
     if not target:
@@ -167,18 +172,23 @@ def is_pinned_child(path: str) -> bool:
             return False
         conn = sqlite3.connect(f"file:{state}?mode=ro", uri=True, timeout=5.0)
         try:
-            rows = conn.execute("SELECT * FROM resumable_subagents").fetchall()
+            rows = conn.execute(
+                "SELECT record_json, expires_at FROM resumable_subagents WHERE pinned = 1"
+            ).fetchall()
         finally:
             conn.close()
     except Exception:
         _log_once("state.db/resumable_subagents")
         return False
-    for row in rows:
+    now = _time.time()
+    for record_json, expires_at in rows:
         try:
-            blob = _json.dumps(row, default=str)
-        except Exception:
+            if expires_at not in (None, "") and float(expires_at) <= now:
+                continue
+        except (TypeError, ValueError):
             continue
-        if target in blob:
+        blob = record_json if isinstance(record_json, str) else _json.dumps(record_json, default=str)
+        if target in (blob or ""):
             return True
     return False
 
