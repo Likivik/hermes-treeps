@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
 from . import lifecycle, store
@@ -33,6 +34,12 @@ def _register_cli(subparser) -> None:
     p_gc = sub.add_parser("gc", help="classify reclaimable workspaces (dry-run unless --apply)")
     p_gc.add_argument("--apply", action="store_true", help="retire the tier1 set (ended + clean + pushed + no open PRs)")
     p_gc.add_argument("--children", action="store_true", help="only child workspaces (delegated children); with --apply, safe for an unattended cron - never decides for user workspaces")
+
+    p_state = sub.add_parser(
+        "state-archive",
+        help="retire the pre-DB per-session JSON files (rename, never delete; refuses unmigrated files)",
+    )
+    p_state.add_argument("--apply", action="store_true", help="actually rename the directory (default: report only)")
 
     p_forget = sub.add_parser(
         "forget",
@@ -230,6 +237,13 @@ def _cli(args) -> int:
             record = store.read_record(ws)
             prs, gh_ok = store.open_prs(ws)
             print(json.dumps({"path": str(ws), "record": record, "open_prs": prs, "pr_check_ok": gh_ok}, indent=2, default=str))
+            return 0
+        if action == "state-archive":
+            report = store.db.archive_legacy_state(apply=bool(getattr(args, "apply", False)))
+            print(json.dumps(report, indent=2))
+            if report.get("unmigrated"):
+                print("refused: files whose session has no binding row need a human look", file=sys.stderr)
+                return 1
             return 0
         if action == "retire":
             print(store.retire(
