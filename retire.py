@@ -83,10 +83,10 @@ def _retire_checked(
     if store.dirty(ws) and not skip_hard:
         raise WorkspaceError("refusing to retire: uncommitted changes in the workspace")
     if not skip_hard:
-        live_sids = [
-            sid for sid in (record.get("sessions") or [])
-            if not (store.read_state(str(sid)) or {}).get("session_ended_at")
-        ]
+        from . import lifecycle as _lifecycle
+
+        lc = _lifecycle.lifecycle({"path": str(ws), "record": record})
+        live_sids = list(lc.sessions) if lc.live else []
         if live_sids:
             raise WorkspaceError(
                 "refusing to retire: bound session(s) still live: "
