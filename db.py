@@ -1697,6 +1697,44 @@ def read_child_reclaim_for_report(report: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+def archive_legacy_state(*, apply: bool = False) -> dict[str, Any]:
+    """Retire the per-session JSON files of the pre-DB era.
+
+    WHY nothing reads them any more: ``read_state``/``write_state`` are thin
+    wrappers over ``read_binding``/``write_binding``, so every session record
+    lives in sqlite. The JSON files are debris - but debris is still data, so
+    this is a RENAME, never a delete. Any file whose session has no binding row
+    is reported as ``unmigrated`` and the whole archive is refused until a
+    human looks at it; a silent loss here would be unrecoverable.
+    """
+    import time as _time
+
+    out: dict[str, Any] = {"dir": "", "files": 0, "unmigrated": [], "archived_to": None, "applied": False}
+    try:
+        directory = legacy_state_dir()
+    except Exception as exc:  # no hermes home resolvable
+        out["error"] = str(exc)
+        return out
+    out["dir"] = str(directory)
+    if not directory.is_dir():
+        return out
+    files = sorted(directory.glob("*.json"))
+    out["files"] = len(files)
+    for path in files:
+        try:
+            if read_binding(path.stem) is None:
+                out["unmigrated"].append(path.name)
+        except Exception:
+            out["unmigrated"].append(path.name)
+    if out["unmigrated"] or not apply:
+        return out
+    target = directory.with_name(f"state.retired-{_time.strftime('%Y%m%dT%H%M%S')}")
+    directory.rename(target)
+    out["archived_to"] = str(target)
+    out["applied"] = True
+    return out
+
+
 def legacy_state_dir() -> Path:
     """Where the old per-session JSON files live (the plugin install dir).
 
