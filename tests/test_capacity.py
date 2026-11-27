@@ -265,3 +265,11 @@ def test_config_from_settings_tolerates_missing_keys(missing):
     del s[missing]
     cfg = capacity.config_from_settings(s)
     assert cfg[missing.removeprefix("capacity_").replace("tracking_", "")] in ([], "")
+
+
+def test_stop_closes_the_row_when_only_the_session_id_is_known():
+    """The host's stop hook carries child_session_id, never child_subagent_id."""
+    capacity.record_start("sa-0-abc123", child_session_id="20261127_022314_deadbeef")
+    assert capacity.record_stop("20261127_022314_deadbeef") is True
+    rows = capacity.open_rows()
+    assert rows == [], "a finished child must not hold its slot"

@@ -39,3 +39,14 @@ def test_refusal_shows_a_mismatch_between_rows_and_live_pids():
 def test_detail_returns_both_numbers(tmp_path, monkeypatch):
     monkeypatch.setattr(CAP, "_ledger_paths", lambda **_kw: [])
     assert CAP.count_live_detail() == (0, 0)
+
+
+def test_ended_open_rows_finds_a_ghost():
+    CAP.record_start("sa-9-ghost", child_session_id="20261127_000000_ghost")
+    CAP.db.write_binding("20261127_000000_ghost", {"session_ended_at": "2026-11-27T01:00:00"})
+    ghosts = [r for r in CAP.ended_open_rows() if r.get("subagent_id") == "sa-9-ghost"]
+    assert len(ghosts) == 1
+    report = CAP.close_ended_rows(apply=False)
+    assert report["rows"] >= 1 and report["closed"] == 0, "report-only by default"
+    applied = CAP.close_ended_rows(apply=True)
+    assert applied["closed"] >= 1

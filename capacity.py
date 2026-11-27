@@ -116,14 +116,66 @@ def record_stop(subagent_id: str) -> bool:
         return False
     try:
         with db.transaction() as conn:
+            # BOTH columns: the host's subagent_start hook carries
+            # child_subagent_id, but subagent_stop carries only
+            # child_session_id (delegate_tool_results.py). Matching one column
+            # silently updated zero rows - measured on 2026-11-27: 33 open rows
+            # and not one ever closed, so finished children held their slots
+            # for the install's lifetime and every delegate_task was refused.
             conn.execute(
-                "UPDATE child_capacity SET ended_at=? WHERE subagent_id=?",
-                (_utc_now(), subagent_id),
+                "UPDATE child_capacity SET ended_at=?"
+                " WHERE subagent_id=? OR child_session_id=?",
+                (_utc_now(), subagent_id, subagent_id),
             )
         return True
     except Exception:
         logger.debug("capacity ledger: could not record stop for %s", subagent_id, exc_info=True)
         return False
+
+
+def ended_open_rows() -> list[dict[str, Any]]:
+    """Open ledger rows whose child session has already ended.
+
+    WHY this exists: record_stop ran with the session id and matched only the
+    subagent id, so rows from finished children stayed open (measured
+    2026-11-27: 33 open, 0 ever closed). The fix stops new ghosts; this finds
+    the old ones, by evidence - the child's own binding says it ended.
+    """
+    out: list[dict[str, Any]] = []
+    for row in open_rows():
+        sid = str(row.get("child_session_id") or "")
+        if not sid:
+            continue
+        try:
+            record = db.read_binding(sid) or {}
+        except Exception:
+            continue
+        if record.get("session_ended_at"):
+            out.append({**row, "ended_at_session": record.get("session_ended_at")})
+    return out
+
+
+def close_ended_rows(*, apply: bool = False) -> dict[str, Any]:
+    """Close the ghost rows. Report-only unless ``apply``."""
+    rows = ended_open_rows()
+    report: dict[str, Any] = {"rows": len(rows), "closed": 0, "applied": bool(apply)}
+    if not apply or not rows:
+        return report
+    now = _utc_now()
+    closed = 0
+    for row in rows:
+        try:
+            with db.transaction() as conn:
+                cur = conn.execute(
+                    "UPDATE child_capacity SET ended_at=?"
+                    " WHERE subagent_id=? AND ended_at=''",
+                    (now, row.get("subagent_id")),
+                )
+                closed += int(cur.rowcount or 0)
+        except Exception:
+            logger.debug("capacity ledger: could not close row %s", row.get("id"), exc_info=True)
+    report["closed"] = closed
+    return report
 
 
 # ── reads ─────────────────────────────────────────────────────────────────────
