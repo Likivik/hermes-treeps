@@ -142,7 +142,7 @@ def ended_open_rows() -> list[dict[str, Any]]:
     the old ones, by evidence - the child's own binding says it ended.
     """
     out: list[dict[str, Any]] = []
-    for row in open_rows():
+    for row in open_rows_any_pid():
         sid = str(row.get("child_session_id") or "")
         if not sid:
             continue
@@ -253,6 +253,26 @@ def open_rows(
     rows: list[dict[str, Any]] = []
     for path in _ledger_paths(scope, profiles, ledger_dir):
         rows.extend(_open_rows_at(path))
+    return rows
+
+
+def open_rows_any_pid(
+    scope: str = "profile",
+    profiles: list[str] | None = None,
+    ledger_dir: str = "",
+) -> list[dict[str, Any]]:
+    """Every open row, whatever its writer pid says.
+
+    WHY: a ghost row's gateway is usually GONE - that is what made it a ghost.
+    Filtering by pid liveness (what the capacity count needs) hides exactly the
+    rows a cleanup needs to see.
+    """
+    rows: list[dict[str, Any]] = []
+    for path in _ledger_paths(scope=scope, profiles=profiles, ledger_dir=ledger_dir):
+        try:
+            rows.extend(_open_rows_at(path, alive_only=False))
+        except Exception:
+            logger.debug("capacity ledger: could not read %s", path, exc_info=True)
     return rows
 
 

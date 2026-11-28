@@ -50,3 +50,13 @@ def test_ended_open_rows_finds_a_ghost():
     assert report["rows"] >= 1 and report["closed"] == 0, "report-only by default"
     applied = CAP.close_ended_rows(apply=True)
     assert applied["closed"] >= 1
+
+
+def test_a_ghost_whose_pid_is_gone_is_still_found(monkeypatch):
+    """A ghost's gateway is usually dead - pid filtering must not hide it."""
+    CAP.record_start("sa-9-deadpid", child_session_id="20261127_000000_dead")
+    CAP.db.write_binding("20261127_000000_dead", {"session_ended_at": "2026-11-27T01:00:00"})
+    monkeypatch.setattr(CAP, "_pid_is_alive", lambda pid: False)
+    assert CAP.open_rows() == [], "the live count filters dead pids"
+    found = [r for r in CAP.open_rows_any_pid() if r["subagent_id"] == "sa-9-deadpid"]
+    assert len(found) == 1
